@@ -1,0 +1,7 @@
+{
+  "recommendations": [
+    "1YiB.rust-bundle",
+    "esbenp.prettier-vscode",
+    "dbaeumer.vscode-eslint"
+  ]
+}
