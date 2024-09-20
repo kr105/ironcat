@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{
     io::{Read, Write},
-    net::TcpStream,
+    net::{IpAddr, Ipv4Addr, TcpStream},
+    str::FromStr,
 };
 
-use network::NetworkMessage;
+use network::{message_version::MessageVersion, Address, NetworkMessage};
 
 mod network;
 
@@ -12,8 +15,10 @@ fn main() {
         Ok(mut stream) => {
             println!("Successfully connected to server in port 3333");
 
-            let message =
-                NetworkMessage::new("command", [0xFB, 0xC0, 0xB6, 0xDB].to_vec()).unwrap();
+            let addr = Address::new(IpAddr::from(Ipv4Addr::from_str("127.0.0.1").unwrap()), 1234);
+            let version = MessageVersion::new(addr);
+
+            let message = NetworkMessage::new("version", version.to_bytes()).unwrap();
 
             stream.write_all(&message.to_bytes()).unwrap();
             println!("Sent Hello, awaiting reply...");
