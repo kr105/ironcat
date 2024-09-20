@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::{decode_varstr, encode_varstr, Address, ServiceMask};
+use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, ReadBytesExt};
 use rand::RngCore;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use super::{encode_varstr, Address, ServiceMask};
+use std::{
+    io::{Cursor, Read},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const PROTOCOL_VERSION: u32 = 70002;
 
 /// Represents a version message in the Catcoin protocol
+#[derive(Debug)]
 pub struct MessageVersion {
     /// Identifies protocol version being used by the node
     pub version: u32,
@@ -17,9 +22,9 @@ pub struct MessageVersion {
     pub timestamp: i64,
     /// The network address of the node receiving this message
     pub addr_recv: Address,
-    /// Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes. The "services" field of the address would also be redundant with the second field of the version message.
+    /// Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes
     //pub addr_from: Address,
-    /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
+    /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self
     pub nonce: u64,
     /// User Agent (0x00 if string is 0 bytes long)
     pub user_agent: String,
@@ -64,5 +69,44 @@ impl MessageVersion {
         bytes.extend_from_slice(&self.start_height.to_le_bytes());
         bytes.push(self.relay as u8);
         bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 85 {
+            return Err(anyhow!("Insufficient bytes for MessageVersion"));
+        }
+
+        let mut cursor = Cursor::new(bytes);
+
+        let version = cursor.read_u32::<LittleEndian>()?;
+        let services = ServiceMask::from_bits(cursor.read_u64::<LittleEndian>()?).unwrap();
+        let timestamp = cursor.read_i64::<LittleEndian>()?;
+
+        let mut address = [0u8; 26];
+        cursor.read_exact(&mut address)?;
+
+        let addr_recv = Address::from_bytes(&address)?;
+
+        // Skip addr_from (26 bytes)
+        cursor.read_exact(&mut address)?;
+
+        let nonce = cursor.read_u64::<LittleEndian>()?;
+
+        // Read user_agent (varstr)
+        let user_agent = decode_varstr(&mut cursor)?;
+
+        let start_height = cursor.read_i32::<LittleEndian>()?;
+        let relay = cursor.read_u8()? != 0;
+
+        Ok(MessageVersion {
+            version,
+            services,
+            timestamp,
+            addr_recv,
+            nonce,
+            user_agent,
+            start_height,
+            relay,
+        })
     }
 }

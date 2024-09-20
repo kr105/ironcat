@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    io::{Cursor, Read},
+    net::{IpAddr, Ipv4Addr},
+};
 
 use anyhow::{anyhow, Result};
 use bitflags::bitflags;
+use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
 
 pub mod message_version;
+
+pub const MAX_MESSAGE_SIZE: usize = 5_000_000;
 
 /// Length of the command field in the network message
 const COMMAND_LENGTH: usize = 12;
@@ -46,6 +52,30 @@ impl Address {
         bytes.extend_from_slice(&self.port.to_le_bytes());
 
         bytes
+    }
+
+    /// Decodes an Address from a slice of network bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
+        if bytes.len() != 26 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid byte length for Address",
+            ));
+        }
+
+        let services =
+            ServiceMask::from_bits_truncate(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
+
+        let ip_bytes: [u8; 16] = bytes[8..24].try_into().unwrap();
+        let address = IpAddr::from(ip_bytes);
+
+        let port = u16::from_be_bytes(bytes[24..26].try_into().unwrap());
+
+        Ok(Address {
+            services,
+            address,
+            port,
+        })
     }
 
     /// Converts the IP address to a 16-byte network order representation
@@ -100,7 +130,7 @@ pub struct NetworkMessage {
     command: [u8; COMMAND_LENGTH],
     length: u32,
     checksum: u32,
-    payload: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 impl NetworkMessage {
@@ -144,7 +174,7 @@ impl NetworkMessage {
         Ok(())
     }
 
-    /// Calculate the checksum for the message payload.
+    /// Calculate the checksum for the message payload
     /// The checksum is the first 4 bytes of the double SHA256 hash of the payload
     fn calculate_checksum(&self) -> u32 {
         let mut hasher = Sha256::new();
@@ -170,6 +200,62 @@ impl NetworkMessage {
         bytes.extend_from_slice(&self.checksum.to_le_bytes());
         bytes.extend_from_slice(&self.payload);
         bytes
+    }
+
+    /// Decodes a NetworkMessage from a byte slice
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 4 + COMMAND_LENGTH + 4 + 4 {
+            return Err(anyhow!(
+                "Byte slice is too short for a valid NetworkMessage"
+            ));
+        }
+
+        let mut cursor = Cursor::new(bytes);
+
+        // Read magic
+        let mut magic = [0u8; 4];
+        cursor.read_exact(&mut magic)?;
+
+        if magic != NET_MAGIC {
+            return Err(anyhow!("Invalid network magic"));
+        }
+
+        // Read command
+        let mut command = [0u8; COMMAND_LENGTH];
+        cursor.read_exact(&mut command)?;
+
+        // Read length
+        let length = cursor.read_u32::<LittleEndian>()?;
+
+        // Read checksum
+        let checksum = cursor.read_u32::<LittleEndian>()?;
+
+        if bytes.len() < 4 + COMMAND_LENGTH + 4 + 4 + length as usize {
+            return Err(anyhow!(
+                "Byte slice is too short for the entire NetworkMessage"
+            ));
+        }
+
+        // Read payload
+        let mut payload = vec![0u8; length as usize];
+        cursor.read_exact(&mut payload)?;
+
+        // Create the NetworkMessage
+        let msg = NetworkMessage {
+            magic,
+            command,
+            length,
+            checksum,
+            payload,
+        };
+
+        // Verify checksum
+        let calculated_checksum = msg.calculate_checksum();
+        if calculated_checksum != checksum {
+            return Err(anyhow!("Checksum mismatch"));
+        }
+
+        Ok(msg)
     }
 }
 
@@ -197,4 +283,38 @@ pub fn encode_varstr(s: &str) -> Vec<u8> {
     let mut encoded = encode_varint(s.len() as u64);
     encoded.extend_from_slice(s.as_bytes());
     encoded
+}
+
+/// Decodes a u64 from a variable length integer (VarInt)
+pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    let first_byte: u8 = cursor.read_u8()?;
+
+    match first_byte {
+        0xFD => {
+            let uint16 = cursor.read_u16::<LittleEndian>()?;
+            Ok(uint16 as u64)
+        }
+
+        0xFE => {
+            let uint32 = cursor.read_u32::<LittleEndian>()?;
+            Ok(uint32 as u64)
+        }
+
+        0xFF => {
+            let uint64 = cursor.read_u64::<LittleEndian>()?;
+            Ok(uint64)
+        }
+
+        _ => Ok(first_byte as u64),
+    }
+}
+
+/// Decodes a string from a variable length string
+pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
+    let length = decode_varint(cursor)?;
+
+    let mut str_bytes = vec![0u8; length as usize];
+    cursor.read_exact(&mut str_bytes)?;
+
+    Ok(String::from_utf8(str_bytes)?)
 }
