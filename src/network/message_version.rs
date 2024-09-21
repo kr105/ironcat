@@ -9,7 +9,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const PROTOCOL_VERSION: u32 = 70002;
+const USER_AGENT: &str = "/Ironcat:0.0.1/";
+const PROTOCOL_VERSION: u32 = 70003;
 
 /// Represents a version message in the Catcoin protocol
 #[derive(Debug)]
@@ -22,7 +23,7 @@ pub struct MessageVersion {
     pub timestamp: i64,
     /// The network address of the node receiving this message
     pub addr_recv: NetworkAddress,
-    /// Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes
+    // Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes
     //pub addr_from: Address,
     /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self
     pub nonce: u64,
@@ -37,7 +38,7 @@ pub struct MessageVersion {
 impl MessageVersion {
     pub fn new(addr_recv: NetworkAddress) -> Self {
         let mut services = ServiceMask::empty();
-        services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
+        services.set(ServiceMask::NODE_NETWORK, true);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -50,8 +51,8 @@ impl MessageVersion {
             timestamp,
             addr_recv,
             nonce: rand::thread_rng().next_u64(),
-            user_agent: "asdasdasd".to_string(),
-            start_height: 0,
+            user_agent: USER_AGENT.to_string(),
+            start_height: 400000,
             relay: false,
         }
     }
@@ -96,7 +97,14 @@ impl MessageVersion {
         let user_agent = decode_varstr(&mut cursor)?;
 
         let start_height = cursor.read_i32::<LittleEndian>()?;
-        let relay = cursor.read_u8()? != 0;
+
+        // Latest "stable" Catcoin client has version 70003
+        // and does not include this field on this message
+        let relay = if version > 70003 {
+            cursor.read_u8()? != 0
+        } else {
+            false
+        };
 
         Ok(MessageVersion {
             version,

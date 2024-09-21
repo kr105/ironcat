@@ -3,6 +3,7 @@
 use std::{
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr},
+    str::FromStr,
 };
 
 use anyhow::{anyhow, Result};
@@ -125,7 +126,7 @@ bitflags! {
 
 /// Represents a Catcoin network message
 #[derive(Debug)]
-pub struct NetworkMessage {
+pub struct Message {
     magic: [u8; 4],
     pub command: [u8; COMMAND_LENGTH],
     length: u32,
@@ -133,10 +134,10 @@ pub struct NetworkMessage {
     pub payload: Vec<u8>,
 }
 
-impl NetworkMessage {
+impl Message {
     /// Creates a new NetworkMessage with the given command and payload
     pub fn new(command: &str, payload: Vec<u8>) -> Result<Self> {
-        let mut msg = NetworkMessage {
+        let mut msg = Message {
             magic: NET_MAGIC,
             command: [0; COMMAND_LENGTH],
             length: payload.len() as u32,
@@ -241,7 +242,7 @@ impl NetworkMessage {
         cursor.read_exact(&mut payload)?;
 
         // Create the NetworkMessage
-        let msg = NetworkMessage {
+        let msg = Message {
             magic,
             command,
             length,
@@ -256,6 +257,31 @@ impl NetworkMessage {
         }
 
         Ok(msg)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NetworkCommand {
+    Version,
+    Verack,
+    Ping,
+    Pong,
+    Alert,
+    Unknown(String),
+}
+
+impl FromStr for NetworkCommand {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "version" => Ok(NetworkCommand::Version),
+            "verack" => Ok(NetworkCommand::Verack),
+            "ping" => Ok(NetworkCommand::Ping),
+            "pong" => Ok(NetworkCommand::Pong),
+            "alert" => Ok(NetworkCommand::Alert),
+            _ => Ok(NetworkCommand::Unknown(s.to_string())),
+        }
     }
 }
 
@@ -321,7 +347,7 @@ pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 
 pub struct NetworkQueue {
     buffer: Vec<u8>,
-    messages: Vec<NetworkMessage>,
+    messages: Vec<Message>,
 }
 
 impl NetworkQueue {
@@ -336,7 +362,7 @@ impl NetworkQueue {
         self.buffer.extend_from_slice(data);
 
         loop {
-            match NetworkMessage::from_bytes(&self.buffer) {
+            match Message::from_bytes(&self.buffer) {
                 Ok(message) => {
                     let message_len = message.to_bytes().len();
                     self.messages.push(message);
@@ -354,7 +380,7 @@ impl NetworkQueue {
         Ok(())
     }
 
-    pub fn get_next_message(&mut self) -> Option<NetworkMessage> {
+    pub fn get_next_message(&mut self) -> Option<Message> {
         if !self.messages.is_empty() {
             Some(self.messages.remove(0))
         } else {
