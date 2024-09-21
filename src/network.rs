@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 pub mod message_version;
 
+/// Maximum allowed size for a network message
 pub const MAX_MESSAGE_SIZE: usize = 5_000_000;
 
 /// Length of the command field in the network message
@@ -260,6 +261,7 @@ impl Message {
     }
 }
 
+/// Represents the different types of network commands
 #[derive(Debug, PartialEq)]
 pub enum NetworkCommand {
     Version,
@@ -345,6 +347,7 @@ pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     Ok(String::from_utf8(str_bytes)?)
 }
 
+/// Manages network messages and buffers incomplete messages
 pub struct NetworkQueue {
     buffer: Vec<u8>,
     messages: Vec<Message>,
@@ -358,6 +361,7 @@ impl NetworkQueue {
         }
     }
 
+    /// Processes incoming data, extracting complete messages and buffering incomplete ones
     pub fn process_incoming_data(&mut self, data: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(data);
 
@@ -380,6 +384,7 @@ impl NetworkQueue {
         Ok(())
     }
 
+    /// Retrieves the next complete message from the queue
     pub fn get_next_message(&mut self) -> Option<Message> {
         if !self.messages.is_empty() {
             Some(self.messages.remove(0))

@@ -15,15 +15,18 @@ use tokio::{
 };
 
 use crate::network::{
-    message_version::MessageVersion, Message, NetworkAddress, NetworkQueue, ServiceMask,
+    message_version::MessageVersion, Message, NetworkAddress, NetworkCommand, NetworkQueue,
+    ServiceMask,
 };
 
+/// Represents a unique identifier for a node in the network
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct NodeEndpoint {
     address: IpAddr,
     port: u16,
 }
 
+/// Represents a node in the Catcoin network
 struct Node {
     endpoint: NodeEndpoint,
 
@@ -53,6 +56,7 @@ struct Node {
 
 /// Manages a collection of nodes in the network
 pub struct NodeManager {
+    // Using DashMap for concurrent access without needing explicit locking
     nodes: DashMap<NodeEndpoint, Node>,
 }
 
@@ -69,10 +73,12 @@ impl NodeManager {
     pub fn insert(&self, address: IpAddr, port: u16) -> bool {
         let endpoint = NodeEndpoint { address, port };
 
+        // Check if the node already exists
         if self.nodes.contains_key(&endpoint) {
             return false;
         }
 
+        // Create a new Node with default values
         let node = Node {
             endpoint: endpoint.clone(),
             ver_ack: false,
@@ -92,6 +98,7 @@ impl NodeManager {
         true
     }
 
+    /// Updates the last_seen timestamp for a node with the current time
     pub fn update_last_seen(&self, node_endpoint: &NodeEndpoint) {
         if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
             node.last_seen = SystemTime::now()
@@ -102,13 +109,14 @@ impl NodeManager {
     }
 }
 
+/// Inserts a new node into the NodeManager and spawns a task to handle the connection
 pub async fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
     let address = IpAddr::from_str(ip).expect("Invalid IP address provided");
 
     let inserted = node_manager.insert(address, port);
 
     if !inserted {
-        return;
+        return; // Node already exists, no need to proceed
     }
 
     let node_manager_clone = Arc::clone(&node_manager);
@@ -117,9 +125,11 @@ pub async fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
     });
 }
 
+/// Handles the connection to a node
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16) {
     let node_endpoint = NodeEndpoint { address, port };
 
+    // Attempt to establish a TCP connection
     let mut tcp_stream = match TcpStream::connect((address, port)).await {
         Ok(stream) => {
             println!("Connected to {:?}", node_endpoint);
@@ -153,12 +163,13 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
         let mut buf = [0; 4096];
 
         match tcp_stream.try_read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => break, // Connection closed
             Ok(n) => {
+                // Process the incoming data
                 incoming_queue.process_incoming_data(&buf[..n]).unwrap();
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                continue;
+                continue; // No data available, try again
             }
             Err(e) => {
                 println!("Error in try_read(): {:?}", e);
@@ -166,6 +177,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
             }
         }
 
+        // Process all messages in the queue
         while let Some(message) = incoming_queue.get_next_message() {
             node_manager.update_last_seen(&node_endpoint);
 
@@ -189,12 +201,14 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
     println!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
 
+/// Parses and handles an incoming message from a node
 async fn parse_incoming_message(
     node_manager: Arc<NodeManager>,
     node_endpoint: &NodeEndpoint,
     tcp_stream: &mut TcpStream,
     message: Message,
 ) -> Result<()> {
+    // Extract the command from the message
     let command = match CStr::from_bytes_until_nul(&message.command) {
         Ok(str) => str.to_str().unwrap(),
         Err(_) => {
@@ -204,10 +218,12 @@ async fn parse_incoming_message(
         }
     };
 
+    let command = NetworkCommand::from_str(command).unwrap();
+
     println!("Received message: {:?}", command);
 
     match command {
-        "version" => {
+        NetworkCommand::Version => {
             let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
 
             // Nodes can send only one version command
@@ -232,7 +248,7 @@ async fn parse_incoming_message(
             tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
         }
 
-        "verack" => {
+        NetworkCommand::Verack => {
             let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
             node.ver_ack = true;
 
@@ -243,8 +259,12 @@ async fn parse_incoming_message(
                 node.connected = true;
             }
         }
+
+        NetworkCommand::Unknown(str) => {
+            println!("Received unknown network command: {}", str);
+        }
         _ => {
-            println!("Received unhandled message: {}", command);
+            println!("Received unhandled message: {:?}", command);
         }
     };
 
