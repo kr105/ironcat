@@ -21,8 +21,8 @@ const COMMAND_LENGTH: usize = 12;
 const NET_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
 
 /// Represents a network address in the Bitcoin protocol
-#[derive(Debug, Hash)]
-pub struct Address {
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct NetworkAddress {
     /// bitfield of features to be enabled for this connection
     pub services: ServiceMask,
     /// IPv6 address. Network byte order. IPv4 address is written as a 16 byte IPv4-mapped IPv6 address
@@ -31,13 +31,13 @@ pub struct Address {
     pub port: u16,
 }
 
-impl Address {
-    /// Creates a new Address with the given IP address and port
+impl NetworkAddress {
+    /// Creates a new NetworkAddress with the given IP address and port
     pub fn new(address: IpAddr, port: u16) -> Self {
         let mut services = ServiceMask::empty();
         services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
 
-        Address {
+        NetworkAddress {
             services,
             address,
             port,
@@ -71,7 +71,7 @@ impl Address {
 
         let port = u16::from_be_bytes(bytes[24..26].try_into().unwrap());
 
-        Ok(Address {
+        Ok(NetworkAddress {
             services,
             address,
             port,
@@ -98,7 +98,7 @@ impl Address {
 
 bitflags! {
     /// Represents the services offered by a node
-    #[derive(Debug, Hash)]
+    #[derive(Debug, Hash, Eq, PartialEq)]
     pub struct ServiceMask: u64 {
         /// Node can serve full blocks
         const NODE_NETWORK = 1;
@@ -127,7 +127,7 @@ bitflags! {
 #[derive(Debug)]
 pub struct NetworkMessage {
     magic: [u8; 4],
-    command: [u8; COMMAND_LENGTH],
+    pub command: [u8; COMMAND_LENGTH],
     length: u32,
     checksum: u32,
     pub payload: Vec<u8>,
@@ -317,4 +317,48 @@ pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     cursor.read_exact(&mut str_bytes)?;
 
     Ok(String::from_utf8(str_bytes)?)
+}
+
+pub struct NetworkQueue {
+    buffer: Vec<u8>,
+    messages: Vec<NetworkMessage>,
+}
+
+impl NetworkQueue {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    pub fn process_incoming_data(&mut self, data: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(data);
+
+        loop {
+            match NetworkMessage::from_bytes(&self.buffer) {
+                Ok(message) => {
+                    let message_len = message.to_bytes().len();
+                    self.messages.push(message);
+                    self.buffer = self.buffer.split_off(message_len);
+                }
+                Err(_) => {
+                    if self.buffer.len() > MAX_MESSAGE_SIZE {
+                        return Err(anyhow!("Received oversized message"));
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_next_message(&mut self) -> Option<NetworkMessage> {
+        if !self.messages.is_empty() {
+            Some(self.messages.remove(0))
+        } else {
+            None
+        }
+    }
 }

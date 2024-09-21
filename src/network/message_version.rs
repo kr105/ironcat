@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{decode_varstr, encode_varstr, Address, ServiceMask};
+use super::{decode_varstr, encode_varstr, NetworkAddress, ServiceMask};
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use rand::RngCore;
@@ -21,7 +21,7 @@ pub struct MessageVersion {
     /// standard UNIX timestamp in seconds
     pub timestamp: i64,
     /// The network address of the node receiving this message
-    pub addr_recv: Address,
+    pub addr_recv: NetworkAddress,
     /// Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes
     //pub addr_from: Address,
     /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self
@@ -35,7 +35,7 @@ pub struct MessageVersion {
 }
 
 impl MessageVersion {
-    pub fn new(addr_recv: Address) -> Self {
+    pub fn new(addr_recv: NetworkAddress) -> Self {
         let mut services = ServiceMask::empty();
         services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
 
@@ -85,7 +85,7 @@ impl MessageVersion {
         let mut address = [0u8; 26];
         cursor.read_exact(&mut address)?;
 
-        let addr_recv = Address::from_bytes(&address)?;
+        let addr_recv = NetworkAddress::from_bytes(&address)?;
 
         // Skip addr_from (26 bytes)
         cursor.read_exact(&mut address)?;
