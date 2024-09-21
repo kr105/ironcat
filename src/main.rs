@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     insert_node(nm_clone, "127.0.0.1", 9933).await;
 
     let nm_clone = Arc::clone(&node_manager);
-    //insert_node(nm_clone, "161.129.176.90", 9933).await;
+    insert_node(nm_clone, "161.129.176.90", 9933).await;
 
     // Keep the main task running
     tokio::signal::ctrl_c().await?;

@@ -1,29 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use std::{
     ffi::CStr,
-    net::{IpAddr, Shutdown, SocketAddr},
+    net::IpAddr,
     str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{self, AsyncWriteExt},
-    net::{tcp, TcpStream, ToSocketAddrs},
+    net::TcpStream,
 };
 
 use crate::network::{
     message_version::MessageVersion, Message, NetworkAddress, NetworkQueue, ServiceMask,
 };
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-struct NodeEndpoint {
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub struct NodeEndpoint {
     address: IpAddr,
     port: u16,
 }
 
 struct Node {
-    address: NetworkAddress,
+    endpoint: NodeEndpoint,
 
     /// Node has sent the verack message
     ver_ack: bool,
@@ -71,14 +73,8 @@ impl NodeManager {
             return false;
         }
 
-        let addr = NetworkAddress {
-            address: endpoint.address,
-            port: endpoint.port,
-            services: ServiceMask::empty(),
-        };
-
         let node = Node {
-            address: addr,
+            endpoint: endpoint.clone(),
             ver_ack: false,
             last_seen: 0,
             connected: false,
@@ -224,7 +220,7 @@ async fn parse_incoming_message(
             let version = MessageVersion::from_bytes(&message.payload).unwrap();
 
             // Save node data
-            node.version = version.version;
+            node.endpoint = node_endpoint.clone();
             node.services = version.services;
             node.timestamp = version.timestamp;
             node.user_agent = version.user_agent;
