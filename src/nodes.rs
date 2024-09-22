@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use simplelog::{debug, error, info, warn};
 use std::{
     ffi::CStr,
     net::IpAddr,
@@ -132,12 +133,12 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
     // Attempt to establish a TCP connection
     let mut tcp_stream = match TcpStream::connect((address, port)).await {
         Ok(stream) => {
-            println!("Connected to {:?}", node_endpoint);
+            info!("Connected to {:?}", node_endpoint);
 
             stream
         }
         Err(e) => {
-            println!("Failed to connect to {:?}: {}", node_endpoint, e);
+            info!("Failed to connect to {:?}: {}", node_endpoint, e);
             return;
         }
     };
@@ -156,7 +157,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
     'main: loop {
         // Wait for the socket to be readable
         if tcp_stream.readable().await.is_err() {
-            println!("Error in waiting readable()");
+            warn!("Error in waiting readable()");
             break;
         }
 
@@ -172,7 +173,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
                 continue; // No data available, try again
             }
             Err(e) => {
-                println!("Error in try_read(): {:?}", e);
+                warn!("Error in try_read(): {:?}", e);
                 break;
             }
         }
@@ -189,7 +190,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
             )
             .await
             {
-                println!("Error parsing message: {:?}", e);
+                warn!("Error parsing message: {:?}", e);
 
                 // Close the connection
                 tcp_stream.shutdown().await.unwrap(); // TODO: Check safety
@@ -198,7 +199,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
         }
     }
 
-    println!("Exiting handle_node_connection for {:?}", node_endpoint);
+    debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
 
 /// Parses and handles an incoming message from a node
@@ -220,7 +221,7 @@ async fn parse_incoming_message(
 
     let command = NetworkCommand::from_str(command).unwrap();
 
-    println!("Received message: {:?}", command);
+    debug!("Received message: {:?}", command);
 
     match command {
         NetworkCommand::Version => {
@@ -261,10 +262,10 @@ async fn parse_incoming_message(
         }
 
         NetworkCommand::Unknown(str) => {
-            println!("Received unknown network command: {}", str);
+            error!("Received unknown network command: {}", str);
         }
         _ => {
-            println!("Received unhandled message: {:?}", command);
+            error!("Received unhandled message: {:?}", command);
         }
     };
 
