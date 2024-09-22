@@ -89,7 +89,7 @@ impl NetworkAddress {
             ServiceMask::from_bits_truncate(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
 
         let ip_bytes: [u8; 16] = bytes[8..24].try_into().unwrap();
-        let address = IpAddr::from(ip_bytes);
+        let address = IpAddr::from(ip_bytes).to_canonical();
 
         let port = u16::from_be_bytes(bytes[24..26].try_into().unwrap());
 

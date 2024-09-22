@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, ReadBytesExt};
 use dashmap::DashMap;
 use simplelog::{debug, error, info, warn};
 use std::{
     ffi::CStr,
+    io::{Cursor, Read},
     net::IpAddr,
     str::FromStr,
     sync::Arc,
@@ -18,10 +20,10 @@ use tokio::{
 
 use crate::{
     network::{
-        message_version::MessageVersion, Message, NetworkAddress, NetworkCommand, NetworkQueue,
-        ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+        decode_varint, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
+        NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
     },
-    utils::{u64_to_vec_le, vec_to_u64_le},
+    utils::{is_recently_active, u64_to_vec_le, vec_to_u64_le},
 };
 
 /// Represents a unique identifier for a node in the network
@@ -118,19 +120,16 @@ impl NodeManager {
 }
 
 /// Inserts a new node into the NodeManager and spawns a task to handle the connection
-pub async fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
+pub fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
     let address = IpAddr::from_str(ip).expect("Invalid IP address provided");
 
-    let inserted = node_manager.insert(address, port);
-
-    if !inserted {
-        return; // Node already exists, no need to proceed
+    // Only proceed if the node doesn't exist already
+    if node_manager.insert(address, port) {
+        let node_manager_clone = node_manager.clone();
+        tokio::spawn(async move {
+            handle_node_connection(node_manager_clone, address, port).await;
+        });
     }
-
-    let node_manager_clone = Arc::clone(&node_manager);
-    tokio::spawn(async move {
-        handle_node_connection(node_manager_clone, address, port).await;
-    });
 }
 
 /// Handles the connection to a node
@@ -305,6 +304,35 @@ async fn parse_incoming_message(
                 .send_message("pong", u64_to_vec_le(nonce))
                 .await
                 .unwrap();
+        }
+
+        NetworkCommand::Addr => {
+            let mut cursor = Cursor::new(message.payload.as_slice());
+            let count = decode_varint(&mut cursor).unwrap();
+
+            // Check all the received addresses
+            for _ in 0..count {
+                let timestamp = cursor.read_u32::<LittleEndian>()?;
+
+                let mut buffer = [0u8; 26];
+                cursor.read_exact(&mut buffer)?;
+
+                if is_recently_active(timestamp) {
+                    let network_address = NetworkAddress::from_bytes(&buffer)?;
+
+                    debug!(
+                        "Received possible node : {:?} - Recently active: {}",
+                        network_address,
+                        is_recently_active(timestamp)
+                    );
+
+                    insert_node(
+                        node_manager.clone(),
+                        network_address.address.to_string().as_str(),
+                        network_address.port,
+                    );
+                }
+            }
         }
 
         NetworkCommand::Unknown(str) => {
