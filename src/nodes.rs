@@ -12,12 +12,16 @@ use std::{
 };
 use tokio::{
     io::{self, AsyncWriteExt},
-    net::TcpStream,
+    net::{tcp, TcpStream},
+    sync::Mutex,
 };
 
-use crate::network::{
-    message_version::MessageVersion, Message, NetworkAddress, NetworkCommand, NetworkQueue,
-    ServiceMask,
+use crate::{
+    network::{
+        message_version::MessageVersion, Message, NetworkAddress, NetworkCommand, NetworkQueue,
+        ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+    },
+    utils::{u64_to_vec_le, vec_to_u64_le},
 };
 
 /// Represents a unique identifier for a node in the network
@@ -53,6 +57,8 @@ struct Node {
 
     /// Set if the node does something that shouldn't
     not_good: bool,
+
+    tcp_writer: Option<SharedTcpWriter>,
 }
 
 /// Manages a collection of nodes in the network
@@ -92,6 +98,7 @@ impl NodeManager {
             user_agent: String::new(),
             version: 0,
             not_good: false,
+            tcp_writer: None,
         };
 
         self.nodes.insert(endpoint, node);
@@ -152,18 +159,24 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
     tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
 
+    // Split the TCP stream into separate reader and writer
+    let (tcp_reader, tcp_writer) = tcp_stream.into_split();
+
+    // Wrap the writer on Arc<Mutex> so we can write from multiple places later on
+    let shared_writer: SharedTcpWriter = Arc::new(Mutex::new(tcp_writer));
+
     let mut incoming_queue = NetworkQueue::new();
 
     'main: loop {
         // Wait for the socket to be readable
-        if tcp_stream.readable().await.is_err() {
+        if tcp_reader.readable().await.is_err() {
             warn!("Error in waiting readable()");
             break;
         }
 
         let mut buf = [0; 4096];
 
-        match tcp_stream.try_read(&mut buf) {
+        match tcp_reader.try_read(&mut buf) {
             Ok(0) => break, // Connection closed
             Ok(n) => {
                 // Process the incoming data
@@ -185,7 +198,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
             if let Err(e) = parse_incoming_message(
                 Arc::clone(&node_manager),
                 &node_endpoint,
-                &mut tcp_stream,
+                shared_writer.clone(),
                 message,
             )
             .await
@@ -193,7 +206,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
                 warn!("Error parsing message: {:?}", e);
 
                 // Close the connection
-                tcp_stream.shutdown().await.unwrap(); // TODO: Check safety
+                shared_writer.lock().await.shutdown().await.unwrap(); // TODO: Check safety
                 break 'main;
             }
         }
@@ -206,7 +219,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 async fn parse_incoming_message(
     node_manager: Arc<NodeManager>,
     node_endpoint: &NodeEndpoint,
-    tcp_stream: &mut TcpStream,
+    tcp_writer: SharedTcpWriter,
     message: Message,
 ) -> Result<()> {
     // Extract the command from the message
@@ -242,11 +255,11 @@ async fn parse_incoming_message(
             node.timestamp = version.timestamp;
             node.user_agent = version.user_agent;
             node.height = version.start_height;
+            node.version = version.version;
             node.relay = version.relay;
 
             // We must answer with a verack
-            let packet = Message::new("verack", Vec::new()).unwrap();
-            tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
+            tcp_writer.send_message("verack", Vec::new()).await.unwrap();
         }
 
         NetworkCommand::Verack => {
@@ -257,8 +270,41 @@ async fn parse_incoming_message(
             // and the node already received the version from us (with this verack),
             // then the connection is ready
             if node.version > 0 {
+                info!(
+                    "Connection ready with node {:?} version={}, blocks={}, user_agent={}",
+                    &node_endpoint, node.version, node.height, node.user_agent
+                );
+
                 node.connected = true;
+                node.tcp_writer = Some(tcp_writer.clone());
+
+                // Now that connection is established, ask for more nodes :)
+                tcp_writer
+                    .send_message("getaddr", Vec::new())
+                    .await
+                    .unwrap();
             }
+        }
+
+        NetworkCommand::Ping => {
+            // Only nonce should be present
+            if message.payload.len() != 8 {
+                warn!("Received malformed ping command");
+
+                let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
+                node.not_good = true;
+
+                return Err(anyhow!("Received malformed ping command"));
+            }
+
+            let nonce = vec_to_u64_le(message.payload);
+            debug!("Received ping command with nonce {}", nonce);
+
+            // Reply back with the nonce
+            tcp_writer
+                .send_message("pong", u64_to_vec_le(nonce))
+                .await
+                .unwrap();
         }
 
         NetworkCommand::Unknown(str) => {

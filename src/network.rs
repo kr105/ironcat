@@ -4,12 +4,14 @@ use std::{
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr},
     str::FromStr,
+    sync::Arc,
 };
 
 use anyhow::{anyhow, Result};
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
+use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex};
 
 pub mod message_version;
 
@@ -21,6 +23,24 @@ const COMMAND_LENGTH: usize = 12;
 
 /// Network magic bytes for Catcoin mainnet
 const NET_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
+
+pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
+
+pub trait SharedTcpWriterExt {
+    async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()>;
+}
+
+impl SharedTcpWriterExt for SharedTcpWriter {
+    async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()> {
+        let packet = Message::new(command, payload)?;
+
+        if let Err(error) = self.lock().await.write_all(&packet.to_bytes()).await {
+            return Err(anyhow!("Error in write_all: {:?}", error));
+        };
+
+        Ok(())
+    }
+}
 
 /// Represents a network address in the Bitcoin protocol
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -269,6 +289,8 @@ pub enum NetworkCommand {
     Ping,
     Pong,
     Alert,
+    GetAddr,
+    Addr,
     Unknown(String),
 }
 
@@ -282,6 +304,8 @@ impl FromStr for NetworkCommand {
             "ping" => Ok(NetworkCommand::Ping),
             "pong" => Ok(NetworkCommand::Pong),
             "alert" => Ok(NetworkCommand::Alert),
+            "getaddr" => Ok(NetworkCommand::GetAddr),
+            "addr" => Ok(NetworkCommand::Addr),
             _ => Ok(NetworkCommand::Unknown(s.to_string())),
         }
     }

@@ -2,6 +2,7 @@
 
 mod network;
 mod nodes;
+mod utils;
 
 use anyhow::Result;
 use nodes::{insert_node, NodeManager};
