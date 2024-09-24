@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use dashmap::DashMap;
-use simplelog::{debug, error, info, warn};
+use simplelog::{debug, error, info, trace, warn};
 use std::{
 	ffi::CStr,
 	fmt,
@@ -11,12 +11,13 @@ use std::{
 	net::IpAddr,
 	str::FromStr,
 	sync::Arc,
-	time::{SystemTime, UNIX_EPOCH},
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
 	io::{self, AsyncWriteExt},
 	net::TcpStream,
 	sync::Mutex,
+	time::sleep,
 };
 
 use crate::{
@@ -40,40 +41,49 @@ impl fmt::Display for NodeEndpoint {
 	}
 }
 
+#[derive(Debug)]
+pub struct NodeStats {
+	pub total_nodes: usize,
+	pub connected_nodes: usize,
+	pub disconnected_nodes: usize,
+}
+
 /// Represents a node in the Catcoin network
-struct Node {
-	endpoint: NodeEndpoint,
+pub struct Node {
+	pub endpoint: NodeEndpoint,
 
 	/// Node has sent the verack message
-	ver_ack: bool,
+	pub ver_ack: bool,
 
 	/// Unix timestamp
-	last_seen: u64,
+	pub last_seen: u64,
 
-	connected: bool,
+	pub timed_out: bool,
 
-	version: u32,
+	pub connected: bool,
 
-	services: ServiceMask,
+	pub version: u32,
 
-	timestamp: i64,
+	pub services: ServiceMask,
 
-	user_agent: String,
+	pub timestamp: i64,
 
-	height: i32,
+	pub user_agent: String,
 
-	relay: bool,
+	pub height: i32,
+
+	pub relay: bool,
 
 	/// Set if the node does something that shouldn't
-	not_good: bool,
+	pub not_good: bool,
 
-	tcp_writer: Option<SharedTcpWriter>,
+	pub tcp_writer: Option<SharedTcpWriter>,
 }
 
 /// Manages a collection of nodes in the network
 pub struct NodeManager {
 	// Using DashMap for concurrent access without needing explicit locking
-	nodes: DashMap<NodeEndpoint, Node>,
+	pub nodes: DashMap<NodeEndpoint, Node>,
 }
 
 impl NodeManager {
@@ -97,6 +107,7 @@ impl NodeManager {
 			endpoint: endpoint.clone(),
 			ver_ack: false,
 			last_seen: 0,
+			timed_out: false,
 			connected: false,
 			height: 0,
 			relay: false,
@@ -122,6 +133,34 @@ impl NodeManager {
 				.as_secs();
 		}
 	}
+
+	/// Updates the timed_out flag for a node
+	pub fn set_timed_out(&self, node_endpoint: &NodeEndpoint, timed_out: bool) {
+		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
+			node.timed_out = timed_out;
+		}
+	}
+
+	/// Checks if the node is appropiate to try a connection
+	pub fn is_candidate(&self, node_endpoint: &NodeEndpoint) -> bool {
+		if let Some(node) = self.nodes.get_mut(node_endpoint) {
+			return !(node.not_good | node.timed_out);
+		}
+
+		false
+	}
+
+	pub fn get_stats(&self) -> NodeStats {
+		let total_nodes = self.nodes.len();
+		let connected_nodes = self.nodes.iter().filter(|n| n.connected).count();
+		let disconnected_nodes = total_nodes - connected_nodes;
+
+		NodeStats {
+			total_nodes,
+			connected_nodes,
+			disconnected_nodes,
+		}
+	}
 }
 
 /// Inserts a new node into the NodeManager and spawns a task to handle the connection
@@ -141,15 +180,51 @@ pub fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16) {
 	let node_endpoint = NodeEndpoint { address, port };
 
-	// Attempt to establish a TCP connection
-	let mut tcp_stream = match TcpStream::connect((address, port)).await {
-		Ok(stream) => {
-			info!("Connected to {:?}", node_endpoint);
+	if !node_manager.is_candidate(&node_endpoint) {
+		trace!(
+			"Avoiding connection to node {} as it is not a good candidate",
+			&node_endpoint
+		);
+		return;
+	}
 
-			stream
+	// Attempt to establish a TCP connection with retries
+	let mut tcp_stream = None;
+	let max_attempts = 3;
+	let delay_between_attempts = Duration::from_secs(30);
+
+	for attempt in 1..=max_attempts {
+		match TcpStream::connect((address, port)).await {
+			Ok(stream) => {
+				info!("Connected to {} on attempt {}", &node_endpoint, attempt);
+				tcp_stream = Some(stream);
+				break;
+			}
+			Err(e) => {
+				if attempt < max_attempts {
+					trace!("Failed to connect to {} on attempt {}: {}", &node_endpoint, attempt, e);
+					sleep(delay_between_attempts).await;
+				} else {
+					debug!(
+						"Failed to connect to {} after {} attempts: {}",
+						&node_endpoint, max_attempts, e
+					);
+
+					node_manager.set_timed_out(&node_endpoint, true);
+
+					return;
+				}
+			}
 		}
-		Err(e) => {
-			info!("Failed to connect to {:?}: {}", node_endpoint, e);
+	}
+
+	let mut tcp_stream = match tcp_stream {
+		Some(stream) => stream,
+		None => {
+			error!(
+				"Failed to establish connection to {:?} after {} attempts",
+				node_endpoint, max_attempts
+			);
 			return;
 		}
 	};

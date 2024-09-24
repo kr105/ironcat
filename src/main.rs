@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod logger_channel;
 mod network;
 mod nodes;
+mod ui;
 mod utils;
 
 use anyhow::Result;
+use logger_channel::{LogChannel, LogChannelEntry};
 use nodes::{insert_node, NodeManager};
-use simplelog::{
-	format_description, info, ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
-};
+use simplelog::{format_description, info, CombinedLogger, ConfigBuilder, LevelFilter};
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use ui::tui::tui_start;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	let (log_tx, log_rx) = mpsc::channel::<LogChannelEntry>(100);
+
 	// Setup logger config
 	let mut log_config = ConfigBuilder::new();
 	let log_config = log_config.set_time_format_custom(format_description!(
@@ -26,25 +31,34 @@ async fn main() -> Result<()> {
 	};
 
 	// Init loggers
-	CombinedLogger::init(vec![TermLogger::new(
-		LevelFilter::Debug,
-		log_config,
-		TerminalMode::Mixed,
-		ColorChoice::Auto,
-	)])
-	.unwrap();
+	CombinedLogger::init(vec![LogChannel::new(LevelFilter::Trace, log_config, log_tx)]).unwrap();
 
 	info!("ironcat v0.0.1 - Starting ...");
 
 	let node_manager = Arc::new(NodeManager::new());
 
+	// Start UI
+	let nm_clone = Arc::clone(&node_manager);
+	let ui_handle = tokio::spawn(tui_start(nm_clone, log_rx));
+
 	let nm_clone = Arc::clone(&node_manager);
 	insert_node(nm_clone, "127.0.0.1", 9933);
 
 	let nm_clone = Arc::clone(&node_manager);
-	insert_node(nm_clone, "161.129.176.90", 9933);
+	insert_node(nm_clone, "109.184.54.50", 9933);
+
+	let nm_clone = Arc::clone(&node_manager);
+	insert_node(nm_clone, "23.179.3.12", 9933);
 
 	// Keep the main task running
-	tokio::signal::ctrl_c().await?;
+	tokio::select! {
+		_ = tokio::signal::ctrl_c() => {
+			println!("Received Ctrl+C, shutting down...");
+		}
+		_ = ui_handle => {
+			println!("UI task ended, shutting down...");
+		}
+	}
+
 	Ok(())
 }

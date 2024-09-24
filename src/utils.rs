@@ -20,8 +20,8 @@ pub fn is_recently_active(timestamp: u32) -> bool {
 		.expect("Time went backwards")
 		.as_secs() as u32;
 
-	// Calculate timestamp from 3 hours ago
-	let thirty_minutes_ago = now.saturating_sub(60 * 60 * 3);
+	// Calculate timestamp from 6 hours ago
+	let thirty_minutes_ago = now.saturating_sub(60 * 60 * 6);
 
 	// Compare
 	timestamp >= thirty_minutes_ago && timestamp <= now

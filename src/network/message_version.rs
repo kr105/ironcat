@@ -52,8 +52,8 @@ impl MessageVersion {
 			addr_recv,
 			nonce: rand::thread_rng().next_u64(),
 			user_agent: USER_AGENT.to_string(),
-			start_height: 400000,
-			relay: false,
+			start_height: 300000,
+			relay: true,
 		}
 	}
 
