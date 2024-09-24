@@ -3,7 +3,6 @@
 use super::{decode_varstr, encode_varstr, NetworkAddress, ServiceMask};
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
-use rand::RngCore;
 use std::{
 	io::{Cursor, Read},
 	time::{SystemTime, UNIX_EPOCH},
@@ -36,7 +35,7 @@ pub struct MessageVersion {
 }
 
 impl MessageVersion {
-	pub fn new(addr_recv: NetworkAddress) -> Self {
+	pub fn new(addr_recv: NetworkAddress, nonce: u64) -> Self {
 		let mut services = ServiceMask::empty();
 		services.set(ServiceMask::NODE_NETWORK, true);
 
@@ -50,7 +49,7 @@ impl MessageVersion {
 			services,
 			timestamp,
 			addr_recv,
-			nonce: rand::thread_rng().next_u64(),
+			nonce,
 			user_agent: USER_AGENT.to_string(),
 			start_height: 300000,
 			relay: true,

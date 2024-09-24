@@ -53,7 +53,7 @@ fn run(
 fn draw(frame: &mut Frame, node_manager: Arc<NodeManager>, log_buffer: &[LogChannelEntry]) {
 	let layout = Layout::default()
 		.direction(Direction::Horizontal)
-		.constraints(vec![Constraint::Percentage(30), Constraint::Percentage(70)])
+		.constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
 		.split(frame.area());
 
 	// Render left panel
@@ -126,6 +126,7 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		Cell::from("Endpoint"),
 		Cell::from("Height"),
 		Cell::from("Connected"),
+		Cell::from("Type"),
 	]);
 
 	let rows: Vec<Row> = nodes
@@ -133,9 +134,10 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		.map(|node| {
 			let node = node.value();
 			Row::new(vec![
-				Cell::from(node.endpoint.to_string()),  // Convert to Cell
-				Cell::from(node.height.to_string()),    // Convert to Cell
-				Cell::from(node.connected.to_string()), // Convert to Cell
+				Cell::from(node.endpoint.to_string()),        // Convert to Cell
+				Cell::from(node.height.to_string()),          // Convert to Cell
+				Cell::from(node.connected.to_string()),       // Convert to Cell
+				Cell::from(node.connection_type.to_string()), // Convert to Cell
 			])
 		})
 		.collect();
@@ -144,8 +146,9 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		rows,
 		vec![
 			Constraint::Percentage(50), // "Endpoint" column width
-			Constraint::Percentage(25), // "Height" column width
-			Constraint::Percentage(25), // "Connected" column width
+			Constraint::Percentage(15), // "Height" column width
+			Constraint::Percentage(15), // "Connected" column width
+			Constraint::Percentage(15), // "Type" column width
 		],
 	)
 	.header(header) // Use a Row for the header

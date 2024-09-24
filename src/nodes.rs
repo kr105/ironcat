@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use dashmap::DashMap;
+use rand::RngCore;
 use simplelog::{debug, error, info, trace, warn};
 use std::{
 	ffi::CStr,
@@ -31,8 +32,8 @@ use crate::{
 /// Represents a unique identifier for a node in the network
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct NodeEndpoint {
-	address: IpAddr,
-	port: u16,
+	pub address: IpAddr,
+	pub port: u16,
 }
 
 impl fmt::Display for NodeEndpoint {
@@ -48,6 +49,19 @@ pub struct NodeStats {
 	pub disconnected_nodes: usize,
 }
 
+pub enum ConnectionType {
+	Incoming,
+	Outgoing,
+}
+
+impl fmt::Display for ConnectionType {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			ConnectionType::Incoming => write!(f, "In"),
+			ConnectionType::Outgoing => write!(f, "Out"),
+		}
+	}
+}
 /// Represents a node in the Catcoin network
 pub struct Node {
 	pub endpoint: NodeEndpoint,
@@ -78,23 +92,37 @@ pub struct Node {
 	pub not_good: bool,
 
 	pub tcp_writer: Option<SharedTcpWriter>,
+
+	pub connection_type: ConnectionType,
 }
 
 /// Manages a collection of nodes in the network
 pub struct NodeManager {
 	// Using DashMap for concurrent access without needing explicit locking
 	pub nodes: DashMap<NodeEndpoint, Node>,
+
+	// Used to avoid connecting to myself
+	pub my_nonce: u64,
+}
+
+impl Default for NodeManager {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl NodeManager {
 	pub fn new() -> Self {
-		NodeManager { nodes: DashMap::new() }
+		NodeManager {
+			nodes: DashMap::new(),
+			my_nonce: rand::thread_rng().next_u64(),
+		}
 	}
 
 	/// Inserts a new node into the manager if it doesn't already exist
 	///
 	/// Returns true if the node was inserted, false if it already existed
-	pub fn insert(&self, address: IpAddr, port: u16) -> bool {
+	pub fn insert(&self, address: IpAddr, port: u16, connection_type: ConnectionType) -> bool {
 		let endpoint = NodeEndpoint { address, port };
 
 		// Check if the node already exists
@@ -117,6 +145,7 @@ impl NodeManager {
 			version: 0,
 			not_good: false,
 			tcp_writer: None,
+			connection_type,
 		};
 
 		self.nodes.insert(endpoint, node);
@@ -163,12 +192,12 @@ impl NodeManager {
 	}
 }
 
-/// Inserts a new node into the NodeManager and spawns a task to handle the connection
+/// Inserts a new outgoing connection node into the NodeManager and spawns a task to handle the connection
 pub fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
 	let address = IpAddr::from_str(ip).expect("Invalid IP address provided");
 
 	// Only proceed if the node doesn't exist already
-	if node_manager.insert(address, port) {
+	if node_manager.insert(address, port, ConnectionType::Outgoing) {
 		let node_manager_clone = node_manager.clone();
 		tokio::spawn(async move {
 			handle_node_connection(node_manager_clone, address, port).await;
@@ -233,11 +262,17 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	// by sending a MessageVersion packet
 
 	let network_address = NetworkAddress::new(address, port);
-	let version = MessageVersion::new(network_address);
+	let version = MessageVersion::new(network_address, node_manager.my_nonce);
 	let packet = Message::new("version", version.to_bytes()).unwrap();
 
 	tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
 
+	node_connection_loop(node_manager, node_endpoint.clone(), tcp_stream).await;
+
+	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
+}
+
+pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint: NodeEndpoint, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
 	let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
@@ -290,8 +325,6 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 			}
 		}
 	}
-
-	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
 
 /// Parses and handles an incoming message from a node
@@ -323,6 +356,12 @@ async fn parse_incoming_message(
 			}
 
 			let version = MessageVersion::from_bytes(&message.payload).unwrap();
+
+			if version.nonce == node_manager.my_nonce {
+				// Oops it is me!
+				debug!("Closing connection to {} as it is self-connection", &node_endpoint);
+				return Err(anyhow!("Node is myself"));
+			}
 
 			// Save node data
 			node.endpoint = node_endpoint.clone();
