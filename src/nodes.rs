@@ -49,6 +49,7 @@ pub struct NodeStats {
 	pub disconnected_nodes: usize,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum ConnectionType {
 	Incoming,
 	Outgoing,
@@ -361,6 +362,14 @@ async fn parse_incoming_message(
 				// Oops it is me!
 				debug!("Closing connection to {} as it is self-connection", &node_endpoint);
 				return Err(anyhow!("Node is myself"));
+			}
+
+			// We should send the version message too if the connection is inbound
+			if node.connection_type == ConnectionType::Incoming {
+				let network_address = NetworkAddress::new(node_endpoint.address, node_endpoint.port);
+				let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
+
+				tcp_writer.send_message("version", version_message.to_bytes()).await?;
 			}
 
 			// Save node data
