@@ -187,6 +187,25 @@ impl NodeManager {
 		false
 	}
 
+	/// Send a ping message to the node
+	pub async fn send_ping(&self, node_endpoint: &NodeEndpoint) {
+		if let Some(node) = self.nodes.get_mut(node_endpoint) {
+			debug!("Sending ping to {}", node_endpoint);
+
+			// TODO: We should use the nonce later on to calculate latency
+			let nonce = rand::thread_rng().next_u64();
+			let nonce = nonce.to_le_bytes();
+
+			// TODO: Cleanup this?
+			node.tcp_writer
+				.clone()
+				.unwrap()
+				.send_message("ping", Vec::from(nonce))
+				.await
+				.unwrap();
+		}
+	}
+
 	pub fn get_stats(&self) -> NodeStats {
 		let total_nodes = self.nodes.len();
 		let connected_nodes = self.nodes.iter().filter(|n| n.connected).count();
@@ -286,10 +305,12 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
 pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint: NodeEndpoint, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
-	let (tcp_reader, tcp_writer) = tcp_stream.into_split();
+	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
 
 	// Wrap the writer on Arc<Mutex> so we can write from multiple places later on
 	let shared_writer: SharedTcpWriter = Arc::new(Mutex::new(tcp_writer));
+
+	let ping_timeout = Duration::from_secs(300);
 
 	let mut incoming_queue = NetworkQueue::new();
 
@@ -302,18 +323,25 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 
 		let mut buf = [0; 4096];
 
-		match tcp_reader.try_read(&mut buf) {
-			Ok(0) => break, // Connection closed
-			Ok(n) => {
-				// Process the incoming data
-				incoming_queue.process_incoming_data(&buf[..n]).unwrap();
+		tokio::select! {
+			result = io::AsyncReadExt::read(&mut tcp_reader, &mut buf) => {
+				match result {
+					Ok(0) => break, // Connection closed
+					Ok(n) => {
+						// Process the incoming data
+						incoming_queue.process_incoming_data(&buf[..n]).unwrap();
+					}
+					Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+						continue; // No data available, try again
+					}
+					Err(e) => {
+						warn!("Error in try_read(): {:?}", e);
+						break;
+					}
+				}
 			}
-			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-				continue; // No data available, try again
-			}
-			Err(e) => {
-				warn!("Error in try_read(): {:?}", e);
-				break;
+			_ = sleep(ping_timeout) => {
+				node_manager.send_ping(&node_endpoint).await;
 			}
 		}
 
@@ -433,6 +461,11 @@ async fn parse_incoming_message(
 
 			// Reply back with the nonce
 			tcp_writer.send_message("pong", u64_to_vec_le(nonce)).await.unwrap();
+		}
+
+		NetworkCommand::Pong => {
+			// TODO: Handle pong properly
+			debug!("Received pong from {}", node_endpoint);
 		}
 
 		NetworkCommand::Addr => {

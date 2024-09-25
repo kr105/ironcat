@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
 	// Init loggers
 	CombinedLogger::init(vec![LogChannel::new(LevelFilter::Trace, log_config, log_tx)]).unwrap();
 
-	info!("ironcat v0.0.1 - Starting ...");
+	info!("ironcat v0.0.2 - Starting ...");
 
 	let node_manager = Arc::new(NodeManager::new());
 
