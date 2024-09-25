@@ -164,6 +164,13 @@ impl NodeManager {
 		}
 	}
 
+	/// Set the connected flag for the node
+	pub fn set_connected(&self, node_endpoint: &NodeEndpoint, connected: bool) {
+		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
+			node.connected = connected;
+		}
+	}
+
 	/// Updates the timed_out flag for a node
 	pub fn set_timed_out(&self, node_endpoint: &NodeEndpoint, timed_out: bool) {
 		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
@@ -268,7 +275,11 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
 	tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
 
-	node_connection_loop(node_manager, node_endpoint.clone(), tcp_stream).await;
+	// Hand off the connection to the connection loop
+	node_connection_loop(node_manager.clone(), node_endpoint.clone(), tcp_stream).await;
+
+	// If the connection loop ended, it means that the connection was closed
+	node_manager.set_connected(&node_endpoint, false);
 
 	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }

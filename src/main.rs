@@ -102,9 +102,14 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 
 		// Only proceed if the node doesn't exist already
 		if nm_clone.insert(node_endpoint.address, node_endpoint.port, ConnectionType::Incoming) {
-			tokio::spawn(node_connection_loop(nm_clone, node_endpoint, tcp_stream));
+			tokio::spawn(async move {
+				node_connection_loop(nm_clone.clone(), node_endpoint.clone(), tcp_stream).await;
+
+				// If the connection loop ended, it means that the connection was closed
+				nm_clone.set_connected(&node_endpoint, false);
+			});
 		} else {
-			debug!("Dropping connection {} as node exist already", node_endpoint);
+			debug!("Dropping connection {} as node exists already", node_endpoint);
 
 			_ = tcp_stream.shutdown().await;
 		}
