@@ -23,8 +23,8 @@ use tokio::{
 
 use crate::{
 	network::{
-		decode_varint, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand, NetworkQueue,
-		ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		decode_varint, message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress,
+		NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
 	utils::{is_recently_active, u64_to_vec_le, vec_to_u64_le},
 };
@@ -457,6 +457,42 @@ async fn parse_incoming_message(
 
 		NetworkCommand::Alert => {
 			debug!("Received an alert command from {}, ignoring it :)", &node_endpoint);
+		}
+
+		NetworkCommand::GetAddr => {
+			let timestamp = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("Time went backwards")
+				.as_secs();
+
+			// Filter the node list so we share good nodes only
+			let filtered_nodes: Vec<NetworkAddress> = node_manager
+				.nodes
+				.iter()
+				.filter(|entry| {
+					let node = entry.value();
+					node.connected && (timestamp - node.last_seen < 60 * 60 * 2) && !node.not_good
+				})
+				.take(1000) // Protocol limits to maximum of 1000 entries per addr message
+				.map(|entry| {
+					let node = entry.value();
+					NetworkAddress {
+						services: node.services.clone(),
+						address: node.endpoint.address,
+						port: node.endpoint.port,
+					}
+				})
+				.collect();
+
+			if filtered_nodes.is_empty() {
+				error!("Can't answer the GetAddr message if the generated node list is empty");
+				return Ok(());
+			}
+
+			debug!("Sending list of {} nodes to {}", filtered_nodes.len(), &node_endpoint);
+
+			let message_addr = MessageAddr::new(filtered_nodes);
+			tcp_writer.send_message("addr", message_addr.to_bytes()).await.unwrap();
 		}
 
 		NetworkCommand::Unknown(str) => {

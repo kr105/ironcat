@@ -13,6 +13,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex};
 
+pub mod message_addr;
 pub mod message_version;
 
 /// Maximum allowed size for a network message
@@ -119,7 +120,7 @@ impl NetworkAddress {
 
 bitflags! {
 	/// Represents the services offered by a node
-	#[derive(Debug, Hash, Eq, PartialEq)]
+	#[derive(Debug, Hash, Eq, PartialEq, Clone)]
 	pub struct ServiceMask: u64 {
 		/// Node can serve full blocks
 		const NODE_NETWORK = 1;
