@@ -310,7 +310,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 	// Wrap the writer on Arc<Mutex> so we can write from multiple places later on
 	let shared_writer: SharedTcpWriter = Arc::new(Mutex::new(tcp_writer));
 
-	let ping_timeout = Duration::from_secs(300);
+	let ping_timeout = Duration::from_secs(180); // 3 minutes
 
 	let mut incoming_queue = NetworkQueue::new();
 
@@ -541,9 +541,6 @@ async fn parse_incoming_message(
 
 		NetworkCommand::Unknown(str) => {
 			error!("Received unknown network command from {}: {}", &node_endpoint, str);
-		}
-		_ => {
-			error!("Received unhandled message from {}: {:?}", &node_endpoint, command);
 		}
 	};
 
