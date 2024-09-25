@@ -2,7 +2,7 @@
 
 use std::{
 	io::{Cursor, Read},
-	net::{IpAddr, Ipv4Addr},
+	net::IpAddr,
 	str::FromStr,
 	sync::Arc,
 };
@@ -12,6 +12,8 @@ use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex};
+
+use crate::utils::ipv4_to_mapped_ipv6;
 
 pub mod message_addr;
 pub mod message_version;
@@ -103,18 +105,9 @@ impl NetworkAddress {
 	/// Converts the IP address to a 16-byte network order representation
 	fn address_to_network_bytes(&self) -> [u8; 16] {
 		match &self.address {
-			IpAddr::V4(ipv4) => Self::ipv4_to_mapped_ipv6(*ipv4),
+			IpAddr::V4(ipv4) => ipv4_to_mapped_ipv6(*ipv4),
 			IpAddr::V6(ipv6) => ipv6.octets(),
 		}
-	}
-
-	/// Converts an IPv4 address to an IPv4-mapped IPv6 address in network byte order
-	fn ipv4_to_mapped_ipv6(ipv4: Ipv4Addr) -> [u8; 16] {
-		let mut bytes = [0u8; 16];
-		bytes[10] = 0xff;
-		bytes[11] = 0xff;
-		bytes[12..].copy_from_slice(&ipv4.octets());
-		bytes
 	}
 }
 

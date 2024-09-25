@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	net::Ipv4Addr,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 pub fn vec_to_u64_le(v: Vec<u8>) -> u64 {
 	if v.len() != 8 {
@@ -25,4 +28,13 @@ pub fn is_recently_active(timestamp: u32) -> bool {
 
 	// Compare
 	timestamp >= thirty_minutes_ago && timestamp <= now
+}
+
+/// Converts an IPv4 address to an IPv4-mapped IPv6 address in network byte order
+pub fn ipv4_to_mapped_ipv6(ipv4: Ipv4Addr) -> [u8; 16] {
+	let mut bytes = [0u8; 16];
+	bytes[10] = 0xff;
+	bytes[11] = 0xff;
+	bytes[12..].copy_from_slice(&ipv4.octets());
+	bytes
 }
