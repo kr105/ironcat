@@ -11,9 +11,17 @@ use anyhow::{anyhow, Result};
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex};
+use simplelog::{debug, error, trace};
+use tokio::{
+	io::AsyncWriteExt,
+	net::{tcp::OwnedWriteHalf, TcpListener},
+	sync::Mutex,
+};
 
-use crate::utils::ipv4_to_mapped_ipv6;
+use crate::{
+	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager},
+	utils::ipv4_to_mapped_ipv6,
+};
 
 pub mod message_addr;
 pub mod message_version;
@@ -405,4 +413,51 @@ impl NetworkQueue {
 			None
 		}
 	}
+}
+
+pub async fn listening_start(node_manager: Arc<NodeManager>) {
+	trace!("listening_start task started");
+
+	let tcp_listener = match TcpListener::bind("0.0.0.0:9934").await {
+		Ok(listener) => listener,
+		Err(error) => {
+			error!("Failed to listen: {:?}", error);
+			return;
+		}
+	};
+
+	loop {
+		let connection = match tcp_listener.accept().await {
+			Ok(handle) => handle,
+			Err(error) => {
+				error!("Failed to accept new connection: {:?}", error);
+				break;
+			}
+		};
+
+		let (mut tcp_stream, socket_addr) = connection;
+
+		let node_endpoint = NodeEndpoint {
+			address: socket_addr.ip(),
+			port: socket_addr.port(),
+		};
+
+		let nm_clone: Arc<NodeManager> = Arc::clone(&node_manager);
+
+		// Only proceed if the node doesn't exist already
+		if nm_clone.insert(node_endpoint.address, node_endpoint.port, ConnectionType::Incoming) {
+			tokio::spawn(async move {
+				node_connection_loop(nm_clone.clone(), node_endpoint.clone(), tcp_stream).await;
+
+				// If the connection loop ended, it means that the connection was closed
+				nm_clone.set_connected(&node_endpoint, false);
+			});
+		} else {
+			debug!("Dropping connection {} as node exists already", node_endpoint);
+
+			_ = tcp_stream.shutdown().await;
+		}
+	}
+
+	trace!("listening_start task finished");
 }
