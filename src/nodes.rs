@@ -315,12 +315,6 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 	let mut incoming_queue = NetworkQueue::new();
 
 	'main: loop {
-		// Wait for the socket to be readable
-		if tcp_reader.readable().await.is_err() {
-			warn!("Error in waiting readable()");
-			break;
-		}
-
 		let mut buf = [0; 4096];
 
 		tokio::select! {
