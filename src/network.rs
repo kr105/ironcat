@@ -418,7 +418,7 @@ impl NetworkQueue {
 pub async fn listening_start(node_manager: Arc<NodeManager>) {
 	trace!("listening_start task started");
 
-	let tcp_listener = match TcpListener::bind("0.0.0.0:9934").await {
+	let tcp_listener = match TcpListener::bind("0.0.0.0:9933").await {
 		Ok(listener) => listener,
 		Err(error) => {
 			error!("Failed to listen: {:?}", error);
