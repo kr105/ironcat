@@ -8,6 +8,7 @@
 - Prefer simple implementations over clever abstractions
 - Minimize external dependencies, prefer stdlib when reasonable
 - Update README.md when adding features or information relevant to newcomers
+- Update docs/protocol.md when changing wire format, message handling, handshake logic, state machine, or connection constants
 
 ## Testing
 - TDD methodology, tests are equally or more important than working code
