@@ -231,6 +231,28 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 | ProtocolViolation | Duplicate version message, self-connection |
 | Misbehavior | Malformed ping (non-zero, non-8 byte payload) |
 
+## DNS Seed Discovery
+
+On startup (unless `--no-dns-seed`), ironcat resolves all Catcoin DNS seeds in parallel to discover peer IPs. Each seed hostname is queried with a 5-second timeout. Results are deduplicated and shuffled before connecting.
+
+DNS seeds (from Catcoin Core `chainparams.cpp`):
+
+```
+catcoin.seeds.multicoin.co
+dnsseed.catalyst.ovh
+dnsseed.catcointomars.top
+dnsseed.wildcat.ovh
+dnsseed.catcoin.ovh
+dnsseed.bcats.top
+dnsseed.jjcatcoin.top
+dnsseed.catsonmylap.top
+dnsseed.catcoin.party
+dnsseed.remembermeasyoupassby.top
+seed.catcoinwallets.com
+```
+
+The `--seed` flag always connects regardless of DNS results, serving as a fallback.
+
 ## Connection Details
 
 - TCP listener binds to `0.0.0.0:9933`

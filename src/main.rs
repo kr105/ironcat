@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod cli;
+mod dns;
 mod network;
 mod nodes;
 mod tui_layer;
@@ -12,7 +13,6 @@ use clap::Parser;
 use cli::Args;
 use network::listening_start;
 use nodes::NodeManager;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 			.init();
 
 		info!("ironcat v0.0.2 - Starting in daemon mode");
-		run_core(None, args.seed).await
+		run_core(None, &args).await
 	} else {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
 		let tui_layer = TuiLayer::new(log_tx);
@@ -41,12 +41,12 @@ async fn main() -> Result<()> {
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
 		info!("ironcat v0.0.2 - Starting ...");
-		run_core(Some(log_rx), args.seed).await
+		run_core(Some(log_rx), &args).await
 	}
 }
 
 /// Core application loop shared between TUI and daemon modes
-async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, seed: SocketAddr) -> Result<()> {
+async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
 	let node_manager = Arc::new(NodeManager::new());
 
 	// Spawn TUI if in TUI mode
@@ -63,8 +63,16 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, seed: SocketAddr)
 	let nm = Arc::clone(&node_manager);
 	let reaper_handle = tokio::spawn(nm.run_reaper());
 
-	// Connect to seed node
-	node_manager.insert_outgoing(seed.ip(), seed.port());
+	// Discover peers via DNS seeds
+	if !args.no_dns_seed {
+		let dns_addrs = dns::resolve_dns_seeds().await;
+		for addr in &dns_addrs {
+			node_manager.insert_outgoing(addr.ip(), addr.port());
+		}
+	}
+
+	// Always connect to --seed as fallback
+	node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
