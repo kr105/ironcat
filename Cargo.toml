@@ -4,14 +4,40 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.89"
-bitflags = "2.6.0"
+anyhow = "1.0.102"
+bitflags = "2.11.0"
 byteorder = "1.5.0"
+clap = { version = "4", features = ["derive"] }
 dashmap = "6.1.0"
-log = "0.4.22"
 rand = "0.8.5"
-ratatui = "0.28.1"
+ratatui = "0.30.0"
 sha2 = "0.10.8"
-simplelog = { version = "0.12.2", features = ["paris"] }
-time = "0.3.36"
-tokio = { version = "1.40.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints.clippy]
+# Base groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Safety and correctness
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+float_arithmetic = "warn"
+
+# Code quality
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Pedantic lints that are more noise than value
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
