@@ -12,6 +12,7 @@ use clap::Parser;
 use cli::Args;
 use network::listening_start;
 use nodes::{insert_node, NodeManager};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -60,7 +61,7 @@ async fn run_with_tui(log_rx: mpsc::Receiver<TuiLogEntry>) -> Result<()> {
 	let listening_handle = tokio::spawn(listening_start(nm_clone));
 
 	let nm_clone = Arc::clone(&node_manager);
-	insert_node(nm_clone, "161.129.176.92", 9933);
+	insert_node(nm_clone, IpAddr::V4(Ipv4Addr::new(161, 129, 176, 92)), 9933);
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
@@ -85,7 +86,7 @@ async fn run_daemon() -> Result<()> {
 	let listening_handle = tokio::spawn(listening_start(nm_clone));
 
 	let nm_clone = Arc::clone(&node_manager);
-	insert_node(nm_clone, "161.129.176.92", 9933);
+	insert_node(nm_clone, IpAddr::V4(Ipv4Addr::new(161, 129, 176, 92)), 9933);
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {

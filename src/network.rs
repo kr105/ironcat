@@ -35,6 +35,9 @@ const COMMAND_LENGTH: usize = 12;
 /// Network magic bytes for Catcoin mainnet
 const NET_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
 
+/// Maximum allowed length for a variable-length string
+const MAX_VARSTR_LENGTH: usize = 4096;
+
 pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
 
 pub trait SharedTcpWriterExt {
@@ -377,6 +380,10 @@ pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 	let length = decode_varint(cursor)?;
 
+	if length as usize > MAX_VARSTR_LENGTH {
+		return Err(anyhow!("varstr length {length} exceeds maximum of {MAX_VARSTR_LENGTH}"));
+	}
+
 	let mut str_bytes = vec![0u8; length as usize];
 	cursor.read_exact(&mut str_bytes)?;
 
@@ -490,6 +497,28 @@ mod tests {
 		let decoded = NetworkAddress::from_bytes(&bytes).expect("should decode");
 
 		assert_eq!(decoded.port, port);
+	}
+
+	#[test]
+	fn decode_varstr_rejects_oversized_length() {
+		// Craft a varstr with length = 0xFFFF (65535), way over any sane limit
+		// but only 4 bytes of actual data after it
+		let mut data = vec![0xFD, 0xFF, 0xFF]; // varint = 65535
+		data.extend_from_slice(&[0x41; 4]); // only 4 bytes of "AAAA"
+
+		let mut cursor = Cursor::new(data.as_slice());
+		let result = decode_varstr(&mut cursor);
+
+		assert!(result.is_err(), "should reject varstr with length > MAX_VARSTR_LENGTH");
+	}
+
+	#[test]
+	fn decode_varstr_accepts_valid_string() {
+		let encoded = encode_varstr("hello");
+		let mut cursor = Cursor::new(encoded.as_slice());
+		let result = decode_varstr(&mut cursor).unwrap();
+
+		assert_eq!(result, "hello");
 	}
 
 	#[test]
