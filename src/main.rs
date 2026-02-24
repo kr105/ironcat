@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
 			.init();
 
-		info!("ironcat v0.0.2 - Starting in daemon mode");
+		info!("ironcat v0.0.4 - Starting in daemon mode");
 		run_core(None, &args).await
 	} else {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
 
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
-		info!("ironcat v0.0.2 - Starting ...");
+		info!("ironcat v0.0.4 - Starting ...");
 		run_core(Some(log_rx), &args).await
 	}
 }

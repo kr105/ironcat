@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
-const USER_AGENT: &str = "/Ironcat:0.0.1/";
+const USER_AGENT: &str = "/Ironcat:0.0.4/";
 const PROTOCOL_VERSION: u32 = 70003;
 
 /// Placeholder start height until actual chain state is available
