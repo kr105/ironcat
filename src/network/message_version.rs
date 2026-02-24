@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{decode_varstr, encode_varstr, NetworkAddress, ServiceMask};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
 	io::{Cursor, Read},
@@ -88,28 +88,42 @@ impl MessageVersion {
 
 		let mut cursor = Cursor::new(bytes);
 
-		let version = cursor.read_u32::<LittleEndian>()?;
-		let services = ServiceMask::from_bits_truncate(cursor.read_u64::<LittleEndian>()?);
-		let timestamp = cursor.read_i64::<LittleEndian>()?;
+		let version = cursor
+			.read_u32::<LittleEndian>()
+			.context("failed to read version field")?;
+		let services = ServiceMask::from_bits_truncate(
+			cursor
+				.read_u64::<LittleEndian>()
+				.context("failed to read services field")?,
+		);
+		let timestamp = cursor
+			.read_i64::<LittleEndian>()
+			.context("failed to read timestamp field")?;
 
 		let mut address = [0u8; 26];
-		cursor.read_exact(&mut address)?;
+		cursor.read_exact(&mut address).context("failed to read addr_recv")?;
 
-		let addr_recv = NetworkAddress::from_bytes(&address)?;
+		let addr_recv = NetworkAddress::from_bytes(&address).context("failed to parse addr_recv")?;
 
 		// Skip addr_from (26 bytes)
-		cursor.read_exact(&mut address)?;
+		cursor.read_exact(&mut address).context("failed to read addr_from")?;
 
-		let nonce = cursor.read_u64::<LittleEndian>()?;
+		let nonce = cursor.read_u64::<LittleEndian>().context("failed to read nonce")?;
 
 		// Read user_agent (varstr)
-		let user_agent = decode_varstr(&mut cursor)?;
+		let user_agent = decode_varstr(&mut cursor).context("failed to read user_agent")?;
 
-		let start_height = cursor.read_i32::<LittleEndian>()?;
+		let start_height = cursor
+			.read_i32::<LittleEndian>()
+			.context("failed to read start_height")?;
 
 		// Latest "stable" Catcoin client has version 70003
 		// and does not include this field on this message
-		let relay = if version > 70003 { cursor.read_u8()? != 0 } else { false };
+		let relay = if version > 70003 {
+			cursor.read_u8().context("failed to read relay field")? != 0
+		} else {
+			false
+		};
 
 		Ok(Self {
 			version,

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+	collections::VecDeque,
 	io::{Cursor, Read},
 	net::IpAddr,
 	str::FromStr,
 	sync::Arc,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
@@ -387,20 +388,20 @@ pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 	let mut str_bytes = vec![0u8; length as usize];
 	cursor.read_exact(&mut str_bytes)?;
 
-	Ok(String::from_utf8(str_bytes)?)
+	String::from_utf8(str_bytes).context("varstr contains invalid UTF-8")
 }
 
 /// Manages network messages and buffers incomplete messages
 pub struct NetworkQueue {
 	buffer: Vec<u8>,
-	messages: Vec<Message>,
+	messages: VecDeque<Message>,
 }
 
 impl NetworkQueue {
 	pub const fn new() -> Self {
 		Self {
 			buffer: Vec::new(),
-			messages: Vec::new(),
+			messages: VecDeque::new(),
 		}
 	}
 
@@ -411,7 +412,7 @@ impl NetworkQueue {
 		loop {
 			if let Ok(message) = Message::from_bytes(&self.buffer) {
 				let message_len = message.to_bytes().len();
-				self.messages.push(message);
+				self.messages.push_back(message);
 				self.buffer = self.buffer.split_off(message_len);
 			} else {
 				if self.buffer.len() > MAX_MESSAGE_SIZE {
@@ -426,11 +427,7 @@ impl NetworkQueue {
 
 	/// Retrieves the next complete message from the queue
 	pub fn get_next_message(&mut self) -> Option<Message> {
-		if self.messages.is_empty() {
-			None
-		} else {
-			Some(self.messages.remove(0))
-		}
+		self.messages.pop_front()
 	}
 }
 

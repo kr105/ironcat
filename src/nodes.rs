@@ -331,7 +331,6 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
 
-#[allow(clippy::indexing_slicing)]
 pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint: NodeEndpoint, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
 	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
@@ -352,6 +351,8 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 					Ok(0) => break, // Connection closed
 					Ok(n) => {
 						// Process the incoming data
+						// n is bounded by buf.len() since it comes from read()
+						#[allow(clippy::indexing_slicing)]
 						if let Err(e) = incoming_queue.process_incoming_data(&buf[..n]) {
 							warn!("Error processing data from {}: {}", &node_endpoint, e);
 							break;
@@ -554,17 +555,13 @@ async fn parse_incoming_message(
 
 				if is_recently_active(timestamp) {
 					debug!("Addr: {} is recently active, adding", network_address.address);
+					insert_node(Arc::clone(&node_manager), network_address.address, network_address.port);
+					debug!("{} nodes", node_manager.nodes.len());
 				} else {
 					debug!(
 						"Addr: {} filtered out (timestamp={}, not recently active)",
 						network_address.address, timestamp
 					);
-				}
-
-				if is_recently_active(timestamp) {
-					insert_node(Arc::clone(&node_manager), network_address.address, network_address.port);
-
-					debug!("{} nodes", node_manager.nodes.len());
 				}
 			}
 		}
