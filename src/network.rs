@@ -11,12 +11,12 @@ use anyhow::{anyhow, Result};
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
-use simplelog::{debug, error, trace};
 use tokio::{
 	io::AsyncWriteExt,
 	net::{tcp::OwnedWriteHalf, TcpListener},
 	sync::Mutex,
 };
+use tracing::{debug, error, trace};
 
 use crate::{
 	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager},

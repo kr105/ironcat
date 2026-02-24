@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use log::Level;
 use ratatui::{
 	crossterm::event::{self, Event, KeyCode},
 	layout::{Constraint, Direction, Layout, Rect},
@@ -10,13 +9,18 @@ use ratatui::{
 	widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 	DefaultTerminal, Frame,
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
+use tracing::Level;
 
-use crate::{logger_channel::LogChannelEntry, nodes::NodeManager};
+use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
 
 /// Initializes and runs the TUI application
-pub async fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<LogChannelEntry>) {
+///
+/// Takes ownership of both arguments because this runs via `spawn_blocking`
+/// which requires `'static + Send`
+#[allow(clippy::needless_pass_by_value)]
+pub fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<TuiLogEntry>) {
 	let terminal = ratatui::init();
 	_ = run(terminal, &node_manager, log_receiver).context("app loop failed");
 	ratatui::restore();
@@ -26,16 +30,16 @@ pub async fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Recei
 fn run(
 	mut terminal: DefaultTerminal,
 	node_manager: &Arc<NodeManager>,
-	mut log_receiver: mpsc::Receiver<LogChannelEntry>,
+	mut log_receiver: mpsc::Receiver<TuiLogEntry>,
 ) -> Result<()> {
-	let mut log_buffer = Vec::new();
+	let mut log_buffer = VecDeque::new();
 
 	loop {
 		// Process new log messages
 		while let Ok(log_message) = log_receiver.try_recv() {
-			log_buffer.push(log_message);
+			log_buffer.push_back(log_message);
 			if log_buffer.len() > 100 {
-				log_buffer.remove(0);
+				log_buffer.pop_front();
 			}
 		}
 
@@ -51,7 +55,7 @@ fn run(
 
 /// Renders the TUI layout and content
 #[allow(clippy::indexing_slicing)]
-fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &[LogChannelEntry]) {
+fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &VecDeque<TuiLogEntry>) {
 	// Layout always returns exactly the number of constraints provided
 	let layout = Layout::default()
 		.direction(Direction::Horizontal)
@@ -76,17 +80,17 @@ fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &[LogCha
 }
 
 /// Creates formatted log text for display
-fn create_log_text(log_buffer: &[LogChannelEntry], visible_lines: usize) -> Text<'static> {
+fn create_log_text(log_buffer: &VecDeque<TuiLogEntry>, visible_lines: usize) -> Text<'static> {
 	let mut text = Text::default();
 	let start_index = log_buffer.len().saturating_sub(visible_lines);
 
 	for entry in log_buffer.iter().skip(start_index) {
-		let (log_name, log_color) = match entry.log_type {
-			Level::Trace => ("TRACE", Color::Magenta),
-			Level::Debug => ("DEBUG", Color::Cyan),
-			Level::Info => (" INFO", Color::Green),
-			Level::Warn => (" WARN", Color::Yellow),
-			Level::Error => ("ERROR", Color::Red),
+		let (log_name, log_color) = match entry.level {
+			Level::TRACE => ("TRACE", Color::Magenta),
+			Level::DEBUG => ("DEBUG", Color::Cyan),
+			Level::INFO => (" INFO", Color::Green),
+			Level::WARN => (" WARN", Color::Yellow),
+			Level::ERROR => ("ERROR", Color::Red),
 		};
 
 		let log_line = Line::from(vec![

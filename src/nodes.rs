@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use dashmap::DashMap;
 use rand::RngCore;
-use simplelog::{debug, error, info, trace, warn};
 use std::{
 	ffi::CStr,
 	fmt,
@@ -20,6 +19,7 @@ use tokio::{
 	sync::Mutex,
 	time::sleep,
 };
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	network::{
@@ -492,6 +492,8 @@ async fn parse_incoming_message(
 			// TODO: replace with proper error handling
 			let count = decode_varint(&mut cursor).unwrap();
 
+			debug!("Received addr message with {} addresses from {}", count, &node_endpoint);
+
 			// Check all the received addresses
 			for _ in 0..count {
 				let timestamp = cursor.read_u32::<LittleEndian>()?;
@@ -499,15 +501,18 @@ async fn parse_incoming_message(
 				let mut buffer = [0u8; 26];
 				cursor.read_exact(&mut buffer)?;
 
+				let network_address = NetworkAddress::from_bytes(&buffer)?;
+
 				if is_recently_active(timestamp) {
-					let network_address = NetworkAddress::from_bytes(&buffer)?;
-
+					debug!("Addr: {} is recently active, adding", network_address.address);
+				} else {
 					debug!(
-						"Received possible node : {:?} - Recently active: {}",
-						network_address,
-						is_recently_active(timestamp)
+						"Addr: {} filtered out (timestamp={}, not recently active)",
+						network_address.address, timestamp
 					);
+				}
 
+				if is_recently_active(timestamp) {
 					insert_node(
 						Arc::clone(&node_manager),
 						network_address.address.to_string().as_str(),
