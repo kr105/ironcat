@@ -6,15 +6,18 @@ use std::{
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Converts a little-endian byte slice to u64
 pub fn vec_to_u64_le(v: &[u8]) -> Result<u64, TryFromSliceError> {
 	let bytes: [u8; 8] = v.try_into()?;
 	Ok(u64::from_le_bytes(bytes))
 }
 
+/// Converts a u64 to a little-endian byte vector
 pub fn u64_to_vec_le(value: u64) -> Vec<u8> {
 	value.to_le_bytes().to_vec()
 }
 
+/// Checks if a timestamp is within the last 24 hours (with 10-minute future tolerance)
 pub fn is_recently_active(timestamp: u32) -> bool {
 	// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
 	// is before 1970, which is not a realistic scenario
