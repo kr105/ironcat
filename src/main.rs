@@ -11,8 +11,8 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Args;
 use network::listening_start;
-use nodes::{insert_node, NodeManager};
-use std::net::{IpAddr, Ipv4Addr};
+use nodes::NodeManager;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -24,76 +24,65 @@ use ui::tui::tui_start;
 async fn main() -> Result<()> {
 	let args = Args::parse();
 
-	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trace"));
+	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
 	if args.daemon {
-		// Daemon mode: log to stderr with timestamps
 		tracing_subscriber::registry()
 			.with(env_filter)
 			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
 			.init();
+
+		info!("ironcat v0.0.2 - Starting in daemon mode");
+		run_core(None, args.seed).await
 	} else {
-		// TUI mode: log to channel for display in the terminal UI
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
 		let tui_layer = TuiLayer::new(log_tx);
 
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
-		return run_with_tui(log_rx).await;
+		info!("ironcat v0.0.2 - Starting ...");
+		run_core(Some(log_rx), args.seed).await
 	}
-
-	info!("ironcat v0.0.2 - Starting in daemon mode");
-
-	run_daemon().await
 }
 
-/// Runs ironcat in TUI mode with the terminal UI
-async fn run_with_tui(log_rx: mpsc::Receiver<TuiLogEntry>) -> Result<()> {
-	info!("ironcat v0.0.2 - Starting ...");
-
+/// Core application loop shared between TUI and daemon modes
+async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, seed: SocketAddr) -> Result<()> {
 	let node_manager = Arc::new(NodeManager::new());
 
-	// Spawn the TUI on a blocking thread so it doesn't block a tokio worker
-	let nm_clone = Arc::clone(&node_manager);
-	let ui_handle = tokio::task::spawn_blocking(move || tui_start(nm_clone, log_rx));
+	// Spawn TUI if in TUI mode
+	let ui_handle = tui_rx.map(|log_rx| {
+		let nm = Arc::clone(&node_manager);
+		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
+	});
 
-	let nm_clone = Arc::clone(&node_manager);
-	let listening_handle = tokio::spawn(listening_start(nm_clone));
+	// Spawn listener
+	let nm = Arc::clone(&node_manager);
+	let listener_handle = tokio::spawn(listening_start(nm));
 
-	let nm_clone = Arc::clone(&node_manager);
-	insert_node(nm_clone, IpAddr::V4(Ipv4Addr::new(161, 129, 176, 92)), 9933);
+	// Spawn reaper for reconnection
+	let nm = Arc::clone(&node_manager);
+	let reaper_handle = tokio::spawn(nm.run_reaper());
+
+	// Connect to seed node
+	node_manager.insert_outgoing(seed.ip(), seed.port());
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
 			info!("Received Ctrl+C, shutting down");
 		}
-		_ = ui_handle => {
+		_ = listener_handle => {
+			info!("Listening task ended, shutting down");
+		}
+		_ = reaper_handle => {
+			info!("Reaper task ended, shutting down");
+		}
+		() = async {
+			match ui_handle {
+				Some(handle) => { let _ = handle.await; }
+				None => std::future::pending::<()>().await,
+			}
+		} => {
 			info!("UI task ended, shutting down");
-		}
-		_ = listening_handle => {
-			info!("Listening task ended, shutting down");
-		}
-	}
-
-	Ok(())
-}
-
-/// Runs ironcat in daemon mode (no TUI, logs to stderr)
-async fn run_daemon() -> Result<()> {
-	let node_manager = Arc::new(NodeManager::new());
-
-	let nm_clone = Arc::clone(&node_manager);
-	let listening_handle = tokio::spawn(listening_start(nm_clone));
-
-	let nm_clone = Arc::clone(&node_manager);
-	insert_node(nm_clone, IpAddr::V4(Ipv4Addr::new(161, 129, 176, 92)), 9933);
-
-	tokio::select! {
-		_ = tokio::signal::ctrl_c() => {
-			info!("Received Ctrl+C, shutting down");
-		}
-		_ = listening_handle => {
-			info!("Listening task ended, shutting down");
 		}
 	}
 

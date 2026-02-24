@@ -4,7 +4,6 @@ use std::{
 	collections::VecDeque,
 	io::{Cursor, Read},
 	net::IpAddr,
-	str::FromStr,
 	sync::Arc,
 };
 
@@ -17,10 +16,10 @@ use tokio::{
 	net::{tcp::OwnedWriteHalf, TcpListener},
 	sync::Mutex,
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
-	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager},
+	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager, NodeState},
 	utils::ipv4_to_mapped_ipv6,
 };
 
@@ -39,15 +38,21 @@ const NET_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
 /// Maximum allowed length for a variable-length string
 const MAX_VARSTR_LENGTH: usize = 4096;
 
+/// Thread-safe shared TCP writer for sending messages to a peer
 pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
 
+/// Extension trait for sending protocol messages over a shared TCP writer
 pub trait SharedTcpWriterExt {
-	async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()>;
+	/// Constructs and sends a protocol message with the given command and payload
+	async fn send_message(&self, command: &str, payload: &[u8]) -> Result<()>;
 }
 
 impl SharedTcpWriterExt for SharedTcpWriter {
-	async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()> {
-		let packet = Message::new(command, payload)?;
+	async fn send_message(&self, command: &str, payload: &[u8]) -> Result<()> {
+		let packet = Message::new(command, payload).map_err(|e| {
+			warn!("Failed to construct message for command '{command}': {e}");
+			e
+		})?;
 
 		if let Err(error) = self.lock().await.write_all(&packet.to_bytes()).await {
 			return Err(anyhow!("Error in write_all: {error:?}"));
@@ -119,7 +124,7 @@ impl NetworkAddress {
 	}
 
 	/// Converts the IP address to a 16-byte network order representation
-	pub(crate) fn address_to_network_bytes(&self) -> [u8; 16] {
+	pub(crate) const fn address_to_network_bytes(&self) -> [u8; 16] {
 		match &self.address {
 			IpAddr::V4(ipv4) => ipv4_to_mapped_ipv6(*ipv4),
 			IpAddr::V6(ipv6) => ipv6.octets(),
@@ -129,7 +134,7 @@ impl NetworkAddress {
 
 bitflags! {
 	/// Represents the services offered by a node
-	#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+	#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 	pub struct ServiceMask: u64 {
 		/// Node can serve full blocks
 		const NODE_NETWORK = 1;
@@ -154,6 +159,26 @@ bitflags! {
 	}
 }
 
+/// Distinguishes incomplete data (need more bytes) from corrupt data (bad magic, checksum, etc)
+#[derive(Debug)]
+pub enum MessageParseError {
+	/// Not enough bytes yet -- wait for more data
+	Incomplete,
+	/// Data is corrupt -- disconnect the peer
+	Corrupt(String),
+}
+
+impl std::fmt::Display for MessageParseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Incomplete => write!(f, "incomplete message data"),
+			Self::Corrupt(reason) => write!(f, "corrupt message: {reason}"),
+		}
+	}
+}
+
+impl std::error::Error for MessageParseError {}
+
 /// Represents a Catcoin network message
 #[derive(Debug)]
 pub struct Message {
@@ -166,15 +191,22 @@ pub struct Message {
 
 impl Message {
 	/// Creates a new `NetworkMessage` with the given command and payload
-	pub fn new(command: &str, payload: Vec<u8>) -> Result<Self> {
-		// Payload is bounded by MAX_MESSAGE_SIZE (5MB), fits in u32
+	pub fn new(command: &str, payload: &[u8]) -> Result<Self> {
+		if payload.len() > MAX_MESSAGE_SIZE {
+			return Err(anyhow!(
+				"payload size {} exceeds maximum {MAX_MESSAGE_SIZE}",
+				payload.len()
+			));
+		}
+
+		// Payload is validated <= MAX_MESSAGE_SIZE (5MB), fits in u32
 		#[allow(clippy::cast_possible_truncation)]
 		let mut msg = Self {
 			magic: NET_MAGIC,
 			command: [0; COMMAND_LENGTH],
 			length: payload.len() as u32,
 			checksum: 0,
-			payload,
+			payload: payload.to_vec(),
 		};
 
 		msg.set_command(command)?;
@@ -227,7 +259,9 @@ impl Message {
 
 	/// Converts the `NetworkMessage` to a byte vector for network transmission
 	pub fn to_bytes(&self) -> Vec<u8> {
-		let mut bytes = Vec::new();
+		// Header (24 bytes) + payload; both operands are bounded so no overflow is possible
+		#[allow(clippy::arithmetic_side_effects)]
+		let mut bytes = Vec::with_capacity(24 + self.payload.len());
 		bytes.extend_from_slice(&self.magic);
 		bytes.extend_from_slice(&self.command);
 		bytes.extend_from_slice(&self.length.to_le_bytes());
@@ -236,50 +270,67 @@ impl Message {
 		bytes
 	}
 
-	/// Decodes a `NetworkMessage` from a byte slice
-	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+	/// Decodes a `NetworkMessage` from a byte slice, returning the message and the number of bytes consumed
+	pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), MessageParseError> {
 		// Header size: magic(4) + command(COMMAND_LENGTH) + length(4) + checksum(4)
 		let header_size = 4 + COMMAND_LENGTH + 4 + 4;
 
 		if bytes.len() < header_size {
-			return Err(anyhow!("Byte slice is too short for a valid NetworkMessage"));
+			return Err(MessageParseError::Incomplete);
 		}
 
 		let mut cursor = Cursor::new(bytes);
 
 		// Read magic
 		let mut magic = [0u8; 4];
-		cursor.read_exact(&mut magic)?;
+		cursor
+			.read_exact(&mut magic)
+			.map_err(|e| MessageParseError::Corrupt(e.to_string()))?;
 
 		if magic != NET_MAGIC {
-			return Err(anyhow!("Invalid network magic"));
+			return Err(MessageParseError::Corrupt("invalid network magic".to_string()));
 		}
 
 		// Read command
 		let mut command = [0u8; COMMAND_LENGTH];
-		cursor.read_exact(&mut command)?;
+		cursor
+			.read_exact(&mut command)
+			.map_err(|e| MessageParseError::Corrupt(e.to_string()))?;
 
 		// Read length
-		let length = cursor.read_u32::<LittleEndian>()?;
+		let length = cursor
+			.read_u32::<LittleEndian>()
+			.map_err(|e| MessageParseError::Corrupt(e.to_string()))?;
+
+		// Validate length before allocating -- prevents a peer from forcing 5MB allocation per connection
+		// length is u32, MAX_MESSAGE_SIZE is usize; compare as usize on 64-bit
+		#[allow(clippy::cast_possible_truncation)]
+		if length as usize > MAX_MESSAGE_SIZE {
+			return Err(MessageParseError::Corrupt(format!(
+				"declared length {length} exceeds maximum of {MAX_MESSAGE_SIZE}"
+			)));
+		}
 
 		// Read checksum
-		let checksum = cursor.read_u32::<LittleEndian>()?;
+		let checksum = cursor
+			.read_u32::<LittleEndian>()
+			.map_err(|e| MessageParseError::Corrupt(e.to_string()))?;
 
 		// length is u32, header_size is 24; can't overflow usize on 64-bit
 		#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 		let total_size = header_size + length as usize;
 
 		if bytes.len() < total_size {
-			return Err(anyhow!("Byte slice is too short for the entire NetworkMessage"));
+			return Err(MessageParseError::Incomplete);
 		}
 
-		// Read payload
-		// length is u32, safe to cast on 64-bit
+		// Read payload; length <= MAX_MESSAGE_SIZE is validated above, safe to cast
 		#[allow(clippy::cast_possible_truncation)]
 		let mut payload = vec![0u8; length as usize];
-		cursor.read_exact(&mut payload)?;
+		cursor
+			.read_exact(&mut payload)
+			.map_err(|e| MessageParseError::Corrupt(e.to_string()))?;
 
-		// Create the NetworkMessage
 		let msg = Self {
 			magic,
 			command,
@@ -291,10 +342,10 @@ impl Message {
 		// Verify checksum
 		let calculated_checksum = msg.calculate_checksum();
 		if calculated_checksum != checksum {
-			return Err(anyhow!("Checksum mismatch"));
+			return Err(MessageParseError::Corrupt("checksum mismatch".to_string()));
 		}
 
-		Ok(msg)
+		Ok((msg, total_size))
 	}
 }
 
@@ -311,56 +362,55 @@ pub enum NetworkCommand {
 	Unknown(String),
 }
 
-impl FromStr for NetworkCommand {
-	type Err = ();
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s.to_lowercase().as_str() {
-			"version" => Ok(Self::Version),
-			"verack" => Ok(Self::Verack),
-			"ping" => Ok(Self::Ping),
-			"pong" => Ok(Self::Pong),
-			"alert" => Ok(Self::Alert),
-			"getaddr" => Ok(Self::GetAddr),
-			"addr" => Ok(Self::Addr),
-			_ => Ok(Self::Unknown(s.to_string())),
+impl NetworkCommand {
+	/// Parses a command string into a `NetworkCommand` variant
+	pub(crate) fn from_command_str(s: &str) -> Self {
+		// Protocol commands are always lowercase ASCII on the wire
+		match s {
+			"version" => Self::Version,
+			"verack" => Self::Verack,
+			"ping" => Self::Ping,
+			"pong" => Self::Pong,
+			"alert" => Self::Alert,
+			"getaddr" => Self::GetAddr,
+			"addr" => Self::Addr,
+			_ => Self::Unknown(s.to_string()),
 		}
 	}
 }
 
-/// Encodes a u64 as a variable length integer (`VarInt`)
-fn encode_varint(n: u64) -> Vec<u8> {
+/// Writes a variable length integer (`VarInt`) directly into the given buffer
+pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
 	// Each cast is guarded by the if/else range check above it
 	if n < 0xfd {
 		// Range check above guarantees n fits in u8
 		#[allow(clippy::cast_possible_truncation)]
-		let byte = n as u8;
-		vec![byte]
+		buf.push(n as u8);
 	} else if n <= 0xffff {
-		let mut v = vec![0xfd];
+		buf.push(0xfd);
 		#[allow(clippy::cast_possible_truncation)]
-		v.extend_from_slice(&(n as u16).to_le_bytes());
-		v
+		buf.extend_from_slice(&(n as u16).to_le_bytes());
 	} else if n <= 0xffff_ffff {
-		let mut v = vec![0xfe];
+		buf.push(0xfe);
 		#[allow(clippy::cast_possible_truncation)]
-		v.extend_from_slice(&(n as u32).to_le_bytes());
-		v
+		buf.extend_from_slice(&(n as u32).to_le_bytes());
 	} else {
-		let mut v = vec![0xff];
-		v.extend_from_slice(&n.to_le_bytes());
-		v
+		buf.push(0xff);
+		buf.extend_from_slice(&n.to_le_bytes());
 	}
 }
 
-/// Encodes a string as a variable length string
+/// Encodes a string as a variable-length string for the wire protocol
 pub fn encode_varstr(s: &str) -> Vec<u8> {
-	let mut encoded = encode_varint(s.len() as u64);
+	// s.len() + 9 (max varint) cannot overflow usize for any real string
+	#[allow(clippy::arithmetic_side_effects)]
+	let mut encoded = Vec::with_capacity(s.len() + 9);
+	write_varint(&mut encoded, s.len() as u64);
 	encoded.extend_from_slice(s.as_bytes());
 	encoded
 }
 
-/// Decodes a u64 from a variable length integer (`VarInt`)
+/// Decodes a variable-length integer from a cursor
 pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 	let first_byte: u8 = cursor.read_u8()?;
 
@@ -408,6 +458,7 @@ pub struct NetworkQueue {
 }
 
 impl NetworkQueue {
+	/// Creates a new empty `NetworkQueue`
 	pub const fn new() -> Self {
 		Self {
 			buffer: Vec::new(),
@@ -419,17 +470,33 @@ impl NetworkQueue {
 	pub fn process_incoming_data(&mut self, data: &[u8]) -> Result<()> {
 		self.buffer.extend_from_slice(data);
 
+		let mut consumed = 0;
 		loop {
-			if let Ok(message) = Message::from_bytes(&self.buffer) {
-				let message_len = message.to_bytes().len();
-				self.messages.push_back(message);
-				self.buffer = self.buffer.split_off(message_len);
-			} else {
-				if self.buffer.len() > MAX_MESSAGE_SIZE {
-					return Err(anyhow!("Received oversized message"));
+			// consumed is always <= self.buffer.len() by construction
+			#[allow(clippy::indexing_slicing)]
+			match Message::from_bytes(&self.buffer[consumed..]) {
+				Ok((message, len)) => {
+					// consumed + len <= buffer.len() by construction, no overflow possible
+					#[allow(clippy::arithmetic_side_effects)]
+					{
+						consumed += len;
+					}
+					self.messages.push_back(message);
 				}
-				break;
+				Err(MessageParseError::Incomplete) => break,
+				Err(MessageParseError::Corrupt(reason)) => {
+					return Err(anyhow!("Corrupt message data: {reason}"));
+				}
 			}
+		}
+
+		if consumed > 0 {
+			// Batch drain instead of per-message split_off
+			self.buffer.drain(..consumed);
+		}
+
+		if self.buffer.len() > MAX_MESSAGE_SIZE {
+			return Err(anyhow!("Buffer exceeds maximum message size"));
 		}
 
 		Ok(())
@@ -441,6 +508,7 @@ impl NetworkQueue {
 	}
 }
 
+/// Starts the TCP listener for incoming peer connections
 pub async fn listening_start(node_manager: Arc<NodeManager>) {
 	trace!("listening_start task started");
 
@@ -456,8 +524,9 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 		let connection = match tcp_listener.accept().await {
 			Ok(handle) => handle,
 			Err(error) => {
-				error!("Failed to accept new connection: {:?}", error);
-				break;
+				warn!("Failed to accept connection: {:?}", error);
+				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+				continue;
 			}
 		};
 
@@ -475,8 +544,8 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 			tokio::spawn(async move {
 				node_connection_loop(Arc::clone(&nm_clone), node_endpoint.clone(), tcp_stream).await;
 
-				// If the connection loop ended, it means that the connection was closed
-				nm_clone.set_connected(&node_endpoint, false);
+				// Incoming connections can't be retried (we don't know their real port)
+				nm_clone.set_state(&node_endpoint, NodeState::Dead);
 			});
 		} else {
 			debug!("Dropping connection {} as node exists already", node_endpoint);
@@ -484,8 +553,6 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 			_ = tcp_stream.shutdown().await;
 		}
 	}
-
-	trace!("listening_start task finished");
 }
 
 #[cfg(test)]
@@ -540,5 +607,54 @@ mod tests {
 		// The wire format is: 8 bytes services + 16 bytes IP + 2 bytes port
 		let port_bytes = &bytes[24..26];
 		assert_eq!(port_bytes, &port.to_be_bytes(), "port must be big-endian on the wire");
+	}
+
+	#[test]
+	fn from_bytes_returns_consumed_length() {
+		let msg = Message::new("ping", &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+		let bytes = msg.to_bytes();
+		let mut extended = bytes.clone();
+		extended.extend_from_slice(&[0xFF; 50]);
+
+		let (parsed, consumed) = Message::from_bytes(&extended).unwrap();
+		assert_eq!(consumed, bytes.len());
+		assert_eq!(parsed.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+	}
+
+	#[test]
+	fn from_bytes_rejects_bad_magic_immediately() {
+		let mut bytes = vec![0x00, 0x00, 0x00, 0x00];
+		bytes.extend_from_slice(&[0u8; 20]);
+		let err = Message::from_bytes(&bytes).unwrap_err();
+		assert!(matches!(err, MessageParseError::Corrupt(_)));
+	}
+
+	#[test]
+	fn from_bytes_returns_incomplete_for_short_buffer() {
+		let bytes = vec![0xFC, 0xC1, 0xB7, 0xDC];
+		let err = Message::from_bytes(&bytes).unwrap_err();
+		assert!(matches!(err, MessageParseError::Incomplete));
+	}
+
+	#[test]
+	fn from_bytes_rejects_oversized_declared_length() {
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&[0xFC, 0xC1, 0xB7, 0xDC]);
+		bytes.extend_from_slice(&[0u8; 12]);
+		bytes.extend_from_slice(&((MAX_MESSAGE_SIZE as u32) + 1).to_le_bytes());
+		bytes.extend_from_slice(&[0u8; 4]);
+		let err = Message::from_bytes(&bytes).unwrap_err();
+		assert!(matches!(err, MessageParseError::Corrupt(_)));
+	}
+
+	#[test]
+	fn process_incoming_data_detects_corrupt_magic() {
+		let mut queue = NetworkQueue::new();
+		let bad_data = vec![
+			0x00, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		];
+		let result = queue.process_incoming_data(&bad_data);
+		assert!(result.is_err());
 	}
 }

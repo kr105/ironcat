@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
+use std::net::SocketAddr;
 
 /// ironcat - Catcoin network client
 #[derive(Parser, Debug)]
@@ -9,6 +10,10 @@ pub struct Args {
 	/// Run in daemon mode (no TUI, logs to stderr)
 	#[arg(long)]
 	pub daemon: bool,
+
+	/// Seed node address to connect to on startup
+	#[arg(long, default_value = "161.129.176.92:9933")]
+	pub seed: SocketAddr,
 }
 
 #[cfg(test)]
@@ -27,5 +32,17 @@ mod tests {
 	fn daemon_flag_sets_true() {
 		let args = Args::parse_from(["ironcat", "--daemon"]);
 		assert!(args.daemon);
+	}
+
+	#[test]
+	fn default_seed_address() {
+		let args = Args::parse_from(["ironcat"]);
+		assert_eq!(args.seed.to_string(), "161.129.176.92:9933");
+	}
+
+	#[test]
+	fn custom_seed_address() {
+		let args = Args::parse_from(["ironcat", "--seed", "10.0.0.1:8080"]);
+		assert_eq!(args.seed.to_string(), "10.0.0.1:8080");
 	}
 }

@@ -23,7 +23,14 @@ use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
 #[allow(clippy::needless_pass_by_value)]
 pub fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<TuiLogEntry>) {
 	let terminal = ratatui::init();
-	_ = run(terminal, &node_manager, log_receiver).context("app loop failed");
+	if let Err(e) = run(terminal, &node_manager, log_receiver) {
+		// TUI owns the terminal, tracing may route to the dead TUI channel,
+		// so use stderr directly
+		#[allow(clippy::print_stderr)]
+		{
+			eprintln!("TUI error: {e:?}");
+		}
+	}
 	ratatui::restore();
 }
 
@@ -131,37 +138,34 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	frame.render_widget(stats_paragraph, chunks[0]);
 
 	// Bottom half: Nodes table sorted by height
-	let mut nodes: Vec<_> = node_manager.nodes.iter().collect();
-	nodes.sort_by(|a, b| b.value().height.cmp(&a.value().height));
+	let mut nodes = node_manager.get_all_nodes();
+	nodes.sort_by(|a, b| b.height.cmp(&a.height));
 
 	let header = Row::new(vec![
 		Cell::from("Endpoint"),
 		Cell::from("Height"),
-		Cell::from("Connected"),
+		Cell::from("State"),
 		Cell::from("Type"),
 	]);
 
 	let rows: Vec<Row> = nodes
 		.iter()
 		.map(|node| {
-			let node = node.value();
 			Row::new(vec![
 				Cell::from(node.endpoint.to_string()),
 				Cell::from(node.height.to_string()),
-				Cell::from(node.connected.to_string()),
+				Cell::from(node.state_label.clone()),
 				Cell::from(node.connection_type.to_string()),
 			])
 		})
 		.collect();
-
-	drop(nodes);
 
 	let table = Table::new(
 		rows,
 		vec![
 			Constraint::Percentage(50), // "Endpoint" column width
 			Constraint::Percentage(15), // "Height" column width
-			Constraint::Percentage(15), // "Connected" column width
+			Constraint::Percentage(15), // "State" column width
 			Constraint::Percentage(15), // "Type" column width
 		],
 	)

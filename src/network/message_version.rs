@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{decode_varstr, encode_varstr, NetworkAddress, ServiceMask};
+use crate::utils::unix_now;
 use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::{
-	io::{Cursor, Read},
-	time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::{Cursor, Read};
 
 const USER_AGENT: &str = "/Ironcat:0.0.1/";
 const PROTOCOL_VERSION: u32 = 70003;
+
+/// Placeholder start height until actual chain state is available
+const DEFAULT_START_HEIGHT: i32 = 300_000;
 
 /// Represents a version message in the Catcoin protocol
 #[derive(Debug)]
@@ -35,21 +36,14 @@ pub struct MessageVersion {
 }
 
 impl MessageVersion {
+	/// Creates a new version message for the given receiving address and nonce
 	pub fn new(addr_recv: NetworkAddress, nonce: u64) -> Self {
 		let mut services = ServiceMask::empty();
-		services.set(ServiceMask::NODE_NETWORK, true);
-
-		// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
-		// is before 1970, which is not a realistic scenario
-		#[allow(clippy::expect_used)]
-		let timestamp = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_secs();
+		services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
 
 		// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
 		#[allow(clippy::cast_possible_wrap)]
-		let timestamp = timestamp as i64;
+		let timestamp = unix_now() as i64;
 
 		Self {
 			version: PROTOCOL_VERSION,
@@ -58,7 +52,7 @@ impl MessageVersion {
 			addr_recv,
 			nonce,
 			user_agent: USER_AGENT.to_string(),
-			start_height: 300_000,
+			start_height: DEFAULT_START_HEIGHT,
 			relay: true,
 		}
 	}
@@ -82,6 +76,7 @@ impl MessageVersion {
 		bytes
 	}
 
+	/// Decodes a version message from wire bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		if bytes.len() < 85 {
 			return Err(anyhow!("Insufficient bytes for MessageVersion"));
@@ -118,13 +113,7 @@ impl MessageVersion {
 			.read_i32::<LittleEndian>()
 			.context("failed to read start_height")?;
 
-		// Latest "stable" Catcoin client has version 70003
-		// and does not include this field on this message
-		let relay = if version > 70003 {
-			cursor.read_u8().context("failed to read relay field")? != 0
-		} else {
-			false
-		};
+		let relay = cursor.read_u8().context("failed to read relay field")? != 0;
 
 		Ok(Self {
 			version,
@@ -167,6 +156,8 @@ mod tests {
 		bytes.push(0x00);
 		// start_height (i32 LE)
 		bytes.extend_from_slice(&300_000i32.to_le_bytes());
+		// relay (BIP 37)
+		bytes.push(0x01);
 
 		bytes
 	}
@@ -203,5 +194,24 @@ mod tests {
 		assert_eq!(decoded.nonce, original.nonce);
 		assert_eq!(decoded.start_height, original.start_height);
 		assert_eq!(decoded.user_agent, original.user_agent);
+		assert_eq!(decoded.relay, original.relay);
+	}
+
+	#[test]
+	fn from_bytes_without_relay_fails() {
+		let mut payload = build_version_payload(ServiceMask::NODE_NETWORK.bits());
+		payload.pop(); // Remove the relay byte
+		let result = MessageVersion::from_bytes(&payload);
+		assert!(result.is_err(), "missing relay field should fail parsing");
+	}
+
+	#[test]
+	fn from_bytes_with_relay_false() {
+		let mut payload = build_version_payload(ServiceMask::NODE_NETWORK.bits());
+		// Replace relay=true with relay=false
+		payload.pop();
+		payload.push(0x00);
+		let msg = MessageVersion::from_bytes(&payload).unwrap();
+		assert!(!msg.relay);
 	}
 }
