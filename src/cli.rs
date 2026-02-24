@@ -12,6 +12,7 @@ pub struct Args {
 }
 
 #[cfg(test)]
+// Tests use unwrap for brevity since panics are the intended failure mode
 #[allow(clippy::unwrap_used)]
 mod tests {
 	use super::*;

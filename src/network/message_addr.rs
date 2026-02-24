@@ -30,7 +30,7 @@ impl MessageAddr {
 			.expect("Time went backwards")
 			.as_secs();
 
-		// Bitcoin protocol uses u32 timestamps, valid until 2106
+		// Catcoin protocol uses u32 timestamps, valid until 2106
 		#[allow(clippy::cast_possible_truncation)]
 		let timestamp = timestamp as u32;
 

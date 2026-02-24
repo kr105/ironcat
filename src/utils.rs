@@ -24,16 +24,17 @@ pub fn is_recently_active(timestamp: u32) -> bool {
 		.expect("Time went backwards")
 		.as_secs();
 
-	// Timestamps in the Bitcoin protocol use u32, which is valid until 2106
+	// Catcoin protocol uses u32 timestamps, valid until 2106
 	#[allow(clippy::cast_possible_truncation)]
 	let now = now as u32;
 
-	// Calculate timestamp from 6 hours ago
-	#[allow(clippy::arithmetic_side_effects)]
-	let six_hours_ago = now.saturating_sub(60 * 60 * 6);
+	// Allow timestamps up to 10 minutes in the future (clock skew tolerance)
+	let max_future = now.saturating_add(60 * 10);
 
-	// Compare
-	timestamp >= six_hours_ago && timestamp <= now
+	// Accept nodes seen within the last 24 hours
+	let cutoff = now.saturating_sub(60 * 60 * 24);
+
+	timestamp >= cutoff && timestamp <= max_future
 }
 
 /// Converts an IPv4 address to an IPv4-mapped IPv6 address in network byte order

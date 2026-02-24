@@ -65,6 +65,7 @@ impl fmt::Display for ConnectionType {
 }
 
 /// Represents a node in the Catcoin network
+// Node state is inherently boolean-heavy (connected, timed_out, ver_ack, etc)
 #[allow(clippy::struct_excessive_bools)]
 pub struct Node {
 	pub endpoint: NodeEndpoint,
@@ -397,6 +398,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 }
 
 /// Parses and handles an incoming message from a node
+// Message dispatch with per-command handling is inherently long
 #[allow(clippy::too_many_lines)]
 async fn parse_incoming_message(
 	node_manager: Arc<NodeManager>,
@@ -530,7 +532,7 @@ async fn parse_incoming_message(
 			let mut cursor = Cursor::new(message.payload.as_slice());
 			let count = decode_varint(&mut cursor).context("failed to decode addr count")?;
 
-			// Bitcoin/Catcoin protocol limits addr messages to 1000 entries
+			// Catcoin protocol limits addr messages to 1000 entries
 			if count > 1000 {
 				return Err(anyhow!(
 					"addr message from {node_endpoint} claims {count} entries, max is 1000"

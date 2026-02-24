@@ -65,6 +65,7 @@ impl MessageVersion {
 
 	/// Converts the `MessageVersion` to a byte vector for network transmission
 	pub fn to_bytes(&self) -> Vec<u8> {
+		// user_agent is a short string, can't overflow usize
 		#[allow(clippy::arithmetic_side_effects)]
 		let capacity = 85 + self.user_agent.len();
 
@@ -139,6 +140,7 @@ impl MessageVersion {
 }
 
 #[cfg(test)]
+// Tests use unwrap for brevity since panics are the intended failure mode
 #[allow(clippy::unwrap_used)]
 mod tests {
 	use super::*;

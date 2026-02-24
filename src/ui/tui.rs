@@ -19,6 +19,7 @@ use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
 ///
 /// Takes ownership of both arguments because this runs via `spawn_blocking`
 /// which requires `'static + Send`
+// spawn_blocking requires 'static + Send, so ownership is needed
 #[allow(clippy::needless_pass_by_value)]
 pub fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<TuiLogEntry>) {
 	let terminal = ratatui::init();
@@ -54,20 +55,23 @@ fn run(
 }
 
 /// Renders the TUI layout and content
-#[allow(clippy::indexing_slicing)]
 fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &VecDeque<TuiLogEntry>) {
-	// Layout always returns exactly the number of constraints provided
+	// Layout returns exactly the number of constraints provided (2)
 	let layout = Layout::default()
 		.direction(Direction::Horizontal)
 		.constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
 		.split(frame.area());
 
 	// Render left panel
+	#[allow(clippy::indexing_slicing)]
 	draw_left_panel(frame, layout[0], node_manager);
 
 	// Render log panel
 	let log_block = Block::default().borders(Borders::ALL).title("Logs");
+	// Layout has 2 elements, index [1] is safe
+	#[allow(clippy::indexing_slicing)]
 	let inner_area = log_block.inner(layout[1]);
+	#[allow(clippy::indexing_slicing)]
 	frame.render_widget(log_block, layout[1]);
 
 	// Calculate visible lines to create the scrolling effect
@@ -108,10 +112,8 @@ fn create_log_text(log_buffer: &VecDeque<TuiLogEntry>, visible_lines: usize) -> 
 	text
 }
 
-#[allow(clippy::indexing_slicing)]
 fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
-	// Split the panel horizontally
-	// Layout always returns exactly the number of constraints provided
+	// Layout returns exactly the number of constraints provided (2)
 	let chunks = Layout::default()
 		.direction(Direction::Vertical)
 		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -124,6 +126,8 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		stats.total, stats.connected, stats.disconnected
 	);
 	let stats_paragraph = Paragraph::new(stats_text).block(Block::default().borders(Borders::ALL).title("Node Stats"));
+	// chunks has 2 elements from the 2 constraints above
+	#[allow(clippy::indexing_slicing)]
 	frame.render_widget(stats_paragraph, chunks[0]);
 
 	// Bottom half: Nodes table sorted by height
@@ -164,6 +168,8 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	.header(header)
 	.block(Block::default().borders(Borders::ALL).title("Connected Nodes"));
 
+	// chunks has 2 elements from the 2 constraints above
+	#[allow(clippy::indexing_slicing)]
 	frame.render_widget(table, chunks[1]);
 }
 

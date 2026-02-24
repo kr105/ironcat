@@ -57,7 +57,7 @@ impl SharedTcpWriterExt for SharedTcpWriter {
 	}
 }
 
-/// Represents a network address in the Bitcoin protocol
+/// Represents a network address in the Catcoin protocol
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct NetworkAddress {
 	/// bitfield of features to be enabled for this connection
@@ -92,7 +92,6 @@ impl NetworkAddress {
 	}
 
 	/// Decodes an Address from a slice of network bytes
-	#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
 		if bytes.len() != 26 {
 			return Err(std::io::Error::new(
@@ -101,12 +100,15 @@ impl NetworkAddress {
 			));
 		}
 
-		// Slicing and unwraps below are safe because of the length check above
+		// Slicing and try_into below are safe: length == 26 is checked above
+		#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 		let services = ServiceMask::from_bits_truncate(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
 
+		#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 		let ip_bytes: [u8; 16] = bytes[8..24].try_into().unwrap();
 		let address = IpAddr::from(ip_bytes).to_canonical();
 
+		#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 		let port = u16::from_be_bytes(bytes[24..26].try_into().unwrap());
 
 		Ok(Self {
@@ -164,8 +166,9 @@ pub struct Message {
 
 impl Message {
 	/// Creates a new `NetworkMessage` with the given command and payload
-	#[allow(clippy::cast_possible_truncation)]
 	pub fn new(command: &str, payload: Vec<u8>) -> Result<Self> {
+		// Payload is bounded by MAX_MESSAGE_SIZE (5MB), fits in u32
+		#[allow(clippy::cast_possible_truncation)]
 		let mut msg = Self {
 			magic: NET_MAGIC,
 			command: [0; COMMAND_LENGTH],
@@ -181,7 +184,6 @@ impl Message {
 	}
 
 	/// Sets the command for the message
-	#[allow(clippy::indexing_slicing)]
 	fn set_command(&mut self, command: &str) -> Result<()> {
 		if !command.is_ascii() {
 			return Err(anyhow!("Command contains non-ASCII characters"));
@@ -199,15 +201,14 @@ impl Message {
 
 		// Copy command string into fixed-size array, leaving the last byte as 0
 		// Slice is safe: command.len() < COMMAND_LENGTH is checked above
+		#[allow(clippy::indexing_slicing)]
 		self.command[..command.len()].copy_from_slice(command.as_bytes());
-		// The rest of the array is already initialized to 0, so we don't need to set it explicitly
 
 		Ok(())
 	}
 
 	/// Calculate the checksum for the message payload
 	/// The checksum is the first 4 bytes of the double SHA256 hash of the payload
-	#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 	fn calculate_checksum(&self) -> u32 {
 		let mut hasher = Sha256::new();
 
@@ -220,6 +221,7 @@ impl Message {
 		let second_hash = hasher.finalize();
 
 		// SHA256 always produces 32 bytes, so slicing [..4] is always safe
+		#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 		u32::from_le_bytes(second_hash[..4].try_into().unwrap())
 	}
 
@@ -235,10 +237,8 @@ impl Message {
 	}
 
 	/// Decodes a `NetworkMessage` from a byte slice
-	#[allow(clippy::cast_possible_truncation)]
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		// Header size: magic(4) + command(COMMAND_LENGTH) + length(4) + checksum(4)
-		#[allow(clippy::arithmetic_side_effects)]
 		let header_size = 4 + COMMAND_LENGTH + 4 + 4;
 
 		if bytes.len() < header_size {
@@ -265,7 +265,8 @@ impl Message {
 		// Read checksum
 		let checksum = cursor.read_u32::<LittleEndian>()?;
 
-		#[allow(clippy::arithmetic_side_effects)]
+		// length is u32, header_size is 24; can't overflow usize on 64-bit
+		#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 		let total_size = header_size + length as usize;
 
 		if bytes.len() < total_size {
@@ -273,6 +274,8 @@ impl Message {
 		}
 
 		// Read payload
+		// length is u32, safe to cast on 64-bit
+		#[allow(clippy::cast_possible_truncation)]
 		let mut payload = vec![0u8; length as usize];
 		cursor.read_exact(&mut payload)?;
 
@@ -326,16 +329,21 @@ impl FromStr for NetworkCommand {
 }
 
 /// Encodes a u64 as a variable length integer (`VarInt`)
-#[allow(clippy::cast_possible_truncation)]
 fn encode_varint(n: u64) -> Vec<u8> {
+	// Each cast is guarded by the if/else range check above it
 	if n < 0xfd {
-		vec![n as u8]
+		// Range check above guarantees n fits in u8
+		#[allow(clippy::cast_possible_truncation)]
+		let byte = n as u8;
+		vec![byte]
 	} else if n <= 0xffff {
 		let mut v = vec![0xfd];
+		#[allow(clippy::cast_possible_truncation)]
 		v.extend_from_slice(&(n as u16).to_le_bytes());
 		v
 	} else if n <= 0xffff_ffff {
 		let mut v = vec![0xfe];
+		#[allow(clippy::cast_possible_truncation)]
 		v.extend_from_slice(&(n as u32).to_le_bytes());
 		v
 	} else {
@@ -377,14 +385,16 @@ pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 }
 
 /// Decodes a string from a variable length string
-#[allow(clippy::cast_possible_truncation)]
 pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 	let length = decode_varint(cursor)?;
 
+	// length is validated <= MAX_VARSTR_LENGTH (4096), fits in usize
+	#[allow(clippy::cast_possible_truncation)]
 	if length as usize > MAX_VARSTR_LENGTH {
 		return Err(anyhow!("varstr length {length} exceeds maximum of {MAX_VARSTR_LENGTH}"));
 	}
 
+	#[allow(clippy::cast_possible_truncation)]
 	let mut str_bytes = vec![0u8; length as usize];
 	cursor.read_exact(&mut str_bytes)?;
 
@@ -479,6 +489,7 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 }
 
 #[cfg(test)]
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
 	use super::*;
