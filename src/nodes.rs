@@ -3,15 +3,9 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rand::RngCore;
-use std::{
-	ffi::CStr,
-	fmt,
-	net::IpAddr,
-	sync::Arc,
-	time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{ffi::CStr, fmt, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
-	io::{self, AsyncWriteExt},
+	io::{self, AsyncWriteExt, BufReader},
 	net::TcpStream,
 	sync::Mutex,
 	time::{sleep, timeout, Instant},
@@ -23,7 +17,7 @@ use crate::{
 		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
 		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
-	utils::{is_recently_active, u64_to_vec_le, vec_to_u64_le},
+	utils::{is_recently_active, unix_now, vec_to_u64_le},
 };
 
 /// Base delay for exponential backoff in seconds
@@ -37,6 +31,30 @@ const MAX_RETRY_ATTEMPTS: u32 = 10;
 
 /// Maximum number of nodes to track
 const MAX_NODES: usize = 5000;
+
+/// Maximum TCP connection attempts per cycle
+const TCP_MAX_ATTEMPTS: u32 = 3;
+
+/// Delay between TCP connection retries
+const TCP_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Timeout for a single TCP connect attempt
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between keepalive pings
+const PING_INTERVAL: Duration = Duration::from_secs(180);
+
+/// How long a node can sit in Connecting before the reaper reclaims it
+const STALE_CONNECTING_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a node can sit in Handshaking before the reaper reclaims it
+const STALE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the reaper scans for retryable/stale nodes
+const REAPER_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Window for "recently active" outgoing nodes in `GetAddr` responses (2 hours)
+const GETADDR_RECENT_WINDOW: u64 = 60 * 60 * 2;
 
 /// Reason why a node was permanently banned
 #[derive(Debug)]
@@ -62,7 +80,7 @@ pub enum NodeState {
 	/// TCP connect in progress
 	Connecting { since: Instant },
 	/// TCP connected, version handshake in progress
-	Handshaking,
+	Handshaking { since: Instant },
 	/// Fully connected and operational
 	Connected { writer: SharedTcpWriter },
 	/// Disconnected, will retry after `retry_at` with exponential backoff
@@ -85,8 +103,6 @@ impl NodeState {
 	}
 
 	/// Whether this node is permanently banned
-	// Part of the NodeState public API, will be used when ban checking is implemented
-	#[allow(dead_code)]
 	pub const fn is_banned(&self) -> bool {
 		matches!(self, Self::Banned { .. })
 	}
@@ -170,16 +186,7 @@ impl fmt::Display for ConnectionType {
 pub struct NodeSnapshot {
 	pub endpoint: NodeEndpoint,
 	pub height: i32,
-	// Will be used by TUI enhancements and filtering logic
-	#[allow(dead_code)]
-	pub connected: bool,
 	pub connection_type: ConnectionType,
-	// Will be used by TUI detail view
-	#[allow(dead_code)]
-	pub user_agent: String,
-	// Will be used by TUI detail view
-	#[allow(dead_code)]
-	pub version: u32,
 	pub state_label: String,
 }
 
@@ -191,6 +198,9 @@ pub struct Node {
 	pub last_seen: u64,
 
 	pub version: u32,
+
+	/// Whether we have received a version message from this peer
+	pub version_received: bool,
 
 	pub services: ServiceMask,
 
@@ -251,7 +261,7 @@ impl NodeManager {
 			dashmap::mapref::entry::Entry::Vacant(vacant) => {
 				let initial_state = match connection_type {
 					ConnectionType::Outgoing => NodeState::Connecting { since: Instant::now() },
-					ConnectionType::Incoming => NodeState::Handshaking,
+					ConnectionType::Incoming => NodeState::Handshaking { since: Instant::now() },
 				};
 
 				let node = Node {
@@ -263,6 +273,7 @@ impl NodeManager {
 					timestamp: 0,
 					user_agent: String::new(),
 					version: 0,
+					version_received: false,
 					connection_type,
 					state: initial_state,
 				};
@@ -276,14 +287,7 @@ impl NodeManager {
 	/// Updates the `last_seen` timestamp for a node with the current time
 	pub fn update_last_seen(&self, node_endpoint: &NodeEndpoint) {
 		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
-			// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
-			// is before 1970, which is not a realistic scenario
-			#[allow(clippy::expect_used)]
-			let now = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.expect("Time went backwards")
-				.as_secs();
-			node.last_seen = now;
+			node.last_seen = unix_now();
 		}
 	}
 
@@ -320,9 +324,8 @@ impl NodeManager {
 		debug!("Sending ping to {}", node_endpoint);
 
 		let nonce = rand::thread_rng().next_u64();
-		let nonce_bytes = nonce.to_le_bytes();
 
-		if let Err(e) = tcp_writer.send_message("ping", Vec::from(nonce_bytes)).await {
+		if let Err(e) = tcp_writer.send_message("ping", &nonce.to_le_bytes()).await {
 			warn!("Failed to send ping to {}: {}", node_endpoint, e);
 		}
 	}
@@ -349,10 +352,7 @@ impl NodeManager {
 				NodeSnapshot {
 					endpoint: node.endpoint.clone(),
 					height: node.height,
-					connected: node.state.is_connected(),
 					connection_type: node.connection_type,
-					user_agent: node.user_agent.clone(),
-					version: node.version,
 					state_label: node.state.to_string(),
 				}
 			})
@@ -364,10 +364,8 @@ impl NodeManager {
 	/// Runs every 30 seconds and spawns connection tasks for nodes whose
 	/// backoff period has elapsed
 	pub async fn run_reaper(self: Arc<Self>) {
-		let scan_interval = Duration::from_secs(30);
-
 		loop {
-			tokio::time::sleep(scan_interval).await;
+			tokio::time::sleep(REAPER_SCAN_INTERVAL).await;
 
 			// Collect endpoints of nodes ready for retry
 			// We collect first to avoid holding DashMap locks during spawning
@@ -409,24 +407,28 @@ impl NodeManager {
 				});
 			}
 
-			// Detect nodes stuck in Connecting for too long (e.g. panicked task)
-			let stale_connecting: Vec<NodeEndpoint> = self
+			// Detect nodes stuck in Connecting or Handshaking for too long
+			let stale_nodes: Vec<NodeEndpoint> = self
 				.nodes
 				.iter()
 				.filter_map(|entry| {
-					if let NodeState::Connecting { since } = &entry.value().state {
-						if since.elapsed() > Duration::from_secs(300) {
-							return Some(entry.key().clone());
-						}
+					let is_stale = match &entry.value().state {
+						NodeState::Connecting { since } => since.elapsed() > STALE_CONNECTING_TIMEOUT,
+						NodeState::Handshaking { since } => since.elapsed() > STALE_HANDSHAKE_TIMEOUT,
+						_ => false,
+					};
+					if is_stale {
+						Some(entry.key().clone())
+					} else {
+						None
 					}
-					None
 				})
 				.collect();
 
-			for endpoint in stale_connecting {
-				warn!("Node {} stuck in Connecting for >5min, scheduling retry", endpoint);
+			for endpoint in stale_nodes {
+				warn!("Node {} stuck in stale state, scheduling retry", endpoint);
 				if let Some(mut node) = self.nodes.get_mut(&endpoint) {
-					if let NodeState::Connecting { .. } = node.state {
+					if matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. }) {
 						node.state = NodeState::Disconnected {
 							retry_at: Instant::now(),
 							attempt: 0,
@@ -503,9 +505,29 @@ impl NodeManager {
 	}
 }
 
+/// Schedules a retry or marks a node as dead based on attempt count
+fn schedule_retry(node_manager: &NodeManager, endpoint: &NodeEndpoint, attempt: u32) {
+	let next_attempt = attempt.saturating_add(1);
+	if next_attempt >= MAX_RETRY_ATTEMPTS {
+		info!("Node {} exhausted all retry attempts, marking dead", endpoint);
+		node_manager.set_state(endpoint, NodeState::Dead);
+	} else {
+		let backoff = calculate_backoff(next_attempt);
+		debug!("Node {} scheduling retry {} in {:?}", endpoint, next_attempt, backoff);
+		// Instant::now() + bounded Duration cannot overflow in practice
+		#[allow(clippy::arithmetic_side_effects)]
+		let retry_at = Instant::now() + backoff;
+		node_manager.set_state(
+			endpoint,
+			NodeState::Disconnected {
+				retry_at,
+				attempt: next_attempt,
+			},
+		);
+	}
+}
+
 /// Handles the connection to a node
-// Connection lifecycle (connect + handshake + backoff transitions) is inherently long
-#[allow(clippy::too_many_lines)]
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16, attempt: u32) {
 	let node_endpoint = NodeEndpoint { address, port };
 
@@ -519,85 +541,42 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
 	// Attempt to establish a TCP connection with retries
 	let mut tcp_stream = None;
-	let max_attempts = 3;
-	let delay_between_attempts = Duration::from_secs(30);
-	let connect_timeout = Duration::from_secs(10);
 
-	for tcp_attempt in 1..=max_attempts {
-		match timeout(connect_timeout, TcpStream::connect((address, port))).await {
+	for tcp_attempt in 1..=TCP_MAX_ATTEMPTS {
+		match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
 			Ok(Ok(stream)) => {
 				info!("Connected to {} on attempt {}", &node_endpoint, tcp_attempt);
 				tcp_stream = Some(stream);
 				break;
 			}
 			Ok(Err(e)) => {
-				if tcp_attempt < max_attempts {
+				if tcp_attempt < TCP_MAX_ATTEMPTS {
 					trace!(
 						"Failed to connect to {} on attempt {}: {}",
 						&node_endpoint,
 						tcp_attempt,
 						e
 					);
-					sleep(delay_between_attempts).await;
+					sleep(TCP_RETRY_DELAY).await;
 				} else {
 					debug!(
 						"Failed to connect to {} after {} attempts: {}",
-						&node_endpoint, max_attempts, e
+						&node_endpoint, TCP_MAX_ATTEMPTS, e
 					);
-					let next_attempt = attempt.saturating_add(1);
-					if next_attempt >= MAX_RETRY_ATTEMPTS {
-						info!("Node {} exhausted all retry attempts, marking dead", &node_endpoint);
-						node_manager.set_state(&node_endpoint, NodeState::Dead);
-					} else {
-						let backoff = calculate_backoff(next_attempt);
-						debug!(
-							"Node {} failed to connect, retry {} in {:?}",
-							&node_endpoint, next_attempt, backoff
-						);
-						// Instant::now() + bounded Duration cannot overflow in practice
-						#[allow(clippy::arithmetic_side_effects)]
-						let retry_at = Instant::now() + backoff;
-						node_manager.set_state(
-							&node_endpoint,
-							NodeState::Disconnected {
-								retry_at,
-								attempt: next_attempt,
-							},
-						);
-					}
+					schedule_retry(&node_manager, &node_endpoint, attempt);
 					return;
 				}
 			}
 			Err(_) => {
-				if tcp_attempt < max_attempts {
+				if tcp_attempt < TCP_MAX_ATTEMPTS {
 					trace!("Connection to {} timed out on attempt {}", &node_endpoint, tcp_attempt);
-					sleep(delay_between_attempts).await;
+					sleep(TCP_RETRY_DELAY).await;
 				} else {
 					debug!(
 						"Connection to {} timed out after {} attempts",
-						&node_endpoint, max_attempts
+						&node_endpoint, TCP_MAX_ATTEMPTS
 					);
-					let next_attempt = attempt.saturating_add(1);
-					if next_attempt >= MAX_RETRY_ATTEMPTS {
-						info!("Node {} exhausted all retry attempts, marking dead", &node_endpoint);
-						node_manager.set_state(&node_endpoint, NodeState::Dead);
-					} else {
-						let backoff = calculate_backoff(next_attempt);
-						debug!(
-							"Node {} timed out, retry {} in {:?}",
-							&node_endpoint, next_attempt, backoff
-						);
-						// Instant::now() + bounded Duration cannot overflow in practice
-						#[allow(clippy::arithmetic_side_effects)]
-						let retry_at = Instant::now() + backoff;
-						node_manager.set_state(
-							&node_endpoint,
-							NodeState::Disconnected {
-								retry_at,
-								attempt: next_attempt,
-							},
-						);
-					}
+					schedule_retry(&node_manager, &node_endpoint, attempt);
 					return;
 				}
 			}
@@ -607,71 +586,35 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	let Some(mut tcp_stream) = tcp_stream else {
 		error!(
 			"Failed to establish connection to {:?} after {} attempts",
-			node_endpoint, max_attempts
+			node_endpoint, TCP_MAX_ATTEMPTS
 		);
 		return;
 	};
 
 	// TCP connected, transition to handshaking
-	node_manager.set_state(&node_endpoint, NodeState::Handshaking);
+	// Reset handshake fields so a reconnected node doesn't carry stale state
+	if let Some(mut node) = node_manager.nodes.get_mut(&node_endpoint) {
+		node.state = NodeState::Handshaking { since: Instant::now() };
+		node.version_received = false;
+	}
 
 	// Once the connection is established, the first step is to present ourselves
 	// by sending a MessageVersion packet
 
 	let network_address = NetworkAddress::new(address, port);
 	let version = MessageVersion::new(network_address, node_manager.my_nonce);
-	let packet = match Message::new("version", version.to_bytes()) {
+	let packet = match Message::new("version", &version.to_bytes()) {
 		Ok(p) => p,
 		Err(e) => {
 			error!("Failed to create version message for {}: {}", &node_endpoint, e);
-			let next_attempt = attempt.saturating_add(1);
-			if next_attempt >= MAX_RETRY_ATTEMPTS {
-				info!("Node {} exhausted all retry attempts, marking dead", &node_endpoint);
-				node_manager.set_state(&node_endpoint, NodeState::Dead);
-			} else {
-				let backoff = calculate_backoff(next_attempt);
-				debug!(
-					"Node {} version message failed, retry {} in {:?}",
-					&node_endpoint, next_attempt, backoff
-				);
-				// Instant::now() + bounded Duration cannot overflow in practice
-				#[allow(clippy::arithmetic_side_effects)]
-				let retry_at = Instant::now() + backoff;
-				node_manager.set_state(
-					&node_endpoint,
-					NodeState::Disconnected {
-						retry_at,
-						attempt: next_attempt,
-					},
-				);
-			}
+			schedule_retry(&node_manager, &node_endpoint, attempt);
 			return;
 		}
 	};
 
 	if let Err(e) = tcp_stream.write_all(&packet.to_bytes()).await {
 		error!("Failed to send version to {}: {}", &node_endpoint, e);
-		let next_attempt = attempt.saturating_add(1);
-		if next_attempt >= MAX_RETRY_ATTEMPTS {
-			info!("Node {} exhausted all retry attempts, marking dead", &node_endpoint);
-			node_manager.set_state(&node_endpoint, NodeState::Dead);
-		} else {
-			let backoff = calculate_backoff(next_attempt);
-			debug!(
-				"Node {} version send failed, retry {} in {:?}",
-				&node_endpoint, next_attempt, backoff
-			);
-			// Instant::now() + bounded Duration cannot overflow in practice
-			#[allow(clippy::arithmetic_side_effects)]
-			let retry_at = Instant::now() + backoff;
-			node_manager.set_state(
-				&node_endpoint,
-				NodeState::Disconnected {
-					retry_at,
-					attempt: next_attempt,
-				},
-			);
-		}
+		schedule_retry(&node_manager, &node_endpoint, attempt);
 		return;
 	}
 
@@ -686,30 +629,8 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 		}
 	}
 
-	// Connection loop ended -- transition based on retry count
-	let next_attempt = attempt.saturating_add(1);
-	if next_attempt >= MAX_RETRY_ATTEMPTS {
-		debug!("Node {} exhausted all retry attempts, marking as dead", &node_endpoint);
-		node_manager.set_state(&node_endpoint, NodeState::Dead);
-	} else {
-		let backoff = calculate_backoff(next_attempt);
-		debug!(
-			"Node {} disconnected, will retry in {}s (attempt {})",
-			&node_endpoint,
-			backoff.as_secs(),
-			next_attempt
-		);
-		// Instant::now() + bounded Duration cannot overflow in practice
-		#[allow(clippy::arithmetic_side_effects)]
-		let retry_at = Instant::now() + backoff;
-		node_manager.set_state(
-			&node_endpoint,
-			NodeState::Disconnected {
-				retry_at,
-				attempt: next_attempt,
-			},
-		);
-	}
+	// Connection loop ended -- schedule retry
+	schedule_retry(&node_manager, &node_endpoint, attempt);
 
 	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
@@ -723,12 +644,15 @@ pub(crate) async fn node_connection_loop(
 	tcp_stream: TcpStream,
 ) {
 	// Split the TCP stream into separate reader and writer
-	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
+	let (tcp_reader, tcp_writer) = tcp_stream.into_split();
+	let mut tcp_reader = BufReader::with_capacity(8192, tcp_reader);
 
 	// Wrap the writer on Arc<Mutex> so we can write from multiple places later on
 	let shared_writer: SharedTcpWriter = Arc::new(Mutex::new(tcp_writer));
 
-	let ping_timeout = Duration::from_secs(180); // 3 minutes
+	let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+	// The first tick completes immediately; consume it so we don't ping on connect
+	ping_interval.tick().await;
 
 	let mut incoming_queue = NetworkQueue::new();
 
@@ -757,7 +681,7 @@ pub(crate) async fn node_connection_loop(
 					}
 				}
 			}
-			() = sleep(ping_timeout) => {
+			_ = ping_interval.tick() => {
 				node_manager.send_ping(&node_endpoint).await;
 			}
 		}
@@ -843,7 +767,7 @@ async fn handle_version(
 			.ok_or_else(|| anyhow!("node {node_endpoint} disappeared from manager"))?;
 
 		// Nodes can send only one version command
-		if node.version > 0 {
+		if node.version_received {
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
 			};
@@ -852,8 +776,11 @@ async fn handle_version(
 		}
 
 		if version.nonce == node_manager.my_nonce {
-			debug!("Closing connection to {} as it is self-connection", node_endpoint);
-			return Err(anyhow!("Node is myself"));
+			node.state = NodeState::Banned {
+				reason: BanReason::ProtocolViolation,
+			};
+			warn!("Self-connection detected to {}, banning", node_endpoint);
+			return Err(anyhow!("Node {node_endpoint} is myself"));
 		}
 
 		node.connection_type == ConnectionType::Incoming
@@ -865,7 +792,7 @@ async fn handle_version(
 		let network_address = NetworkAddress::new(node_endpoint.address, node_endpoint.port);
 		let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
 		tcp_writer
-			.send_message("version", version_message.to_bytes())
+			.send_message("version", &version_message.to_bytes())
 			.await
 			.context("failed to send version reply for inbound connection")?;
 	}
@@ -883,12 +810,13 @@ async fn handle_version(
 		node.user_agent = version.user_agent;
 		node.height = version.start_height;
 		node.version = version.version;
+		node.version_received = true;
 		node.relay = version.relay;
 	}
 
 	// Verack sent after all locks released
 	tcp_writer
-		.send_message("verack", Vec::new())
+		.send_message("verack", &[])
 		.await
 		.context("failed to send verack")
 }
@@ -905,7 +833,7 @@ async fn handle_verack(
 		.ok_or_else(|| anyhow!("node {node_endpoint} disappeared from manager"))?;
 
 	// If we already received version from the peer, the handshake is complete
-	if node.version > 0 {
+	if node.version_received {
 		info!(
 			"Connection ready with node {} version={}, blocks={}, user_agent={}",
 			node_endpoint, node.version, node.height, node.user_agent
@@ -918,7 +846,7 @@ async fn handle_verack(
 		drop(node);
 
 		tcp_writer
-			.send_message("getaddr", Vec::new())
+			.send_message("getaddr", &[])
 			.await
 			.context("failed to send getaddr")?;
 	}
@@ -934,6 +862,12 @@ async fn handle_ping(
 	tcp_writer: &SharedTcpWriter,
 	payload: &[u8],
 ) -> Result<()> {
+	// Pre-BIP31 nodes send 0-byte pings; just acknowledge silently
+	if payload.is_empty() {
+		debug!("Received pre-BIP31 ping (no nonce) from {}", node_endpoint);
+		return Ok(());
+	}
+
 	if payload.len() != 8 {
 		warn!("Received malformed ping command from {}", node_endpoint);
 
@@ -951,7 +885,7 @@ async fn handle_ping(
 	debug!("Received ping command from {} with nonce {}", node_endpoint, nonce);
 
 	tcp_writer
-		.send_message("pong", u64_to_vec_le(nonce))
+		.send_message("pong", &nonce.to_le_bytes())
 		.await
 		.context("failed to send pong")
 }
@@ -1006,13 +940,7 @@ async fn handle_getaddr(
 	node_endpoint: &NodeEndpoint,
 	tcp_writer: &SharedTcpWriter,
 ) -> Result<()> {
-	// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
-	// is before 1970, which is not a realistic scenario
-	#[allow(clippy::expect_used)]
-	let timestamp = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.expect("Time went backwards")
-		.as_secs();
+	let now = unix_now();
 
 	// Filter the node list so we share only recently active outgoing connections
 	// Incoming connections use ephemeral OS ports -- their stored port is not their real listening port
@@ -1023,7 +951,7 @@ async fn handle_getaddr(
 			let node = entry.value();
 			node.state.is_connected()
 				&& node.connection_type == ConnectionType::Outgoing
-				&& (timestamp.saturating_sub(node.last_seen) < 60 * 60 * 2)
+				&& (now.saturating_sub(node.last_seen) < GETADDR_RECENT_WINDOW)
 		})
 		.take(1000) // Protocol limits to maximum of 1000 entries per addr message
 		.map(|entry| {
@@ -1048,7 +976,7 @@ async fn handle_getaddr(
 
 	let message_addr = MessageAddr::new(filtered_nodes);
 	tcp_writer
-		.send_message("addr", message_addr.to_bytes())
+		.send_message("addr", &message_addr.to_bytes())
 		.await
 		.context("failed to send addr")
 }

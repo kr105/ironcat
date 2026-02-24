@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-	io::{Cursor, Read},
-	time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::{Cursor, Read};
 
 use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::{decode_varint, encode_varint, NetworkAddress};
+use super::{decode_varint, write_varint, NetworkAddress};
+use crate::utils::unix_now;
 
 /// An entry in an addr message, pairing a network address with its timestamp
 #[derive(Debug)]
@@ -27,17 +25,9 @@ pub struct MessageAddr {
 impl MessageAddr {
 	/// Creates a new addr message from a list of network addresses, using the current timestamp
 	pub fn new(nodes_list: Vec<NetworkAddress>) -> Self {
-		// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
-		// is before 1970, which is not a realistic scenario
-		#[allow(clippy::expect_used)]
-		let timestamp = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_secs();
-
 		// Catcoin protocol uses u32 timestamps, valid until 2106
 		#[allow(clippy::cast_possible_truncation)]
-		let timestamp = timestamp as u32;
+		let timestamp = unix_now() as u32;
 
 		let addr_list = nodes_list
 			.into_iter()
@@ -85,10 +75,6 @@ impl MessageAddr {
 
 	/// Converts the addr message to bytes for network transmission
 	pub fn to_bytes(&self) -> Vec<u8> {
-		if self.addr_list.is_empty() {
-			return Vec::new();
-		}
-
 		// varint (max 9 bytes) + 30 bytes per entry (4 timestamp + 26 network address)
 		// addr_list.len() is validated <= 1000, multiplication can't overflow
 		#[allow(clippy::arithmetic_side_effects)]
@@ -97,8 +83,7 @@ impl MessageAddr {
 
 		// addr_list.len() bounded by 1000, fits in u64
 		#[allow(clippy::cast_possible_truncation)]
-		let count = self.addr_list.len() as u64;
-		bytes.extend_from_slice(&encode_varint(count));
+		write_varint(&mut bytes, self.addr_list.len() as u64);
 
 		for entry in &self.addr_list {
 			bytes.extend_from_slice(&entry.timestamp.to_le_bytes());
@@ -148,9 +133,9 @@ mod tests {
 	}
 
 	#[test]
-	fn empty_addr_list_produces_empty_bytes() {
+	fn empty_addr_list_produces_varint_zero() {
 		let msg = MessageAddr::new(Vec::new());
-		assert!(msg.to_bytes().is_empty());
+		assert_eq!(msg.to_bytes(), vec![0x00]);
 	}
 
 	#[test]

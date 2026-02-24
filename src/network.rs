@@ -44,11 +44,11 @@ pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
 /// Extension trait for sending protocol messages over a shared TCP writer
 pub trait SharedTcpWriterExt {
 	/// Constructs and sends a protocol message with the given command and payload
-	async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()>;
+	async fn send_message(&self, command: &str, payload: &[u8]) -> Result<()>;
 }
 
 impl SharedTcpWriterExt for SharedTcpWriter {
-	async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()> {
+	async fn send_message(&self, command: &str, payload: &[u8]) -> Result<()> {
 		let packet = Message::new(command, payload).map_err(|e| {
 			warn!("Failed to construct message for command '{command}': {e}");
 			e
@@ -191,7 +191,7 @@ pub struct Message {
 
 impl Message {
 	/// Creates a new `NetworkMessage` with the given command and payload
-	pub fn new(command: &str, payload: Vec<u8>) -> Result<Self> {
+	pub fn new(command: &str, payload: &[u8]) -> Result<Self> {
 		if payload.len() > MAX_MESSAGE_SIZE {
 			return Err(anyhow!(
 				"payload size {} exceeds maximum {MAX_MESSAGE_SIZE}",
@@ -206,7 +206,7 @@ impl Message {
 			command: [0; COMMAND_LENGTH],
 			length: payload.len() as u32,
 			checksum: 0,
-			payload,
+			payload: payload.to_vec(),
 		};
 
 		msg.set_command(command)?;
@@ -365,7 +365,8 @@ pub enum NetworkCommand {
 impl NetworkCommand {
 	/// Parses a command string into a `NetworkCommand` variant
 	pub(crate) fn from_command_str(s: &str) -> Self {
-		match s.to_lowercase().as_str() {
+		// Protocol commands are always lowercase ASCII on the wire
+		match s {
 			"version" => Self::Version,
 			"verack" => Self::Verack,
 			"ping" => Self::Ping,
@@ -378,34 +379,33 @@ impl NetworkCommand {
 	}
 }
 
-/// Encodes a u64 as a variable length integer (`VarInt`)
-fn encode_varint(n: u64) -> Vec<u8> {
+/// Writes a variable length integer (`VarInt`) directly into the given buffer
+pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
 	// Each cast is guarded by the if/else range check above it
 	if n < 0xfd {
 		// Range check above guarantees n fits in u8
 		#[allow(clippy::cast_possible_truncation)]
-		let byte = n as u8;
-		vec![byte]
+		buf.push(n as u8);
 	} else if n <= 0xffff {
-		let mut v = vec![0xfd];
+		buf.push(0xfd);
 		#[allow(clippy::cast_possible_truncation)]
-		v.extend_from_slice(&(n as u16).to_le_bytes());
-		v
+		buf.extend_from_slice(&(n as u16).to_le_bytes());
 	} else if n <= 0xffff_ffff {
-		let mut v = vec![0xfe];
+		buf.push(0xfe);
 		#[allow(clippy::cast_possible_truncation)]
-		v.extend_from_slice(&(n as u32).to_le_bytes());
-		v
+		buf.extend_from_slice(&(n as u32).to_le_bytes());
 	} else {
-		let mut v = vec![0xff];
-		v.extend_from_slice(&n.to_le_bytes());
-		v
+		buf.push(0xff);
+		buf.extend_from_slice(&n.to_le_bytes());
 	}
 }
 
 /// Encodes a string as a variable-length string for the wire protocol
 pub fn encode_varstr(s: &str) -> Vec<u8> {
-	let mut encoded = encode_varint(s.len() as u64);
+	// s.len() + 9 (max varint) cannot overflow usize for any real string
+	#[allow(clippy::arithmetic_side_effects)]
+	let mut encoded = Vec::with_capacity(s.len() + 9);
+	write_varint(&mut encoded, s.len() as u64);
 	encoded.extend_from_slice(s.as_bytes());
 	encoded
 }
@@ -611,7 +611,7 @@ mod tests {
 
 	#[test]
 	fn from_bytes_returns_consumed_length() {
-		let msg = Message::new("ping", vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+		let msg = Message::new("ping", &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
 		let bytes = msg.to_bytes();
 		let mut extended = bytes.clone();
 		extended.extend_from_slice(&[0xFF; 50]);

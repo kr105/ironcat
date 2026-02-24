@@ -12,7 +12,7 @@ use clap::Parser;
 use cli::Args;
 use network::listening_start;
 use nodes::NodeManager;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 			.init();
 
 		info!("ironcat v0.0.2 - Starting in daemon mode");
-		run_core(None).await
+		run_core(None, args.seed).await
 	} else {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
 		let tui_layer = TuiLayer::new(log_tx);
@@ -41,12 +41,12 @@ async fn main() -> Result<()> {
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
 		info!("ironcat v0.0.2 - Starting ...");
-		run_core(Some(log_rx)).await
+		run_core(Some(log_rx), args.seed).await
 	}
 }
 
 /// Core application loop shared between TUI and daemon modes
-async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>) -> Result<()> {
+async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, seed: SocketAddr) -> Result<()> {
 	let node_manager = Arc::new(NodeManager::new());
 
 	// Spawn TUI if in TUI mode
@@ -64,7 +64,7 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>) -> Result<()> {
 	let reaper_handle = tokio::spawn(nm.run_reaper());
 
 	// Connect to seed node
-	node_manager.insert_outgoing(IpAddr::V4(Ipv4Addr::new(161, 129, 176, 92)), 9933);
+	node_manager.insert_outgoing(seed.ip(), seed.port());
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
