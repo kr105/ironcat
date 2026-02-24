@@ -82,7 +82,7 @@ impl NetworkAddress {
 		let mut bytes = Vec::with_capacity(26);
 		bytes.extend_from_slice(&self.services.bits().to_le_bytes());
 		bytes.extend_from_slice(&self.address_to_network_bytes());
-		bytes.extend_from_slice(&self.port.to_le_bytes());
+		bytes.extend_from_slice(&self.port.to_be_bytes());
 
 		bytes
 	}
@@ -460,4 +460,35 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 	}
 
 	trace!("listening_start task finished");
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::net::{IpAddr, Ipv4Addr};
+
+	#[test]
+	fn network_address_port_roundtrip() {
+		// Encode then decode should give the same port
+		let port: u16 = 9933;
+		let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+
+		let bytes = addr.to_bytes();
+		let decoded = NetworkAddress::from_bytes(&bytes).expect("should decode");
+
+		assert_eq!(decoded.port, port);
+	}
+
+	#[test]
+	fn network_address_port_is_big_endian_on_wire() {
+		// Port 0x1F90 (8080) should appear as [0x1F, 0x90] in the last 2 bytes
+		let port: u16 = 8080;
+		let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
+
+		let bytes = addr.to_bytes();
+
+		// The wire format is: 8 bytes services + 16 bytes IP + 2 bytes port
+		let port_bytes = &bytes[24..26];
+		assert_eq!(port_bytes, &port.to_be_bytes(), "port must be big-endian on the wire");
+	}
 }
