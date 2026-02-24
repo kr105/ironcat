@@ -180,8 +180,8 @@ impl NodeManager {
 
 	/// Checks if the node is appropiate to try a connection
 	pub fn is_candidate(&self, node_endpoint: &NodeEndpoint) -> bool {
-		if let Some(node) = self.nodes.get_mut(node_endpoint) {
-			return !(node.not_good | node.timed_out);
+		if let Some(node) = self.nodes.get(node_endpoint) {
+			return !(node.not_good || node.timed_out);
 		}
 
 		false

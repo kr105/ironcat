@@ -24,10 +24,10 @@ pub fn is_recently_active(timestamp: u32) -> bool {
 		.as_secs() as u32;
 
 	// Calculate timestamp from 6 hours ago
-	let thirty_minutes_ago = now.saturating_sub(60 * 60 * 6);
+	let six_hours_ago = now.saturating_sub(60 * 60 * 6);
 
 	// Compare
-	timestamp >= thirty_minutes_ago && timestamp <= now
+	timestamp >= six_hours_ago && timestamp <= now
 }
 
 /// Converts an IPv4 address to an IPv4-mapped IPv6 address in network byte order
