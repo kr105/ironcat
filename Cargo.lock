@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "ironcat"
-version = "0.1.0"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",

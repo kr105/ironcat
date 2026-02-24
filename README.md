@@ -8,6 +8,7 @@ A Catcoin network client implemented from scratch in Rust.
 cargo run                                    # TUI mode (default)
 cargo run -- --daemon                        # Daemon mode, logs to stderr
 cargo run -- --seed 10.0.0.1:9933            # Custom seed node
+cargo run -- --no-dns-seed                   # Disable DNS peer discovery
 RUST_LOG=debug cargo run                     # Control log level
 cargo run -- --help                          # Show help
 ```

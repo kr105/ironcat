@@ -471,6 +471,38 @@ impl NodeManager {
 		None
 	}
 
+	/// Shuts down all connected nodes cleanly by sending TCP FIN
+	///
+	/// Collects writers first to avoid holding `DashMap` locks across awaits
+	pub async fn graceful_shutdown(&self) {
+		let writers: Vec<(NodeEndpoint, SharedTcpWriter)> = self
+			.nodes
+			.iter()
+			.filter_map(|entry| {
+				if let NodeState::Connected { ref writer } = entry.state {
+					Some((entry.endpoint.clone(), Arc::clone(writer)))
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		let count = writers.len();
+		if count == 0 {
+			return;
+		}
+
+		info!(count, "Shutting down connected nodes");
+
+		for (endpoint, writer) in writers {
+			if let Err(err) = writer.lock().await.shutdown().await {
+				warn!(%endpoint, error = %err, "Failed to shut down writer");
+			}
+		}
+
+		info!("Graceful shutdown complete");
+	}
+
 	/// Marks a node as permanently banned
 	// Part of the NodeManager encapsulation API, will replace direct state mutation
 	#[allow(dead_code)]
