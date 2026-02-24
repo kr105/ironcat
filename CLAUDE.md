@@ -9,6 +9,7 @@
 - Minimize external dependencies, prefer stdlib when reasonable
 - Update README.md when adding features or information relevant to newcomers
 - Update docs/protocol.md when changing wire format, message handling, handshake logic, state machine, or connection constants
+- Keep all documentation concrete, accurate, and free of filler -- every sentence should convey useful information
 
 ## Testing
 - TDD methodology, tests are equally or more important than working code

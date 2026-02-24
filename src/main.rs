@@ -94,5 +94,7 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 	}
 
+	node_manager.graceful_shutdown().await;
+
 	Ok(())
 }

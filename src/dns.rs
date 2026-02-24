@@ -31,9 +31,8 @@ const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn resolve_dns_seeds() -> Vec<SocketAddr> {
 	let mut join_set = tokio::task::JoinSet::new();
 
-	for seed in DNS_SEEDS {
-		let seed_owned = (*seed).to_string();
-		join_set.spawn(async move { resolve_single_seed(&seed_owned).await });
+	for &seed in DNS_SEEDS {
+		join_set.spawn(async move { resolve_single_seed(seed).await });
 	}
 
 	let mut seen = HashSet::new();
