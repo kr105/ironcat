@@ -44,12 +44,12 @@ impl fmt::Display for NodeEndpoint {
 
 #[derive(Debug)]
 pub struct NodeStats {
-	pub total_nodes: usize,
-	pub connected_nodes: usize,
-	pub disconnected_nodes: usize,
+	pub total: usize,
+	pub connected: usize,
+	pub disconnected: usize,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionType {
 	Incoming,
 	Outgoing,
@@ -58,12 +58,14 @@ pub enum ConnectionType {
 impl fmt::Display for ConnectionType {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			ConnectionType::Incoming => write!(f, "In"),
-			ConnectionType::Outgoing => write!(f, "Out"),
+			Self::Incoming => write!(f, "In"),
+			Self::Outgoing => write!(f, "Out"),
 		}
 	}
 }
+
 /// Represents a node in the Catcoin network
+#[allow(clippy::struct_excessive_bools)]
 pub struct Node {
 	pub endpoint: NodeEndpoint,
 
@@ -114,7 +116,7 @@ impl Default for NodeManager {
 
 impl NodeManager {
 	pub fn new() -> Self {
-		NodeManager {
+		Self {
 			nodes: DashMap::new(),
 			my_nonce: rand::thread_rng().next_u64(),
 		}
@@ -154,13 +156,17 @@ impl NodeManager {
 		true
 	}
 
-	/// Updates the last_seen timestamp for a node with the current time
+	/// Updates the `last_seen` timestamp for a node with the current time
 	pub fn update_last_seen(&self, node_endpoint: &NodeEndpoint) {
 		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
-			node.last_seen = SystemTime::now()
+			// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
+			// is before 1970, which is not a realistic scenario
+			#[allow(clippy::expect_used)]
+			let now = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.expect("Time went backwards")
 				.as_secs();
+			node.last_seen = now;
 		}
 	}
 
@@ -171,7 +177,7 @@ impl NodeManager {
 		}
 	}
 
-	/// Updates the timed_out flag for a node
+	/// Updates the `timed_out` flag for a node
 	pub fn set_timed_out(&self, node_endpoint: &NodeEndpoint, timed_out: bool) {
 		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
 			node.timed_out = timed_out;
@@ -188,6 +194,7 @@ impl NodeManager {
 	}
 
 	/// Send a ping message to the node
+	#[allow(clippy::unwrap_used)]
 	pub async fn send_ping(&self, node_endpoint: &NodeEndpoint) {
 		if let Some(node) = self.nodes.get_mut(node_endpoint) {
 			debug!("Sending ping to {}", node_endpoint);
@@ -196,7 +203,7 @@ impl NodeManager {
 			let nonce = rand::thread_rng().next_u64();
 			let nonce = nonce.to_le_bytes();
 
-			// TODO: Cleanup this?
+			// TODO: replace with proper error handling
 			node.tcp_writer
 				.clone()
 				.unwrap()
@@ -207,32 +214,34 @@ impl NodeManager {
 	}
 
 	pub fn get_stats(&self) -> NodeStats {
-		let total_nodes = self.nodes.len();
-		let connected_nodes = self.nodes.iter().filter(|n| n.connected).count();
-		let disconnected_nodes = total_nodes - connected_nodes;
+		let total = self.nodes.len();
+		let connected = self.nodes.iter().filter(|n| n.connected).count();
+		let disconnected = total.saturating_sub(connected);
 
 		NodeStats {
-			total_nodes,
-			connected_nodes,
-			disconnected_nodes,
+			total,
+			connected,
+			disconnected,
 		}
 	}
 }
 
-/// Inserts a new outgoing connection node into the NodeManager and spawns a task to handle the connection
+/// Inserts a new outgoing connection node into the `NodeManager` and spawns a task to handle the connection
 pub fn insert_node(node_manager: Arc<NodeManager>, ip: &str, port: u16) {
+	// TODO: replace with proper error handling
+	#[allow(clippy::expect_used)]
 	let address = IpAddr::from_str(ip).expect("Invalid IP address provided");
 
 	// Only proceed if the node doesn't exist already
 	if node_manager.insert(address, port, ConnectionType::Outgoing) {
-		let node_manager_clone = node_manager.clone();
 		tokio::spawn(async move {
-			handle_node_connection(node_manager_clone, address, port).await;
+			handle_node_connection(node_manager, address, port).await;
 		});
 	}
 }
 
 /// Handles the connection to a node
+#[allow(clippy::unwrap_used)]
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16) {
 	let node_endpoint = NodeEndpoint { address, port };
 
@@ -274,15 +283,12 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 		}
 	}
 
-	let mut tcp_stream = match tcp_stream {
-		Some(stream) => stream,
-		None => {
-			error!(
-				"Failed to establish connection to {:?} after {} attempts",
-				node_endpoint, max_attempts
-			);
-			return;
-		}
+	let Some(mut tcp_stream) = tcp_stream else {
+		error!(
+			"Failed to establish connection to {:?} after {} attempts",
+			node_endpoint, max_attempts
+		);
+		return;
 	};
 
 	// Once the connection is established, the first step is to present ourselves
@@ -290,12 +296,13 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
 	let network_address = NetworkAddress::new(address, port);
 	let version = MessageVersion::new(network_address, node_manager.my_nonce);
+	// TODO: replace with proper error handling
 	let packet = Message::new("version", version.to_bytes()).unwrap();
 
 	tcp_stream.write_all(&packet.to_bytes()).await.unwrap();
 
 	// Hand off the connection to the connection loop
-	node_connection_loop(node_manager.clone(), node_endpoint.clone(), tcp_stream).await;
+	node_connection_loop(Arc::clone(&node_manager), node_endpoint.clone(), tcp_stream).await;
 
 	// If the connection loop ended, it means that the connection was closed
 	node_manager.set_connected(&node_endpoint, false);
@@ -303,6 +310,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
 }
 
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint: NodeEndpoint, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
 	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
@@ -323,6 +331,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 					Ok(0) => break, // Connection closed
 					Ok(n) => {
 						// Process the incoming data
+						// TODO: replace with proper error handling
 						incoming_queue.process_incoming_data(&buf[..n]).unwrap();
 					}
 					Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -334,7 +343,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 					}
 				}
 			}
-			_ = sleep(ping_timeout) => {
+			() = sleep(ping_timeout) => {
 				node_manager.send_ping(&node_endpoint).await;
 			}
 		}
@@ -346,7 +355,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 			if let Err(e) = parse_incoming_message(
 				Arc::clone(&node_manager),
 				&node_endpoint,
-				shared_writer.clone(),
+				Arc::clone(&shared_writer),
 				message,
 			)
 			.await
@@ -354,7 +363,8 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 				warn!("Error parsing message: {:?}", e);
 
 				// Close the connection
-				shared_writer.lock().await.shutdown().await.unwrap(); // TODO: Check safety
+				// TODO: replace with proper error handling
+				shared_writer.lock().await.shutdown().await.unwrap();
 				break 'main;
 			}
 		}
@@ -362,6 +372,7 @@ pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint:
 }
 
 /// Parses and handles an incoming message from a node
+#[allow(clippy::too_many_lines, clippy::unwrap_used)]
 async fn parse_incoming_message(
 	node_manager: Arc<NodeManager>,
 	node_endpoint: &NodeEndpoint,
@@ -370,16 +381,19 @@ async fn parse_incoming_message(
 ) -> Result<()> {
 	// Extract the command from the message
 	let command = match CStr::from_bytes_until_nul(&message.command) {
+		// TODO: replace with proper error handling
 		Ok(str) => str.to_str().unwrap(),
 		Err(_) => return Err(anyhow!("Error parsing incoming message, 'command' field is malformed")),
 	};
 
+	// TODO: replace with proper error handling
 	let command = NetworkCommand::from_str(command).unwrap();
 
 	debug!("Received message: {:?} from {}", command, &node_endpoint);
 
 	match command {
 		NetworkCommand::Version => {
+			// TODO: replace with proper error handling
 			let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
 
 			// Nodes can send only one version command
@@ -389,6 +403,7 @@ async fn parse_incoming_message(
 				return Err(anyhow!("Node {} sent version command twice", &node_endpoint));
 			}
 
+			// TODO: replace with proper error handling
 			let version = MessageVersion::from_bytes(&message.payload).unwrap();
 
 			if version.nonce == node_manager.my_nonce {
@@ -414,11 +429,15 @@ async fn parse_incoming_message(
 			node.version = version.version;
 			node.relay = version.relay;
 
+			drop(node);
+
 			// We must answer with a verack
+			// TODO: replace with proper error handling
 			tcp_writer.send_message("verack", Vec::new()).await.unwrap();
 		}
 
 		NetworkCommand::Verack => {
+			// TODO: replace with proper error handling
 			let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
 			node.ver_ack = true;
 
@@ -432,9 +451,12 @@ async fn parse_incoming_message(
 				);
 
 				node.connected = true;
-				node.tcp_writer = Some(tcp_writer.clone());
+				node.tcp_writer = Some(Arc::clone(&tcp_writer));
+
+				drop(node);
 
 				// Now that connection is established, ask for more nodes :)
+				// TODO: replace with proper error handling
 				tcp_writer.send_message("getaddr", Vec::new()).await.unwrap();
 			}
 		}
@@ -444,16 +466,19 @@ async fn parse_incoming_message(
 			if message.payload.len() != 8 {
 				warn!("Received malformed ping command from {}", &node_endpoint);
 
+				// TODO: replace with proper error handling
 				let mut node = node_manager.nodes.get_mut(node_endpoint).unwrap();
 				node.not_good = true;
+				drop(node);
 
 				return Err(anyhow!("Received malformed ping command from {}", &node_endpoint));
 			}
 
-			let nonce = vec_to_u64_le(message.payload);
+			let nonce = vec_to_u64_le(&message.payload)?;
 			debug!("Received ping command from {} with nonce {}", &node_endpoint, nonce);
 
 			// Reply back with the nonce
+			// TODO: replace with proper error handling
 			tcp_writer.send_message("pong", u64_to_vec_le(nonce)).await.unwrap();
 		}
 
@@ -464,6 +489,7 @@ async fn parse_incoming_message(
 
 		NetworkCommand::Addr => {
 			let mut cursor = Cursor::new(message.payload.as_slice());
+			// TODO: replace with proper error handling
 			let count = decode_varint(&mut cursor).unwrap();
 
 			// Check all the received addresses
@@ -483,7 +509,7 @@ async fn parse_incoming_message(
 					);
 
 					insert_node(
-						node_manager.clone(),
+						Arc::clone(&node_manager),
 						network_address.address.to_string().as_str(),
 						network_address.port,
 					);
@@ -498,6 +524,9 @@ async fn parse_incoming_message(
 		}
 
 		NetworkCommand::GetAddr => {
+			// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
+			// is before 1970, which is not a realistic scenario
+			#[allow(clippy::expect_used)]
 			let timestamp = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.expect("Time went backwards")
@@ -509,7 +538,7 @@ async fn parse_incoming_message(
 				.iter()
 				.filter(|entry| {
 					let node = entry.value();
-					node.connected && (timestamp - node.last_seen < 60 * 60 * 2) && !node.not_good
+					node.connected && (timestamp.saturating_sub(node.last_seen) < 60 * 60 * 2) && !node.not_good
 				})
 				.take(1000) // Protocol limits to maximum of 1000 entries per addr message
 				.map(|entry| {
@@ -530,13 +559,14 @@ async fn parse_incoming_message(
 			debug!("Sending list of {} nodes to {}", filtered_nodes.len(), &node_endpoint);
 
 			let message_addr = MessageAddr::new(filtered_nodes);
+			// TODO: replace with proper error handling
 			tcp_writer.send_message("addr", message_addr.to_bytes()).await.unwrap();
 		}
 
 		NetworkCommand::Unknown(str) => {
 			error!("Received unknown network command from {}: {}", &node_endpoint, str);
 		}
-	};
+	}
 
 	Ok(())
 }

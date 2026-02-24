@@ -18,8 +18,8 @@ pub struct LogChannel {
 
 impl LogChannel {
 	/// Creates a new `LogChannel` with the specified log level, configuration, and sender
-	pub fn new(log_level: LevelFilter, config: Config, sender: mpsc::Sender<LogChannelEntry>) -> Box<LogChannel> {
-		Box::new(LogChannel {
+	pub fn new(log_level: LevelFilter, config: Config, sender: mpsc::Sender<LogChannelEntry>) -> Box<Self> {
+		Box::new(Self {
 			level: log_level,
 			config,
 			sender,

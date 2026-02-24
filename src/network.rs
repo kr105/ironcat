@@ -46,8 +46,8 @@ impl SharedTcpWriterExt for SharedTcpWriter {
 		let packet = Message::new(command, payload)?;
 
 		if let Err(error) = self.lock().await.write_all(&packet.to_bytes()).await {
-			return Err(anyhow!("Error in write_all: {:?}", error));
-		};
+			return Err(anyhow!("Error in write_all: {error:?}"));
+		}
 
 		Ok(())
 	}
@@ -65,12 +65,12 @@ pub struct NetworkAddress {
 }
 
 impl NetworkAddress {
-	/// Creates a new NetworkAddress with the given IP address and port
+	/// Creates a new `NetworkAddress` with the given IP address and port
 	pub fn new(address: IpAddr, port: u16) -> Self {
 		let mut services = ServiceMask::empty();
 		services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
 
-		NetworkAddress {
+		Self {
 			services,
 			address,
 			port,
@@ -88,6 +88,7 @@ impl NetworkAddress {
 	}
 
 	/// Decodes an Address from a slice of network bytes
+	#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
 		if bytes.len() != 26 {
 			return Err(std::io::Error::new(
@@ -96,6 +97,7 @@ impl NetworkAddress {
 			));
 		}
 
+		// Slicing and unwraps below are safe because of the length check above
 		let services = ServiceMask::from_bits_truncate(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
 
 		let ip_bytes: [u8; 16] = bytes[8..24].try_into().unwrap();
@@ -103,7 +105,7 @@ impl NetworkAddress {
 
 		let port = u16::from_be_bytes(bytes[24..26].try_into().unwrap());
 
-		Ok(NetworkAddress {
+		Ok(Self {
 			services,
 			address,
 			port,
@@ -111,7 +113,7 @@ impl NetworkAddress {
 	}
 
 	/// Converts the IP address to a 16-byte network order representation
-	fn address_to_network_bytes(&self) -> [u8; 16] {
+	pub(crate) fn address_to_network_bytes(&self) -> [u8; 16] {
 		match &self.address {
 			IpAddr::V4(ipv4) => ipv4_to_mapped_ipv6(*ipv4),
 			IpAddr::V6(ipv6) => ipv6.octets(),
@@ -157,9 +159,10 @@ pub struct Message {
 }
 
 impl Message {
-	/// Creates a new NetworkMessage with the given command and payload
+	/// Creates a new `NetworkMessage` with the given command and payload
+	#[allow(clippy::cast_possible_truncation)]
 	pub fn new(command: &str, payload: Vec<u8>) -> Result<Self> {
-		let mut msg = Message {
+		let mut msg = Self {
 			magic: NET_MAGIC,
 			command: [0; COMMAND_LENGTH],
 			length: payload.len() as u32,
@@ -174,6 +177,7 @@ impl Message {
 	}
 
 	/// Sets the command for the message
+	#[allow(clippy::indexing_slicing)]
 	fn set_command(&mut self, command: &str) -> Result<()> {
 		if !command.is_ascii() {
 			return Err(anyhow!("Command contains non-ASCII characters"));
@@ -181,8 +185,7 @@ impl Message {
 
 		if command.len() >= COMMAND_LENGTH {
 			return Err(anyhow!(
-				"Command is too long (max {} characters, plus NULL padding)",
-				COMMAND_LENGTH
+				"Command is too long (max {COMMAND_LENGTH} characters, plus NULL padding)"
 			));
 		}
 
@@ -191,6 +194,7 @@ impl Message {
 		}
 
 		// Copy command string into fixed-size array, leaving the last byte as 0
+		// Slice is safe: command.len() < COMMAND_LENGTH is checked above
 		self.command[..command.len()].copy_from_slice(command.as_bytes());
 		// The rest of the array is already initialized to 0, so we don't need to set it explicitly
 
@@ -199,6 +203,7 @@ impl Message {
 
 	/// Calculate the checksum for the message payload
 	/// The checksum is the first 4 bytes of the double SHA256 hash of the payload
+	#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 	fn calculate_checksum(&self) -> u32 {
 		let mut hasher = Sha256::new();
 
@@ -210,11 +215,11 @@ impl Message {
 		hasher.update(first_hash);
 		let second_hash = hasher.finalize();
 
-		// Convert the first 4 bytes of the second hash to a u32
+		// SHA256 always produces 32 bytes, so slicing [..4] is always safe
 		u32::from_le_bytes(second_hash[..4].try_into().unwrap())
 	}
 
-	/// Converts the NetworkMessage to a byte vector for network transmission
+	/// Converts the `NetworkMessage` to a byte vector for network transmission
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::new();
 		bytes.extend_from_slice(&self.magic);
@@ -225,9 +230,14 @@ impl Message {
 		bytes
 	}
 
-	/// Decodes a NetworkMessage from a byte slice
+	/// Decodes a `NetworkMessage` from a byte slice
+	#[allow(clippy::cast_possible_truncation)]
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-		if bytes.len() < 4 + COMMAND_LENGTH + 4 + 4 {
+		// Header size: magic(4) + command(COMMAND_LENGTH) + length(4) + checksum(4)
+		#[allow(clippy::arithmetic_side_effects)]
+		let header_size = 4 + COMMAND_LENGTH + 4 + 4;
+
+		if bytes.len() < header_size {
 			return Err(anyhow!("Byte slice is too short for a valid NetworkMessage"));
 		}
 
@@ -251,7 +261,10 @@ impl Message {
 		// Read checksum
 		let checksum = cursor.read_u32::<LittleEndian>()?;
 
-		if bytes.len() < 4 + COMMAND_LENGTH + 4 + 4 + length as usize {
+		#[allow(clippy::arithmetic_side_effects)]
+		let total_size = header_size + length as usize;
+
+		if bytes.len() < total_size {
 			return Err(anyhow!("Byte slice is too short for the entire NetworkMessage"));
 		}
 
@@ -260,7 +273,7 @@ impl Message {
 		cursor.read_exact(&mut payload)?;
 
 		// Create the NetworkMessage
-		let msg = Message {
+		let msg = Self {
 			magic,
 			command,
 			length,
@@ -279,7 +292,7 @@ impl Message {
 }
 
 /// Represents the different types of network commands
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NetworkCommand {
 	Version,
 	Verack,
@@ -296,19 +309,20 @@ impl FromStr for NetworkCommand {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		match s.to_lowercase().as_str() {
-			"version" => Ok(NetworkCommand::Version),
-			"verack" => Ok(NetworkCommand::Verack),
-			"ping" => Ok(NetworkCommand::Ping),
-			"pong" => Ok(NetworkCommand::Pong),
-			"alert" => Ok(NetworkCommand::Alert),
-			"getaddr" => Ok(NetworkCommand::GetAddr),
-			"addr" => Ok(NetworkCommand::Addr),
-			_ => Ok(NetworkCommand::Unknown(s.to_string())),
+			"version" => Ok(Self::Version),
+			"verack" => Ok(Self::Verack),
+			"ping" => Ok(Self::Ping),
+			"pong" => Ok(Self::Pong),
+			"alert" => Ok(Self::Alert),
+			"getaddr" => Ok(Self::GetAddr),
+			"addr" => Ok(Self::Addr),
+			_ => Ok(Self::Unknown(s.to_string())),
 		}
 	}
 }
 
-/// Encodes a u64 as a variable length integer (VarInt)
+/// Encodes a u64 as a variable length integer (`VarInt`)
+#[allow(clippy::cast_possible_truncation)]
 fn encode_varint(n: u64) -> Vec<u8> {
 	if n < 0xfd {
 		vec![n as u8]
@@ -316,7 +330,7 @@ fn encode_varint(n: u64) -> Vec<u8> {
 		let mut v = vec![0xfd];
 		v.extend_from_slice(&(n as u16).to_le_bytes());
 		v
-	} else if n <= 0xffffffff {
+	} else if n <= 0xffff_ffff {
 		let mut v = vec![0xfe];
 		v.extend_from_slice(&(n as u32).to_le_bytes());
 		v
@@ -334,19 +348,19 @@ pub fn encode_varstr(s: &str) -> Vec<u8> {
 	encoded
 }
 
-/// Decodes a u64 from a variable length integer (VarInt)
+/// Decodes a u64 from a variable length integer (`VarInt`)
 pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 	let first_byte: u8 = cursor.read_u8()?;
 
 	match first_byte {
 		0xFD => {
 			let uint16 = cursor.read_u16::<LittleEndian>()?;
-			Ok(uint16 as u64)
+			Ok(u64::from(uint16))
 		}
 
 		0xFE => {
 			let uint32 = cursor.read_u32::<LittleEndian>()?;
-			Ok(uint32 as u64)
+			Ok(u64::from(uint32))
 		}
 
 		0xFF => {
@@ -354,11 +368,12 @@ pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 			Ok(uint64)
 		}
 
-		_ => Ok(first_byte as u64),
+		_ => Ok(u64::from(first_byte)),
 	}
 }
 
 /// Decodes a string from a variable length string
+#[allow(clippy::cast_possible_truncation)]
 pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 	let length = decode_varint(cursor)?;
 
@@ -375,7 +390,7 @@ pub struct NetworkQueue {
 }
 
 impl NetworkQueue {
-	pub fn new() -> Self {
+	pub const fn new() -> Self {
 		Self {
 			buffer: Vec::new(),
 			messages: Vec::new(),
@@ -387,18 +402,15 @@ impl NetworkQueue {
 		self.buffer.extend_from_slice(data);
 
 		loop {
-			match Message::from_bytes(&self.buffer) {
-				Ok(message) => {
-					let message_len = message.to_bytes().len();
-					self.messages.push(message);
-					self.buffer = self.buffer.split_off(message_len);
+			if let Ok(message) = Message::from_bytes(&self.buffer) {
+				let message_len = message.to_bytes().len();
+				self.messages.push(message);
+				self.buffer = self.buffer.split_off(message_len);
+			} else {
+				if self.buffer.len() > MAX_MESSAGE_SIZE {
+					return Err(anyhow!("Received oversized message"));
 				}
-				Err(_) => {
-					if self.buffer.len() > MAX_MESSAGE_SIZE {
-						return Err(anyhow!("Received oversized message"));
-					}
-					break;
-				}
+				break;
 			}
 		}
 
@@ -407,10 +419,10 @@ impl NetworkQueue {
 
 	/// Retrieves the next complete message from the queue
 	pub fn get_next_message(&mut self) -> Option<Message> {
-		if !self.messages.is_empty() {
-			Some(self.messages.remove(0))
-		} else {
+		if self.messages.is_empty() {
 			None
+		} else {
+			Some(self.messages.remove(0))
 		}
 	}
 }
@@ -447,7 +459,7 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 		// Only proceed if the node doesn't exist already
 		if nm_clone.insert(node_endpoint.address, node_endpoint.port, ConnectionType::Incoming) {
 			tokio::spawn(async move {
-				node_connection_loop(nm_clone.clone(), node_endpoint.clone(), tcp_stream).await;
+				node_connection_loop(Arc::clone(&nm_clone), node_endpoint.clone(), tcp_stream).await;
 
 				// If the connection loop ended, it means that the connection was closed
 				nm_clone.set_connected(&node_endpoint, false);
@@ -463,6 +475,7 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
 	use super::*;
 	use std::net::{IpAddr, Ipv4Addr};

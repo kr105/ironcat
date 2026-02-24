@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+	array::TryFromSliceError,
 	net::Ipv4Addr,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
-pub fn vec_to_u64_le(v: Vec<u8>) -> u64 {
-	if v.len() != 8 {
-		panic!("Vector must contain exactly 8 bytes");
-	}
-	u64::from_le_bytes(v.try_into().unwrap())
+pub fn vec_to_u64_le(v: &[u8]) -> Result<u64, TryFromSliceError> {
+	let bytes: [u8; 8] = v.try_into()?;
+	Ok(u64::from_le_bytes(bytes))
 }
 
 pub fn u64_to_vec_le(value: u64) -> Vec<u8> {
@@ -17,13 +16,20 @@ pub fn u64_to_vec_le(value: u64) -> Vec<u8> {
 }
 
 pub fn is_recently_active(timestamp: u32) -> bool {
-	// Get current timestamp
+	// SystemTime::now().duration_since(UNIX_EPOCH) only fails if system clock
+	// is before 1970, which is not a realistic scenario
+	#[allow(clippy::expect_used)]
 	let now = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.expect("Time went backwards")
-		.as_secs() as u32;
+		.as_secs();
+
+	// Timestamps in the Bitcoin protocol use u32, which is valid until 2106
+	#[allow(clippy::cast_possible_truncation)]
+	let now = now as u32;
 
 	// Calculate timestamp from 6 hours ago
+	#[allow(clippy::arithmetic_side_effects)]
 	let six_hours_ago = now.saturating_sub(60 * 60 * 6);
 
 	// Compare

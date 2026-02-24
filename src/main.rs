@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use ui::tui::tui_start;
 
+// Using eprintln! for shutdown messages because the TUI owns stdout and the log
+// channel may already be closed when these fire
+#[allow(clippy::print_stderr)]
 #[tokio::main]
 async fn main() -> Result<()> {
 	let (log_tx, log_rx) = mpsc::channel::<LogChannelEntry>(100);
@@ -26,12 +29,16 @@ async fn main() -> Result<()> {
 	));
 
 	// Try to set logging time to local timezone
+	// Cannot use map_or_else here due to borrow checker constraints
+	#[allow(clippy::option_if_let_else)]
 	let log_config = match log_config.set_time_offset_to_local() {
 		Ok(local) => local.build(),
 		Err(_) => log_config.build(),
 	};
 
 	// Init loggers
+	// Logger init only fails if called twice, which can't happen here
+	#[allow(clippy::unwrap_used)]
 	CombinedLogger::init(vec![LogChannel::new(LevelFilter::Trace, log_config, log_tx)]).unwrap();
 
 	info!("ironcat v0.0.2 - Starting ...");
@@ -57,15 +64,17 @@ async fn main() -> Result<()> {
 	insert_node(nm_clone, "23.179.3.12", 9933);
 
 	// Keep the main task running
+	// Using eprintln! here because the TUI owns stdout and the log channel
+	// may already be closed when these shutdown messages fire
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
-			println!("Received Ctrl+C, shutting down...");
+			eprintln!("Received Ctrl+C, shutting down...");
 		}
 		_ = ui_handle => {
-			println!("UI task ended, shutting down...");
+			eprintln!("UI task ended, shutting down...");
 		}
 		_ = listening_handle => {
-			println!("Listening task ended, shutting down...");
+			eprintln!("Listening task ended, shutting down...");
 		}
 	}
 

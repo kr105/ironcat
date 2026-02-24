@@ -18,14 +18,14 @@ use crate::{logger_channel::LogChannelEntry, nodes::NodeManager};
 /// Initializes and runs the TUI application
 pub async fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<LogChannelEntry>) {
 	let terminal = ratatui::init();
-	_ = run(terminal, node_manager, log_receiver).context("app loop failed");
+	_ = run(terminal, &node_manager, log_receiver).context("app loop failed");
 	ratatui::restore();
 }
 
 /// Main TUI application loop
 fn run(
 	mut terminal: DefaultTerminal,
-	node_manager: Arc<NodeManager>,
+	node_manager: &Arc<NodeManager>,
 	mut log_receiver: mpsc::Receiver<LogChannelEntry>,
 ) -> Result<()> {
 	let mut log_buffer = Vec::new();
@@ -39,8 +39,8 @@ fn run(
 			}
 		}
 
-		let node_manager_clone = node_manager.clone();
-		terminal.draw(|f| draw(f, node_manager_clone, &log_buffer))?;
+		let node_manager_clone = Arc::clone(node_manager);
+		terminal.draw(|f| draw(f, &node_manager_clone, &log_buffer))?;
 
 		if should_quit()? {
 			break;
@@ -50,14 +50,16 @@ fn run(
 }
 
 /// Renders the TUI layout and content
-fn draw(frame: &mut Frame, node_manager: Arc<NodeManager>, log_buffer: &[LogChannelEntry]) {
+#[allow(clippy::indexing_slicing)]
+fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &[LogChannelEntry]) {
+	// Layout always returns exactly the number of constraints provided
 	let layout = Layout::default()
 		.direction(Direction::Horizontal)
 		.constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
 		.split(frame.area());
 
 	// Render left panel
-	draw_left_panel(frame, layout[0], &node_manager);
+	draw_left_panel(frame, layout[0], node_manager);
 
 	// Render log panel
 	let log_block = Block::default().borders(Borders::ALL).title("Logs");
@@ -89,7 +91,7 @@ fn create_log_text(log_buffer: &[LogChannelEntry], visible_lines: usize) -> Text
 
 		let log_line = Line::from(vec![
 			Span::styled(
-				format!("[{}]", log_name),
+				format!("[{log_name}]"),
 				Style::default().fg(log_color).add_modifier(Modifier::BOLD),
 			),
 			Span::raw(" "),
@@ -102,8 +104,10 @@ fn create_log_text(log_buffer: &[LogChannelEntry], visible_lines: usize) -> Text
 	text
 }
 
+#[allow(clippy::indexing_slicing)]
 fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	// Split the panel horizontally
+	// Layout always returns exactly the number of constraints provided
 	let chunks = Layout::default()
 		.direction(Direction::Vertical)
 		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -113,7 +117,7 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	let stats = node_manager.get_stats();
 	let stats_text = format!(
 		"Total Nodes: {}\nConnected Nodes: {}\nDisconnected Nodes: {}",
-		stats.total_nodes, stats.connected_nodes, stats.disconnected_nodes
+		stats.total, stats.connected, stats.disconnected
 	);
 	let stats_paragraph = Paragraph::new(stats_text).block(Block::default().borders(Borders::ALL).title("Node Stats"));
 	frame.render_widget(stats_paragraph, chunks[0]);
@@ -134,13 +138,15 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		.map(|node| {
 			let node = node.value();
 			Row::new(vec![
-				Cell::from(node.endpoint.to_string()),        // Convert to Cell
-				Cell::from(node.height.to_string()),          // Convert to Cell
-				Cell::from(node.connected.to_string()),       // Convert to Cell
-				Cell::from(node.connection_type.to_string()), // Convert to Cell
+				Cell::from(node.endpoint.to_string()),
+				Cell::from(node.height.to_string()),
+				Cell::from(node.connected.to_string()),
+				Cell::from(node.connection_type.to_string()),
 			])
 		})
 		.collect();
+
+	drop(nodes);
 
 	let table = Table::new(
 		rows,
@@ -151,7 +157,7 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 			Constraint::Percentage(15), // "Type" column width
 		],
 	)
-	.header(header) // Use a Row for the header
+	.header(header)
 	.block(Block::default().borders(Borders::ALL).title("Connected Nodes"));
 
 	frame.render_widget(table, chunks[1]);
