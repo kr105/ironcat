@@ -41,10 +41,6 @@ pub fn is_recently_active(timestamp: u32) -> bool {
 }
 
 /// Converts an IPv4 address to an IPv4-mapped IPv6 address in network byte order
-pub fn ipv4_to_mapped_ipv6(ipv4: Ipv4Addr) -> [u8; 16] {
-	let mut bytes = [0u8; 16];
-	bytes[10] = 0xff;
-	bytes[11] = 0xff;
-	bytes[12..].copy_from_slice(&ipv4.octets());
-	bytes
+pub const fn ipv4_to_mapped_ipv6(ipv4: Ipv4Addr) -> [u8; 16] {
+	ipv4.to_ipv6_mapped().octets()
 }

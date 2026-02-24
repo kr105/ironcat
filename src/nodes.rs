@@ -7,7 +7,6 @@ use std::{
 	ffi::CStr,
 	fmt,
 	net::IpAddr,
-	str::FromStr,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +35,9 @@ const BACKOFF_MAX_SECS: u64 = 30 * 60;
 /// Maximum retry attempts before marking a node as dead
 const MAX_RETRY_ATTEMPTS: u32 = 10;
 
+/// Maximum number of nodes to track
+const MAX_NODES: usize = 5000;
+
 /// Reason why a node was permanently banned
 #[derive(Debug)]
 pub enum BanReason {
@@ -58,7 +60,7 @@ impl fmt::Display for BanReason {
 #[derive(Debug)]
 pub enum NodeState {
 	/// TCP connect in progress
-	Connecting,
+	Connecting { since: Instant },
 	/// TCP connected, version handshake in progress
 	Handshaking,
 	/// Fully connected and operational
@@ -93,7 +95,7 @@ impl NodeState {
 impl fmt::Display for NodeState {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Connecting => write!(f, "Connecting"),
+			Self::Connecting { .. } => write!(f, "Connecting"),
 			Self::Handshaking { .. } => write!(f, "Handshaking"),
 			Self::Connected { .. } => write!(f, "Connected"),
 			Self::Disconnected { attempt, .. } => write!(f, "Disconnected({attempt})"),
@@ -222,6 +224,7 @@ impl Default for NodeManager {
 }
 
 impl NodeManager {
+	/// Creates a new `NodeManager` with an empty node set and a random nonce
 	pub fn new() -> Self {
 		Self {
 			nodes: DashMap::new(),
@@ -233,6 +236,11 @@ impl NodeManager {
 	///
 	/// Returns true if the node was inserted, false if it already existed
 	pub fn insert(&self, address: IpAddr, port: u16, connection_type: ConnectionType) -> bool {
+		if self.nodes.len() >= MAX_NODES {
+			debug!("Node limit reached ({}), not adding {}:{}", MAX_NODES, address, port);
+			return false;
+		}
+
 		let endpoint = NodeEndpoint { address, port };
 
 		// Use entry API for atomic check-and-insert
@@ -242,7 +250,7 @@ impl NodeManager {
 			dashmap::mapref::entry::Entry::Occupied(_) => false,
 			dashmap::mapref::entry::Entry::Vacant(vacant) => {
 				let initial_state = match connection_type {
-					ConnectionType::Outgoing => NodeState::Connecting,
+					ConnectionType::Outgoing => NodeState::Connecting { since: Instant::now() },
 					ConnectionType::Incoming => NodeState::Handshaking,
 				};
 
@@ -289,7 +297,7 @@ impl NodeManager {
 	/// Checks if the node is appropriate to try a connection
 	pub fn is_candidate(&self, node_endpoint: &NodeEndpoint) -> bool {
 		if let Some(node) = self.nodes.get(node_endpoint) {
-			return matches!(node.state, NodeState::Connecting) || node.state.is_connectable();
+			return matches!(node.state, NodeState::Connecting { .. }) || node.state.is_connectable();
 		}
 
 		false
@@ -319,6 +327,7 @@ impl NodeManager {
 		}
 	}
 
+	/// Returns summary statistics about the managed nodes
 	pub fn get_stats(&self) -> NodeStats {
 		let total = self.nodes.len();
 		let connected = self.nodes.iter().filter(|n| n.state.is_connected()).count();
@@ -387,7 +396,7 @@ impl NodeManager {
 					if !node.state.is_connectable() {
 						continue;
 					}
-					node.state = NodeState::Connecting;
+					node.state = NodeState::Connecting { since: Instant::now() };
 				} else {
 					continue;
 				}
@@ -398,6 +407,32 @@ impl NodeManager {
 				tokio::spawn(async move {
 					handle_node_connection(nm, addr, port, attempt).await;
 				});
+			}
+
+			// Detect nodes stuck in Connecting for too long (e.g. panicked task)
+			let stale_connecting: Vec<NodeEndpoint> = self
+				.nodes
+				.iter()
+				.filter_map(|entry| {
+					if let NodeState::Connecting { since } = &entry.value().state {
+						if since.elapsed() > Duration::from_secs(300) {
+							return Some(entry.key().clone());
+						}
+					}
+					None
+				})
+				.collect();
+
+			for endpoint in stale_connecting {
+				warn!("Node {} stuck in Connecting for >5min, scheduling retry", endpoint);
+				if let Some(mut node) = self.nodes.get_mut(&endpoint) {
+					if let NodeState::Connecting { .. } = node.state {
+						node.state = NodeState::Disconnected {
+							retry_at: Instant::now(),
+							attempt: 0,
+						};
+					}
+				}
 			}
 
 			let stats = self.get_stats();
@@ -449,10 +484,7 @@ impl NodeManager {
 	pub fn revive_if_newer(self: &Arc<Self>, endpoint: &NodeEndpoint, timestamp: u32) -> bool {
 		if let Some(mut node) = self.nodes.get_mut(endpoint) {
 			if matches!(node.state, NodeState::Dead) && u64::from(timestamp) > node.last_seen {
-				node.state = NodeState::Disconnected {
-					retry_at: Instant::now(),
-					attempt: 0,
-				};
+				node.state = NodeState::Connecting { since: Instant::now() };
 				node.last_seen = u64::from(timestamp);
 				drop(node);
 
@@ -646,10 +678,16 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	// Hand off the connection to the connection loop
 	node_connection_loop(Arc::clone(&node_manager), node_endpoint.clone(), tcp_stream).await;
 
+	// Don't overwrite banned nodes -- they were banned for a reason
+	if let Some(node) = node_manager.nodes.get(&node_endpoint) {
+		if node.state.is_banned() {
+			debug!("Node {} is banned, not scheduling retry", &node_endpoint);
+			return;
+		}
+	}
+
 	// Connection loop ended -- transition based on retry count
-	// attempt + 1 is bounded by MAX_RETRY_ATTEMPTS (10), no overflow
-	#[allow(clippy::arithmetic_side_effects)]
-	let next_attempt = attempt + 1;
+	let next_attempt = attempt.saturating_add(1);
 	if next_attempt >= MAX_RETRY_ATTEMPTS {
 		debug!("Node {} exhausted all retry attempts, marking as dead", &node_endpoint);
 		node_manager.set_state(&node_endpoint, NodeState::Dead);
@@ -677,7 +715,13 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 }
 
 /// Main read loop for a node connection
-pub async fn node_connection_loop(node_manager: Arc<NodeManager>, node_endpoint: NodeEndpoint, tcp_stream: TcpStream) {
+// Explicit pub(crate) signals intent: only network.rs should call this directly
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn node_connection_loop(
+	node_manager: Arc<NodeManager>,
+	node_endpoint: NodeEndpoint,
+	tcp_stream: TcpStream,
+) {
 	// Split the TCP stream into separate reader and writer
 	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
 
@@ -757,10 +801,7 @@ async fn parse_incoming_message(
 		return Err(anyhow!("Error parsing incoming message, 'command' field is malformed"));
 	};
 
-	let command = NetworkCommand::from_str(command).map_err(|()| {
-		warn!("Failed to parse network command from {}", node_endpoint);
-		anyhow!("failed to parse network command")
-	})?;
+	let command = NetworkCommand::from_command_str(command);
 
 	debug!("Received message: {:?} from {}", command, node_endpoint);
 
@@ -988,7 +1029,7 @@ async fn handle_getaddr(
 		.map(|entry| {
 			let node = entry.value();
 			NetworkAddress {
-				services: node.services.clone(),
+				services: node.services,
 				address: node.endpoint.address,
 				port: node.endpoint.port,
 			}
@@ -996,7 +1037,10 @@ async fn handle_getaddr(
 		.collect();
 
 	if filtered_nodes.is_empty() {
-		error!("Can't answer the GetAddr message if the generated node list is empty");
+		debug!(
+			"No recently active outgoing nodes to share for GetAddr from {}",
+			node_endpoint
+		);
 		return Ok(());
 	}
 
@@ -1048,7 +1092,7 @@ mod tests {
 
 	#[test]
 	fn connecting_is_not_connected() {
-		assert!(!NodeState::Connecting.is_connected());
+		assert!(!NodeState::Connecting { since: Instant::now() }.is_connected());
 	}
 
 	#[test]
@@ -1092,7 +1136,7 @@ mod tests {
 
 	#[test]
 	fn connected_is_not_banned() {
-		assert!(!NodeState::Connecting.is_banned());
+		assert!(!NodeState::Connecting { since: Instant::now() }.is_banned());
 	}
 
 	#[test]

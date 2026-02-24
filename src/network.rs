@@ -4,7 +4,6 @@ use std::{
 	collections::VecDeque,
 	io::{Cursor, Read},
 	net::IpAddr,
-	str::FromStr,
 	sync::Arc,
 };
 
@@ -39,9 +38,12 @@ const NET_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
 /// Maximum allowed length for a variable-length string
 const MAX_VARSTR_LENGTH: usize = 4096;
 
+/// Thread-safe shared TCP writer for sending messages to a peer
 pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
 
+/// Extension trait for sending protocol messages over a shared TCP writer
 pub trait SharedTcpWriterExt {
+	/// Constructs and sends a protocol message with the given command and payload
 	async fn send_message(&self, command: &str, payload: Vec<u8>) -> Result<()>;
 }
 
@@ -122,7 +124,7 @@ impl NetworkAddress {
 	}
 
 	/// Converts the IP address to a 16-byte network order representation
-	pub(crate) fn address_to_network_bytes(&self) -> [u8; 16] {
+	pub(crate) const fn address_to_network_bytes(&self) -> [u8; 16] {
 		match &self.address {
 			IpAddr::V4(ipv4) => ipv4_to_mapped_ipv6(*ipv4),
 			IpAddr::V6(ipv6) => ipv6.octets(),
@@ -132,7 +134,7 @@ impl NetworkAddress {
 
 bitflags! {
 	/// Represents the services offered by a node
-	#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+	#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 	pub struct ServiceMask: u64 {
 		/// Node can serve full blocks
 		const NODE_NETWORK = 1;
@@ -360,19 +362,18 @@ pub enum NetworkCommand {
 	Unknown(String),
 }
 
-impl FromStr for NetworkCommand {
-	type Err = ();
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl NetworkCommand {
+	/// Parses a command string into a `NetworkCommand` variant
+	pub(crate) fn from_command_str(s: &str) -> Self {
 		match s.to_lowercase().as_str() {
-			"version" => Ok(Self::Version),
-			"verack" => Ok(Self::Verack),
-			"ping" => Ok(Self::Ping),
-			"pong" => Ok(Self::Pong),
-			"alert" => Ok(Self::Alert),
-			"getaddr" => Ok(Self::GetAddr),
-			"addr" => Ok(Self::Addr),
-			_ => Ok(Self::Unknown(s.to_string())),
+			"version" => Self::Version,
+			"verack" => Self::Verack,
+			"ping" => Self::Ping,
+			"pong" => Self::Pong,
+			"alert" => Self::Alert,
+			"getaddr" => Self::GetAddr,
+			"addr" => Self::Addr,
+			_ => Self::Unknown(s.to_string()),
 		}
 	}
 }

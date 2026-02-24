@@ -35,6 +35,7 @@ pub struct MessageVersion {
 }
 
 impl MessageVersion {
+	/// Creates a new version message for the given receiving address and nonce
 	pub fn new(addr_recv: NetworkAddress, nonce: u64) -> Self {
 		let mut services = ServiceMask::empty();
 		services.set(ServiceMask::NODE_NETWORK, true);
@@ -82,6 +83,7 @@ impl MessageVersion {
 		bytes
 	}
 
+	/// Decodes a version message from wire bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		if bytes.len() < 85 {
 			return Err(anyhow!("Insufficient bytes for MessageVersion"));
