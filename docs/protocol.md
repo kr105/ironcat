@@ -264,5 +264,8 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 - Read buffer: 4096 bytes per read call
 - Writer is `Arc<Mutex<OwnedWriteHalf>>` for concurrent access
 - Max tracked nodes: 5000
-- Incoming connections are keyed by their ephemeral port (cannot be retried)
+- Nodes are keyed by IP address (one connection per IP, both inbound and outbound, for sybil/eclipse defense)
+- Incoming connections that arrive for an IP already active (connecting, handshaking, or connected) are rejected
+- Incoming connections can replace disconnected or dead nodes at the same IP, resetting state to Handshaking
+- If a disconnected or dead node receives an addr update with a different port, the stored port is updated silently for the next reconnection attempt
 - `DashMap` locks are never held across await points (version handler uses 3-phase lock pattern)

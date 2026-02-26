@@ -17,6 +17,7 @@ cargo run -- --help                          # Show help
 
 - Full Catcoin P2P handshake (version/verack)
 - Peer discovery via DNS seeds and addr gossip
+- One connection per IP (sybil/eclipse defense)
 - Proactive addr relay with deterministic peer selection and rate limiting
 - Periodic self-announcement when publicly reachable
 - Exponential backoff with jitter for disconnected peers
