@@ -158,19 +158,6 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 	Duration::from_secs(capped.saturating_sub(jitter_range).saturating_add(jitter_offset))
 }
 
-/// Represents a unique identifier for a node in the network
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
-pub struct NodeEndpoint {
-	pub address: IpAddr,
-	pub port: u16,
-}
-
-impl fmt::Display for NodeEndpoint {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}:{}", self.address, self.port)
-	}
-}
-
 /// Summary statistics about managed nodes
 #[derive(Debug)]
 pub struct NodeStats {
@@ -200,7 +187,8 @@ impl fmt::Display for ConnectionType {
 /// Contains only the fields needed by the TUI, without internal state
 /// like `tcp_writer` or the full `NodeState` enum
 pub struct NodeSnapshot {
-	pub endpoint: NodeEndpoint,
+	pub address: IpAddr,
+	pub port: u16,
 	pub height: i32,
 	pub connection_type: ConnectionType,
 	pub state_label: String,
@@ -208,7 +196,8 @@ pub struct NodeSnapshot {
 
 /// Represents a node in the Catcoin network
 pub struct Node {
-	pub endpoint: NodeEndpoint,
+	/// Port number for this node's listening socket
+	pub port: u16,
 
 	/// Unix timestamp
 	pub last_seen: u64,
@@ -234,7 +223,7 @@ pub struct Node {
 	pub state: NodeState,
 
 	/// Addresses already relayed to this peer in the current 24h window
-	pub addr_known: HashSet<(IpAddr, u16)>,
+	pub addr_known: HashSet<IpAddr>,
 
 	/// The 24h time bucket when `addr_known` was last cleared
 	pub addr_known_bucket: u64,
@@ -252,7 +241,7 @@ pub struct Node {
 /// Manages a collection of nodes in the network
 pub struct NodeManager {
 	// Using DashMap for concurrent access without needing explicit locking
-	pub(crate) nodes: DashMap<NodeEndpoint, Node>,
+	pub(crate) nodes: DashMap<IpAddr, Node>,
 
 	// Used to avoid connecting to myself
 	pub my_nonce: u64,
@@ -284,20 +273,26 @@ impl NodeManager {
 
 	/// Inserts a new node into the manager if it doesn't already exist
 	///
-	/// Returns true if the node was inserted, false if it already existed
+	/// For occupied entries that are Disconnected or Dead, silently updates port
+	/// and connection type. Returns true only if a new entry was inserted
 	pub fn insert(&self, address: IpAddr, port: u16, connection_type: ConnectionType) -> bool {
 		if self.nodes.len() >= MAX_NODES {
 			debug!("Node limit reached ({}), not adding {}:{}", MAX_NODES, address, port);
 			return false;
 		}
 
-		let endpoint = NodeEndpoint { address, port };
-
 		// Use entry API for atomic check-and-insert
-		let entry = self.nodes.entry(endpoint.clone());
+		let entry = self.nodes.entry(address);
 
 		match entry {
-			dashmap::mapref::entry::Entry::Occupied(_) => false,
+			dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+				let node = occupied.get_mut();
+				if matches!(node.state, NodeState::Disconnected { .. } | NodeState::Dead) {
+					node.port = port;
+					node.connection_type = connection_type;
+				}
+				false
+			}
 			dashmap::mapref::entry::Entry::Vacant(vacant) => {
 				let initial_state = match connection_type {
 					ConnectionType::Outgoing => NodeState::Connecting { since: Instant::now() },
@@ -305,7 +300,7 @@ impl NodeManager {
 				};
 
 				let node = Node {
-					endpoint,
+					port,
 					last_seen: 0,
 					height: 0,
 					relay: false,
@@ -329,23 +324,82 @@ impl NodeManager {
 		}
 	}
 
+	/// Inserts or reactivates a node for an incoming connection
+	///
+	/// If the node exists and is Disconnected or Dead, resets it to Handshaking
+	/// If the node exists and is active, returns false (reject the connection)
+	/// If the node doesn't exist, inserts it in Handshaking state
+	/// Returns true if the node is ready to accept the incoming connection
+	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> bool {
+		if self.nodes.len() >= MAX_NODES {
+			debug!(
+				"Node limit reached ({}), not adding incoming {}:{}",
+				MAX_NODES, address, port
+			);
+			return false;
+		}
+
+		let entry = self.nodes.entry(address);
+
+		match entry {
+			dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+				let node = occupied.get_mut();
+				if matches!(node.state, NodeState::Disconnected { .. } | NodeState::Dead) {
+					node.port = port;
+					node.connection_type = ConnectionType::Incoming;
+					node.state = NodeState::Handshaking { since: Instant::now() };
+					node.version_received = false;
+					node.sent_getaddr = false;
+					node.addr_tokens = ADDR_TOKEN_CAPACITY;
+					node.last_token_refill = Instant::now();
+					true
+				} else {
+					false
+				}
+			}
+			dashmap::mapref::entry::Entry::Vacant(vacant) => {
+				let node = Node {
+					port,
+					last_seen: 0,
+					height: 0,
+					relay: false,
+					services: ServiceMask::empty(),
+					timestamp: 0,
+					user_agent: String::new(),
+					version: 0,
+					version_received: false,
+					connection_type: ConnectionType::Incoming,
+					state: NodeState::Handshaking { since: Instant::now() },
+					addr_known: HashSet::new(),
+					addr_known_bucket: 0,
+					addr_tokens: ADDR_TOKEN_CAPACITY,
+					last_token_refill: Instant::now(),
+					sent_getaddr: false,
+				};
+
+				vacant.insert(node);
+				true
+			}
+		}
+	}
+
 	/// Updates the `last_seen` timestamp for a node with the current time
-	pub fn update_last_seen(&self, node_endpoint: &NodeEndpoint) {
-		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
+	pub fn update_last_seen(&self, address: &IpAddr) {
+		if let Some(mut node) = self.nodes.get_mut(address) {
 			node.last_seen = unix_now();
 		}
 	}
 
 	/// Updates the connection state of a node
-	pub fn set_state(&self, node_endpoint: &NodeEndpoint, state: NodeState) {
-		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
+	pub fn set_state(&self, address: &IpAddr, state: NodeState) {
+		if let Some(mut node) = self.nodes.get_mut(address) {
 			node.state = state;
 		}
 	}
 
 	/// Checks if the node is appropriate to try a connection
-	pub fn is_candidate(&self, node_endpoint: &NodeEndpoint) -> bool {
-		if let Some(node) = self.nodes.get(node_endpoint) {
+	pub fn is_candidate(&self, address: &IpAddr) -> bool {
+		if let Some(node) = self.nodes.get(address) {
 			return matches!(node.state, NodeState::Connecting { .. }) || node.state.is_connectable();
 		}
 
@@ -353,25 +407,25 @@ impl NodeManager {
 	}
 
 	/// Sends a ping message to a connected node
-	pub async fn send_ping(&self, node_endpoint: &NodeEndpoint) {
-		let tcp_writer = if let Some(node) = self.nodes.get(node_endpoint) {
+	pub async fn send_ping(&self, address: &IpAddr) {
+		let tcp_writer = if let Some(node) = self.nodes.get(address) {
 			if let NodeState::Connected { ref writer } = node.state {
 				Arc::clone(writer)
 			} else {
-				debug!("Skipping ping to {}, not connected", node_endpoint);
+				debug!("Skipping ping to {}, not connected", address);
 				return;
 			}
 		} else {
-			debug!("Skipping ping to {}, node not found", node_endpoint);
+			debug!("Skipping ping to {}, node not found", address);
 			return;
 		};
 
-		debug!("Sending ping to {}", node_endpoint);
+		debug!("Sending ping to {}", address);
 
 		let nonce = rand::thread_rng().next_u64();
 
 		if let Err(e) = tcp_writer.send_message("ping", &nonce.to_le_bytes()).await {
-			warn!("Failed to send ping to {}: {}", node_endpoint, e);
+			warn!("Failed to send ping to {}: {}", address, e);
 		}
 	}
 
@@ -395,7 +449,8 @@ impl NodeManager {
 			.map(|entry| {
 				let node = entry.value();
 				NodeSnapshot {
-					endpoint: node.endpoint.clone(),
+					address: *entry.key(),
+					port: node.port,
 					height: node.height,
 					connection_type: node.connection_type,
 					state_label: node.state.to_string(),
@@ -412,16 +467,16 @@ impl NodeManager {
 		loop {
 			tokio::time::sleep(REAPER_SCAN_INTERVAL).await;
 
-			// Collect endpoints of nodes ready for retry
+			// Collect addresses of nodes ready for retry
 			// We collect first to avoid holding DashMap locks during spawning
-			let ready_nodes: Vec<(NodeEndpoint, u32)> = self
+			let ready_nodes: Vec<(IpAddr, u32)> = self
 				.nodes
 				.iter()
 				.filter_map(|entry| {
 					let node = entry.value();
 					if let NodeState::Disconnected { attempt, .. } = &node.state {
 						if node.state.is_connectable() {
-							return Some((entry.key().clone(), *attempt));
+							return Some((*entry.key(), *attempt));
 						}
 					}
 					None
@@ -432,28 +487,27 @@ impl NodeManager {
 				info!("Reaper: {} nodes ready for retry", ready_nodes.len());
 			}
 
-			for (endpoint, attempt) in ready_nodes {
-				// Transition to Connecting before spawning
-				if let Some(mut node) = self.nodes.get_mut(&endpoint) {
+			for (address, attempt) in ready_nodes {
+				// Transition to Connecting before spawning, read port while locked
+				let port = if let Some(mut node) = self.nodes.get_mut(&address) {
 					// Double-check state hasn't changed since we collected
 					if !node.state.is_connectable() {
 						continue;
 					}
 					node.state = NodeState::Connecting { since: Instant::now() };
+					node.port
 				} else {
 					continue;
-				}
+				};
 
 				let nm = Arc::clone(&self);
-				let addr = endpoint.address;
-				let port = endpoint.port;
 				tokio::spawn(async move {
-					handle_node_connection(nm, addr, port, attempt).await;
+					handle_node_connection(nm, address, port, attempt).await;
 				});
 			}
 
 			// Detect nodes stuck in Connecting or Handshaking for too long
-			let stale_nodes: Vec<NodeEndpoint> = self
+			let stale_nodes: Vec<IpAddr> = self
 				.nodes
 				.iter()
 				.filter_map(|entry| {
@@ -463,16 +517,16 @@ impl NodeManager {
 						_ => false,
 					};
 					if is_stale {
-						Some(entry.key().clone())
+						Some(*entry.key())
 					} else {
 						None
 					}
 				})
 				.collect();
 
-			for endpoint in stale_nodes {
-				warn!("Node {} stuck in stale state, scheduling retry", endpoint);
-				if let Some(mut node) = self.nodes.get_mut(&endpoint) {
+			for address in stale_nodes {
+				warn!("Node {} stuck in stale state, scheduling retry", address);
+				if let Some(mut node) = self.nodes.get_mut(&address) {
 					if matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. }) {
 						node.state = NodeState::Disconnected {
 							retry_at: Instant::now(),
@@ -507,8 +561,8 @@ impl NodeManager {
 	/// Returns None if the node doesn't exist or isn't in Connected state
 	// Part of the NodeManager encapsulation API, will replace direct field access
 	#[allow(dead_code)]
-	pub fn get_writer(&self, node_endpoint: &NodeEndpoint) -> Option<SharedTcpWriter> {
-		if let Some(node) = self.nodes.get(node_endpoint) {
+	pub fn get_writer(&self, address: &IpAddr) -> Option<SharedTcpWriter> {
+		if let Some(node) = self.nodes.get(address) {
 			if let NodeState::Connected { ref writer } = node.state {
 				return Some(Arc::clone(writer));
 			}
@@ -520,12 +574,12 @@ impl NodeManager {
 	///
 	/// Collects writers first to avoid holding `DashMap` locks across awaits
 	pub async fn graceful_shutdown(&self) {
-		let writers: Vec<(NodeEndpoint, SharedTcpWriter)> = self
+		let writers: Vec<(IpAddr, SharedTcpWriter)> = self
 			.nodes
 			.iter()
 			.filter_map(|entry| {
 				if let NodeState::Connected { ref writer } = entry.state {
-					Some((entry.endpoint.clone(), Arc::clone(writer)))
+					Some((*entry.key(), Arc::clone(writer)))
 				} else {
 					None
 				}
@@ -539,9 +593,9 @@ impl NodeManager {
 
 		info!(count, "Shutting down connected nodes");
 
-		for (endpoint, writer) in writers {
+		for (address, writer) in writers {
 			if let Err(err) = writer.lock().await.shutdown().await {
-				warn!(%endpoint, error = %err, "Failed to shut down writer");
+				warn!(%address, error = %err, "Failed to shut down writer");
 			}
 		}
 
@@ -551,8 +605,8 @@ impl NodeManager {
 	/// Marks a node as permanently banned
 	// Part of the NodeManager encapsulation API, will replace direct state mutation
 	#[allow(dead_code)]
-	pub fn ban_node(&self, node_endpoint: &NodeEndpoint, reason: BanReason) {
-		if let Some(mut node) = self.nodes.get_mut(node_endpoint) {
+	pub fn ban_node(&self, address: &IpAddr, reason: BanReason) {
+		if let Some(mut node) = self.nodes.get_mut(address) {
 			node.state = NodeState::Banned { reason };
 		}
 	}
@@ -587,19 +641,20 @@ impl NodeManager {
 	/// Revives a Dead node if the given timestamp is newer than `last_seen`
 	///
 	/// Returns true if the node was revived, false otherwise
-	pub fn revive_if_newer(self: &Arc<Self>, endpoint: &NodeEndpoint, timestamp: u32) -> bool {
-		if let Some(mut node) = self.nodes.get_mut(endpoint) {
+	pub fn revive_if_newer(self: &Arc<Self>, address: &IpAddr, port: u16, timestamp: u32) -> bool {
+		if let Some(mut node) = self.nodes.get_mut(address) {
 			if matches!(node.state, NodeState::Dead) && u64::from(timestamp) > node.last_seen {
 				node.state = NodeState::Connecting { since: Instant::now() };
 				node.last_seen = u64::from(timestamp);
+				node.port = port;
+				let revived_addr = *address;
+				let revived_port = node.port;
 				drop(node);
 
 				// Spawn a connection task for the revived node
 				let nm = Arc::clone(self);
-				let addr = endpoint.address;
-				let port = endpoint.port;
 				tokio::spawn(async move {
-					handle_node_connection(nm, addr, port, 0).await;
+					handle_node_connection(nm, revived_addr, revived_port, 0).await;
 				});
 
 				return true;
@@ -639,12 +694,12 @@ impl NodeManager {
 			let payload = msg.to_bytes();
 
 			// Collect writers to avoid holding DashMap locks across awaits
-			let writers: Vec<(NodeEndpoint, SharedTcpWriter)> = self
+			let writers: Vec<(IpAddr, SharedTcpWriter)> = self
 				.nodes
 				.iter()
 				.filter_map(|entry| {
 					if let NodeState::Connected { ref writer } = entry.value().state {
-						Some((entry.key().clone(), Arc::clone(writer)))
+						Some((*entry.key(), Arc::clone(writer)))
 					} else {
 						None
 					}
@@ -657,9 +712,9 @@ impl NodeManager {
 
 			info!("Announcing own address {}:9933 to {} peers", external_ip, writers.len());
 
-			for (endpoint, writer) in &writers {
+			for (address, writer) in &writers {
 				if let Err(e) = writer.send_message("addr", &payload).await {
-					debug!("Failed to self-announce to {}: {}", endpoint, e);
+					debug!("Failed to self-announce to {}: {}", address, e);
 				}
 			}
 		}
@@ -667,19 +722,19 @@ impl NodeManager {
 }
 
 /// Schedules a retry or marks a node as dead based on attempt count
-fn schedule_retry(node_manager: &NodeManager, endpoint: &NodeEndpoint, attempt: u32) {
+fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
 	let next_attempt = attempt.saturating_add(1);
 	if next_attempt >= MAX_RETRY_ATTEMPTS {
-		info!("Node {} exhausted all retry attempts, marking dead", endpoint);
-		node_manager.set_state(endpoint, NodeState::Dead);
+		info!("Node {} exhausted all retry attempts, marking dead", address);
+		node_manager.set_state(address, NodeState::Dead);
 	} else {
 		let backoff = calculate_backoff(next_attempt);
-		debug!("Node {} scheduling retry {} in {:?}", endpoint, next_attempt, backoff);
+		debug!("Node {} scheduling retry {} in {:?}", address, next_attempt, backoff);
 		// Instant::now() + bounded Duration cannot overflow in practice
 		#[allow(clippy::arithmetic_side_effects)]
 		let retry_at = Instant::now() + backoff;
 		node_manager.set_state(
-			endpoint,
+			address,
 			NodeState::Disconnected {
 				retry_at,
 				attempt: next_attempt,
@@ -690,12 +745,11 @@ fn schedule_retry(node_manager: &NodeManager, endpoint: &NodeEndpoint, attempt: 
 
 /// Handles the connection to a node
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16, attempt: u32) {
-	let node_endpoint = NodeEndpoint { address, port };
-
-	if !node_manager.is_candidate(&node_endpoint) {
+	if !node_manager.is_candidate(&address) {
 		trace!(
-			"Avoiding connection to node {} as it is not a good candidate",
-			&node_endpoint
+			"Avoiding connection to node {}:{} as it is not a good candidate",
+			address,
+			port
 		);
 		return;
 	}
@@ -706,38 +760,44 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	for tcp_attempt in 1..=TCP_MAX_ATTEMPTS {
 		match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
 			Ok(Ok(stream)) => {
-				info!("Connected to {} on attempt {}", &node_endpoint, tcp_attempt);
+				info!("Connected to {}:{} on attempt {}", address, port, tcp_attempt);
 				tcp_stream = Some(stream);
 				break;
 			}
 			Ok(Err(e)) => {
 				if tcp_attempt < TCP_MAX_ATTEMPTS {
 					trace!(
-						"Failed to connect to {} on attempt {}: {}",
-						&node_endpoint,
+						"Failed to connect to {}:{} on attempt {}: {}",
+						address,
+						port,
 						tcp_attempt,
 						e
 					);
 					sleep(TCP_RETRY_DELAY).await;
 				} else {
 					debug!(
-						"Failed to connect to {} after {} attempts: {}",
-						&node_endpoint, TCP_MAX_ATTEMPTS, e
+						"Failed to connect to {}:{} after {} attempts: {}",
+						address, port, TCP_MAX_ATTEMPTS, e
 					);
-					schedule_retry(&node_manager, &node_endpoint, attempt);
+					schedule_retry(&node_manager, &address, attempt);
 					return;
 				}
 			}
 			Err(_) => {
 				if tcp_attempt < TCP_MAX_ATTEMPTS {
-					trace!("Connection to {} timed out on attempt {}", &node_endpoint, tcp_attempt);
+					trace!(
+						"Connection to {}:{} timed out on attempt {}",
+						address,
+						port,
+						tcp_attempt
+					);
 					sleep(TCP_RETRY_DELAY).await;
 				} else {
 					debug!(
-						"Connection to {} timed out after {} attempts",
-						&node_endpoint, TCP_MAX_ATTEMPTS
+						"Connection to {}:{} timed out after {} attempts",
+						address, port, TCP_MAX_ATTEMPTS
 					);
-					schedule_retry(&node_manager, &node_endpoint, attempt);
+					schedule_retry(&node_manager, &address, attempt);
 					return;
 				}
 			}
@@ -746,15 +806,15 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 
 	let Some(mut tcp_stream) = tcp_stream else {
 		error!(
-			"Failed to establish connection to {:?} after {} attempts",
-			node_endpoint, TCP_MAX_ATTEMPTS
+			"Failed to establish connection to {}:{} after {} attempts",
+			address, port, TCP_MAX_ATTEMPTS
 		);
 		return;
 	};
 
 	// TCP connected, transition to handshaking
 	// Reset handshake fields so a reconnected node doesn't carry stale state
-	if let Some(mut node) = node_manager.nodes.get_mut(&node_endpoint) {
+	if let Some(mut node) = node_manager.nodes.get_mut(&address) {
 		node.state = NodeState::Handshaking { since: Instant::now() };
 		node.version_received = false;
 	}
@@ -767,43 +827,39 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	let packet = match Message::new("version", &version.to_bytes()) {
 		Ok(p) => p,
 		Err(e) => {
-			error!("Failed to create version message for {}: {}", &node_endpoint, e);
-			schedule_retry(&node_manager, &node_endpoint, attempt);
+			error!("Failed to create version message for {}:{}: {}", address, port, e);
+			schedule_retry(&node_manager, &address, attempt);
 			return;
 		}
 	};
 
 	if let Err(e) = tcp_stream.write_all(&packet.to_bytes()).await {
-		error!("Failed to send version to {}: {}", &node_endpoint, e);
-		schedule_retry(&node_manager, &node_endpoint, attempt);
+		error!("Failed to send version to {}:{}: {}", address, port, e);
+		schedule_retry(&node_manager, &address, attempt);
 		return;
 	}
 
 	// Hand off the connection to the connection loop
-	node_connection_loop(Arc::clone(&node_manager), node_endpoint.clone(), tcp_stream).await;
+	node_connection_loop(Arc::clone(&node_manager), address, tcp_stream).await;
 
 	// Don't overwrite banned nodes -- they were banned for a reason
-	if let Some(node) = node_manager.nodes.get(&node_endpoint) {
+	if let Some(node) = node_manager.nodes.get(&address) {
 		if node.state.is_banned() {
-			debug!("Node {} is banned, not scheduling retry", &node_endpoint);
+			debug!("Node {} is banned, not scheduling retry", address);
 			return;
 		}
 	}
 
 	// Connection loop ended -- schedule retry
-	schedule_retry(&node_manager, &node_endpoint, attempt);
+	schedule_retry(&node_manager, &address, attempt);
 
-	debug!("Exiting handle_node_connection for {:?}", node_endpoint);
+	debug!("Exiting handle_node_connection for {}:{}", address, port);
 }
 
 /// Main read loop for a node connection
 // Explicit pub(crate) signals intent: only network.rs should call this directly
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn node_connection_loop(
-	node_manager: Arc<NodeManager>,
-	node_endpoint: NodeEndpoint,
-	tcp_stream: TcpStream,
-) {
+pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address: IpAddr, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
 	let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 	let mut tcp_reader = BufReader::with_capacity(8192, tcp_reader);
@@ -829,7 +885,7 @@ pub(crate) async fn node_connection_loop(
 						// n is bounded by buf.len() since it comes from read()
 						#[allow(clippy::indexing_slicing)]
 						if let Err(e) = incoming_queue.process_incoming_data(&buf[..n]) {
-							warn!("Error processing data from {}: {}", &node_endpoint, e);
+							warn!("Error processing data from {}: {}", address, e);
 							break;
 						}
 					}
@@ -843,27 +899,22 @@ pub(crate) async fn node_connection_loop(
 				}
 			}
 			_ = ping_interval.tick() => {
-				node_manager.send_ping(&node_endpoint).await;
+				node_manager.send_ping(&address).await;
 			}
 		}
 
 		// Process all messages in the queue
 		while let Some(message) = incoming_queue.get_next_message() {
-			node_manager.update_last_seen(&node_endpoint);
+			node_manager.update_last_seen(&address);
 
-			if let Err(e) = parse_incoming_message(
-				Arc::clone(&node_manager),
-				&node_endpoint,
-				Arc::clone(&shared_writer),
-				message,
-			)
-			.await
+			if let Err(e) =
+				parse_incoming_message(Arc::clone(&node_manager), &address, Arc::clone(&shared_writer), message).await
 			{
 				warn!("Error parsing message: {:?}", e);
 
 				// Close the connection
 				if let Err(e) = shared_writer.lock().await.shutdown().await {
-					warn!("Error shutting down writer for {}: {}", &node_endpoint, e);
+					warn!("Error shutting down writer for {}: {}", address, e);
 				}
 				break 'main;
 			}
@@ -874,7 +925,7 @@ pub(crate) async fn node_connection_loop(
 /// Parses and dispatches an incoming message to the appropriate handler
 async fn parse_incoming_message(
 	node_manager: Arc<NodeManager>,
-	node_endpoint: &NodeEndpoint,
+	address: &IpAddr,
 	tcp_writer: SharedTcpWriter,
 	message: Message,
 ) -> Result<()> {
@@ -882,30 +933,30 @@ async fn parse_incoming_message(
 		str.to_str()
 			.map_err(|e| anyhow!("command field is not valid UTF-8: {e}"))?
 	} else {
-		warn!("Malformed 'command' field in message from {}", node_endpoint);
+		warn!("Malformed 'command' field in message from {}", address);
 		return Err(anyhow!("Error parsing incoming message, 'command' field is malformed"));
 	};
 
 	let command = NetworkCommand::from_command_str(command);
 
-	debug!("Received message: {:?} from {}", command, node_endpoint);
+	debug!("Received message: {:?} from {}", command, address);
 
 	match command {
-		NetworkCommand::Version => handle_version(&node_manager, node_endpoint, &tcp_writer, &message.payload).await,
-		NetworkCommand::Verack => handle_verack(&node_manager, node_endpoint, &tcp_writer).await,
-		NetworkCommand::Ping => handle_ping(&node_manager, node_endpoint, &tcp_writer, &message.payload).await,
+		NetworkCommand::Version => handle_version(&node_manager, address, &tcp_writer, &message.payload).await,
+		NetworkCommand::Verack => handle_verack(&node_manager, address, &tcp_writer).await,
+		NetworkCommand::Ping => handle_ping(&node_manager, address, &tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
-			handle_pong(node_endpoint);
+			handle_pong(address);
 			Ok(())
 		}
-		NetworkCommand::Addr => handle_addr(&node_manager, node_endpoint, &message.payload).await,
+		NetworkCommand::Addr => handle_addr(&node_manager, address, &message.payload).await,
 		NetworkCommand::Alert => {
-			debug!("Received alert from {}, ignoring", node_endpoint);
+			debug!("Received alert from {}, ignoring", address);
 			Ok(())
 		}
-		NetworkCommand::GetAddr => handle_getaddr(&node_manager, node_endpoint, &tcp_writer).await,
+		NetworkCommand::GetAddr => handle_getaddr(&node_manager, address, &tcp_writer).await,
 		NetworkCommand::Unknown(cmd) => {
-			warn!("Unknown command from {}: {}", node_endpoint, cmd);
+			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())
 		}
 	}
@@ -914,43 +965,43 @@ async fn parse_incoming_message(
 /// Handles an incoming version message from a peer
 async fn handle_version(
 	node_manager: &Arc<NodeManager>,
-	node_endpoint: &NodeEndpoint,
+	address: &IpAddr,
 	tcp_writer: &SharedTcpWriter,
 	payload: &[u8],
 ) -> Result<()> {
 	let version = MessageVersion::from_bytes(payload).context("failed to parse version message")?;
 
 	// Phase 1: Validate under lock, then release
-	let is_incoming = {
+	let (is_incoming, port) = {
 		let mut node = node_manager
 			.nodes
-			.get_mut(node_endpoint)
-			.ok_or_else(|| anyhow!("node {node_endpoint} disappeared from manager"))?;
+			.get_mut(address)
+			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
 
 		// Nodes can send only one version command
 		if node.version_received {
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
 			};
-			warn!("Node {} sent version command twice, banning", node_endpoint);
-			return Err(anyhow!("Node {node_endpoint} sent version command twice"));
+			warn!("Node {} sent version command twice, banning", address);
+			return Err(anyhow!("Node {address} sent version command twice"));
 		}
 
 		if version.nonce == node_manager.my_nonce {
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
 			};
-			warn!("Self-connection detected to {}, banning", node_endpoint);
-			return Err(anyhow!("Node {node_endpoint} is myself"));
+			warn!("Self-connection detected to {}, banning", address);
+			return Err(anyhow!("Node {address} is myself"));
 		}
 
-		node.connection_type == ConnectionType::Incoming
+		(node.connection_type == ConnectionType::Incoming, node.port)
 		// RefMut dropped here
 	};
 
 	// Phase 2: Async sends without holding any lock
 	if is_incoming {
-		let network_address = NetworkAddress::new(node_endpoint.address, node_endpoint.port);
+		let network_address = NetworkAddress::new(*address, port);
 		let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
 		tcp_writer
 			.send_message("version", &version_message.to_bytes())
@@ -962,10 +1013,9 @@ async fn handle_version(
 	{
 		let mut node = node_manager
 			.nodes
-			.get_mut(node_endpoint)
-			.ok_or_else(|| anyhow!("node {node_endpoint} disappeared from manager during version handling"))?;
+			.get_mut(address)
+			.ok_or_else(|| anyhow!("node {address} disappeared from manager during version handling"))?;
 
-		node.endpoint = node_endpoint.clone();
 		node.services = version.services;
 		node.timestamp = version.timestamp;
 		node.user_agent = version.user_agent;
@@ -986,21 +1036,17 @@ async fn handle_version(
 }
 
 /// Handles an incoming verack message from a peer
-async fn handle_verack(
-	node_manager: &Arc<NodeManager>,
-	node_endpoint: &NodeEndpoint,
-	tcp_writer: &SharedTcpWriter,
-) -> Result<()> {
+async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
 	let mut node = node_manager
 		.nodes
-		.get_mut(node_endpoint)
-		.ok_or_else(|| anyhow!("node {node_endpoint} disappeared from manager"))?;
+		.get_mut(address)
+		.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
 
 	// If we already received version from the peer, the handshake is complete
 	if node.version_received {
 		info!(
 			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			node_endpoint, node.version, node.height, node.user_agent
+			address, node.version, node.height, node.user_agent
 		);
 
 		node.state = NodeState::Connected {
@@ -1010,7 +1056,7 @@ async fn handle_verack(
 		drop(node);
 
 		// Mark that we sent getaddr so we suppress relay of their addr response
-		if let Some(mut node) = node_manager.nodes.get_mut(node_endpoint) {
+		if let Some(mut node) = node_manager.nodes.get_mut(address) {
 			node.sent_getaddr = true;
 		}
 
@@ -1027,31 +1073,31 @@ async fn handle_verack(
 /// Handles an incoming ping message from a peer
 async fn handle_ping(
 	node_manager: &Arc<NodeManager>,
-	node_endpoint: &NodeEndpoint,
+	address: &IpAddr,
 	tcp_writer: &SharedTcpWriter,
 	payload: &[u8],
 ) -> Result<()> {
 	// Pre-BIP31 nodes send 0-byte pings; just acknowledge silently
 	if payload.is_empty() {
-		debug!("Received pre-BIP31 ping (no nonce) from {}", node_endpoint);
+		debug!("Received pre-BIP31 ping (no nonce) from {}", address);
 		return Ok(());
 	}
 
 	if payload.len() != 8 {
-		warn!("Received malformed ping command from {}", node_endpoint);
+		warn!("Received malformed ping command from {}", address);
 
 		node_manager.set_state(
-			node_endpoint,
+			address,
 			NodeState::Banned {
 				reason: BanReason::Misbehavior,
 			},
 		);
 
-		return Err(anyhow!("Received malformed ping command from {node_endpoint}"));
+		return Err(anyhow!("Received malformed ping command from {address}"));
 	}
 
 	let nonce = vec_to_u64_le(payload).context("failed to parse ping nonce")?;
-	debug!("Received ping command from {} with nonce {}", node_endpoint, nonce);
+	debug!("Received ping command from {} with nonce {}", address, nonce);
 
 	tcp_writer
 		.send_message("pong", &nonce.to_le_bytes())
@@ -1060,9 +1106,9 @@ async fn handle_ping(
 }
 
 /// Handles an incoming pong message from a peer
-fn handle_pong(node_endpoint: &NodeEndpoint) {
+fn handle_pong(address: &IpAddr) {
 	// TODO: Handle pong properly
-	debug!("Received pong from {}", node_endpoint);
+	debug!("Received pong from {}", address);
 }
 
 /// Computes a deterministic score for relay peer selection
@@ -1083,7 +1129,7 @@ fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_ha
 ///
 /// For each recently-active entry, selects the best peers by deterministic
 /// hash score and sends a single-entry addr message to each
-async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpoint, entries: &[&AddrEntry]) {
+async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, entries: &[&AddrEntry]) {
 	if entries.is_empty() {
 		return;
 	}
@@ -1093,19 +1139,19 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpo
 	let time_bucket = unix_now() / (24 * 60 * 60);
 
 	// Collect connected outgoing peers (excluding source), releasing DashMap lock
-	let peers: Vec<(NodeEndpoint, SharedTcpWriter)> = node_manager
+	let peers: Vec<(IpAddr, SharedTcpWriter)> = node_manager
 		.nodes
 		.iter()
 		.filter_map(|entry| {
 			let node = entry.value();
-			if node.endpoint == *source_endpoint {
+			if *entry.key() == *source_address {
 				return None;
 			}
 			if node.connection_type != ConnectionType::Outgoing {
 				return None;
 			}
 			if let NodeState::Connected { ref writer } = node.state {
-				Some((entry.key().clone(), Arc::clone(writer)))
+				Some((*entry.key(), Arc::clone(writer)))
 			} else {
 				None
 			}
@@ -1117,12 +1163,11 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpo
 	}
 
 	for entry in entries {
-		// Hash the (address, port) tuple for a stable addr identifier
+		// Hash the IP for a stable addr identifier
 		let addr_hash = {
 			use std::hash::{Hash, Hasher};
 			let mut hasher = std::collections::hash_map::DefaultHasher::new();
 			entry.address.address.hash(&mut hasher);
-			entry.address.port.hash(&mut hasher);
 			hasher.finish()
 		};
 
@@ -1130,12 +1175,11 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpo
 		let mut scored: Vec<(usize, u64)> = peers
 			.iter()
 			.enumerate()
-			.map(|(idx, (ep, _))| {
+			.map(|(idx, (ip, _))| {
 				let peer_hash = {
 					use std::hash::{Hash, Hasher};
 					let mut hasher = std::collections::hash_map::DefaultHasher::new();
-					ep.address.hash(&mut hasher);
-					ep.port.hash(&mut hasher);
+					ip.hash(&mut hasher);
 					hasher.finish()
 				};
 				(
@@ -1151,16 +1195,16 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpo
 		for &(idx, _) in scored.iter().take(ADDR_RELAY_PEER_COUNT) {
 			// idx is bounded by peers.len() from the enumerate above
 			#[allow(clippy::indexing_slicing)]
-			let (ref ep, ref writer) = peers[idx];
+			let (ref peer_ip, ref writer) = peers[idx];
 
 			// Check and update addr_known under DashMap lock
 			// Clear the set when the 24h time bucket rotates to prevent unbounded growth
-			let already_known = if let Some(mut node) = node_manager.nodes.get_mut(ep) {
+			let already_known = if let Some(mut node) = node_manager.nodes.get_mut(peer_ip) {
 				if node.addr_known_bucket != time_bucket {
 					node.addr_known.clear();
 					node.addr_known_bucket = time_bucket;
 				}
-				!node.addr_known.insert((entry.address.address, entry.address.port))
+				!node.addr_known.insert(entry.address.address)
 			} else {
 				continue;
 			};
@@ -1181,7 +1225,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpo
 			let msg = MessageAddr::from_entries(vec![relay_entry]);
 
 			if let Err(e) = writer.send_message("addr", &msg.to_bytes()).await {
-				debug!("Failed to relay addr to {}: {}", ep, e);
+				debug!("Failed to relay addr to {}: {}", peer_ip, e);
 			}
 		}
 	}
@@ -1200,18 +1244,18 @@ fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
 }
 
 /// Handles an incoming addr message containing peer addresses
-async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoint, payload: &[u8]) -> Result<()> {
+async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload: &[u8]) -> Result<()> {
 	let msg = MessageAddr::from_bytes(payload).context("failed to parse addr message")?;
 
 	debug!(
 		"Received addr message with {} addresses from {}",
 		msg.entries().len(),
-		node_endpoint
+		address
 	);
 
 	// Rate limiting: refill tokens and consume one per entry
 	let accepted_indices: Vec<usize> = {
-		let Some(mut node) = node_manager.nodes.get_mut(node_endpoint) else {
+		let Some(mut node) = node_manager.nodes.get_mut(address) else {
 			return Ok(());
 		};
 
@@ -1232,7 +1276,7 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoi
 			} else {
 				debug!(
 					"Rate limited addr entry {} from {} (tokens exhausted)",
-					entry.address.address, node_endpoint
+					entry.address.address, address
 				);
 			}
 		}
@@ -1258,14 +1302,11 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoi
 			continue;
 		}
 
-		let endpoint = NodeEndpoint {
-			address: entry.address.address,
-			port: entry.address.port,
-		};
+		let entry_ip = entry.address.address;
 
 		// Try to revive Dead nodes with a newer timestamp
-		if node_manager.revive_if_newer(&endpoint, entry.timestamp) {
-			info!("Revived dead node {} with newer addr timestamp", endpoint);
+		if node_manager.revive_if_newer(&entry_ip, entry.address.port, entry.timestamp) {
+			info!("Revived dead node {} with newer addr timestamp", entry_ip);
 			continue;
 		}
 
@@ -1276,7 +1317,7 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoi
 
 	// Relay eligible entries to other peers
 	// Only relay small batches from organic gossip (not getaddr responses)
-	let should_relay = node_manager.nodes.get(node_endpoint).is_some_and(|n| !n.sent_getaddr);
+	let should_relay = node_manager.nodes.get(address).is_some_and(|n| !n.sent_getaddr);
 
 	if should_relay && msg.entries().len() <= ADDR_RELAY_MAX_ENTRIES {
 		let relay_entries: Vec<&AddrEntry> = accepted_indices
@@ -1293,18 +1334,14 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoi
 			})
 			.collect();
 
-		relay_addr(node_manager, node_endpoint, &relay_entries).await;
+		relay_addr(node_manager, address, &relay_entries).await;
 	}
 
 	Ok(())
 }
 
 /// Handles an incoming getaddr request from a peer
-async fn handle_getaddr(
-	node_manager: &Arc<NodeManager>,
-	node_endpoint: &NodeEndpoint,
-	tcp_writer: &SharedTcpWriter,
-) -> Result<()> {
+async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
 	let now = unix_now();
 
 	// Filter the node list so we share only recently active outgoing connections
@@ -1323,8 +1360,8 @@ async fn handle_getaddr(
 			let node = entry.value();
 			NetworkAddress {
 				services: node.services,
-				address: node.endpoint.address,
-				port: node.endpoint.port,
+				address: *entry.key(),
+				port: node.port,
 			}
 		})
 		.collect();
@@ -1332,12 +1369,12 @@ async fn handle_getaddr(
 	if filtered_nodes.is_empty() {
 		debug!(
 			"No recently active outgoing nodes to share for GetAddr from {}",
-			node_endpoint
+			address
 		);
 		return Ok(());
 	}
 
-	debug!("Sending list of {} nodes to {}", filtered_nodes.len(), node_endpoint);
+	debug!("Sending list of {} nodes to {}", filtered_nodes.len(), address);
 
 	let message_addr = MessageAddr::new(filtered_nodes);
 	tcp_writer
@@ -1539,27 +1576,11 @@ mod tests {
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
 		// First insert returns true (new)
-		let first = nm
-			.nodes
-			.get_mut(&NodeEndpoint {
-				address: ip,
-				port: 9933,
-			})
-			.unwrap()
-			.addr_known
-			.insert((ip, 9933));
+		let first = nm.nodes.get_mut(&ip).unwrap().addr_known.insert(ip);
 		assert!(first);
 
 		// Second insert returns false (already known)
-		let second = nm
-			.nodes
-			.get_mut(&NodeEndpoint {
-				address: ip,
-				port: 9933,
-			})
-			.unwrap()
-			.addr_known
-			.insert((ip, 9933));
+		let second = nm.nodes.get_mut(&ip).unwrap().addr_known.insert(ip);
 		assert!(!second);
 	}
 
@@ -1569,21 +1590,16 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
-		let ep = NodeEndpoint {
-			address: ip,
-			port: 9933,
-		};
-
 		// Insert an addr and set a bucket
 		{
-			let mut node = nm.nodes.get_mut(&ep).unwrap();
-			node.addr_known.insert(("1.2.3.4".parse::<IpAddr>().unwrap(), 9933));
+			let mut node = nm.nodes.get_mut(&ip).unwrap();
+			node.addr_known.insert("1.2.3.4".parse::<IpAddr>().unwrap());
 			node.addr_known_bucket = 100;
 		}
 
 		// Simulate bucket rotation by checking a different bucket
 		{
-			let mut node = nm.nodes.get_mut(&ep).unwrap();
+			let mut node = nm.nodes.get_mut(&ip).unwrap();
 			let new_bucket = 101;
 			if node.addr_known_bucket != new_bucket {
 				node.addr_known.clear();
@@ -1599,11 +1615,7 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
-		let ep = NodeEndpoint {
-			address: ip,
-			port: 9933,
-		};
-		let node = nm.nodes.get(&ep).unwrap();
+		let node = nm.nodes.get(&ip).unwrap();
 		assert!(!node.sent_getaddr);
 	}
 
@@ -1613,15 +1625,11 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
-		let ep = NodeEndpoint {
-			address: ip,
-			port: 9933,
-		};
 		{
-			let mut node = nm.nodes.get_mut(&ep).unwrap();
+			let mut node = nm.nodes.get_mut(&ip).unwrap();
 			node.sent_getaddr = true;
 		}
-		let node = nm.nodes.get(&ep).unwrap();
+		let node = nm.nodes.get(&ip).unwrap();
 		assert!(node.sent_getaddr);
 	}
 
@@ -1631,11 +1639,7 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
-		let ep = NodeEndpoint {
-			address: ip,
-			port: 9933,
-		};
-		let node = nm.nodes.get(&ep).unwrap();
+		let node = nm.nodes.get(&ip).unwrap();
 		assert!((node.addr_tokens - ADDR_TOKEN_CAPACITY).abs() < f64::EPSILON);
 	}
 
@@ -1647,5 +1651,217 @@ mod tests {
 		let score_a = compute_relay_score(key, 111, bucket, peer);
 		let score_b = compute_relay_score(key, 222, bucket, peer);
 		assert_ne!(score_a, score_b);
+	}
+
+	#[test]
+	fn same_ip_different_port_deduplicates() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		assert!(nm.insert(ip, 9933, ConnectionType::Outgoing));
+		assert!(!nm.insert(ip, 8888, ConnectionType::Outgoing));
+		assert_eq!(nm.nodes.len(), 1);
+	}
+
+	#[test]
+	fn insert_updates_port_when_disconnected() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Disconnected {
+				retry_at: Instant::now(),
+				attempt: 0,
+			};
+		}
+
+		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
+		assert!(!result, "should return false for existing node");
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 8888);
+	}
+
+	#[test]
+	fn insert_updates_port_when_dead() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Dead;
+		}
+
+		let result = nm.insert(ip, 7777, ConnectionType::Outgoing);
+		assert!(!result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 7777);
+	}
+
+	#[test]
+	fn insert_ignores_when_connecting() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Node starts in Connecting state
+		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
+		assert!(!result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 9933, "port should not change when connecting");
+	}
+
+	#[test]
+	fn insert_incoming_new_node() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 54321);
+		assert_eq!(node.connection_type, ConnectionType::Incoming);
+		assert!(matches!(node.state, NodeState::Handshaking { .. }));
+	}
+
+	#[test]
+	fn insert_incoming_replaces_disconnected() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Disconnected {
+				retry_at: Instant::now(),
+				attempt: 0,
+			};
+		}
+
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 54321);
+		assert_eq!(node.connection_type, ConnectionType::Incoming);
+		assert!(matches!(node.state, NodeState::Handshaking { .. }));
+	}
+
+	#[test]
+	fn insert_incoming_replaces_dead() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Dead;
+		}
+
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 54321);
+		assert_eq!(node.connection_type, ConnectionType::Incoming);
+		assert!(matches!(node.state, NodeState::Handshaking { .. }));
+	}
+
+	#[test]
+	fn insert_incoming_rejects_when_connecting() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Node starts in Connecting -- should reject incoming
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(!result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 9933);
+	}
+
+	#[test]
+	fn insert_ignores_when_banned() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Banned {
+				reason: BanReason::ProtocolViolation,
+			};
+		}
+
+		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
+		assert!(!result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 9933, "port should not change when banned");
+	}
+
+	#[test]
+	fn insert_incoming_rejects_when_banned() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Banned {
+				reason: BanReason::ProtocolViolation,
+			};
+		}
+
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(!result, "should reject incoming for banned node");
+	}
+
+	#[tokio::test]
+	async fn insert_ignores_when_connected() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Create a real TCP pair to get an OwnedWriteHalf
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let stream = TcpStream::connect(addr).await.unwrap();
+		let (_, write_half) = stream.into_split();
+		let writer: SharedTcpWriter = Arc::new(Mutex::new(write_half));
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Connected { writer };
+		}
+
+		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
+		assert!(!result);
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 9933, "port should not change when connected");
+	}
+
+	#[tokio::test]
+	async fn insert_incoming_rejects_when_connected() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let stream = TcpStream::connect(addr).await.unwrap();
+		let (_, write_half) = stream.into_split();
+		let writer: SharedTcpWriter = Arc::new(Mutex::new(write_half));
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Connected { writer };
+		}
+
+		let result = nm.insert_incoming(ip, 54321);
+		assert!(!result, "should reject incoming when node is connected");
+
+		let node = nm.nodes.get(&ip).unwrap();
+		assert_eq!(node.port, 9933, "port should not change");
 	}
 }

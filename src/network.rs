@@ -19,7 +19,7 @@ use tokio::{
 use tracing::{debug, error, trace, warn};
 
 use crate::{
-	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager, NodeState},
+	nodes::{node_connection_loop, NodeManager, NodeState},
 	utils::ipv4_to_mapped_ipv6,
 };
 
@@ -532,23 +532,20 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 
 		let (mut tcp_stream, socket_addr) = connection;
 
-		let node_endpoint = NodeEndpoint {
-			address: socket_addr.ip(),
-			port: socket_addr.port(),
-		};
+		let address = socket_addr.ip();
+		let port = socket_addr.port();
 
 		let nm_clone: Arc<NodeManager> = Arc::clone(&node_manager);
 
-		// Only proceed if the node doesn't exist already
-		if nm_clone.insert(node_endpoint.address, node_endpoint.port, ConnectionType::Incoming) {
+		if nm_clone.insert_incoming(address, port) {
 			tokio::spawn(async move {
-				node_connection_loop(Arc::clone(&nm_clone), node_endpoint.clone(), tcp_stream).await;
+				node_connection_loop(Arc::clone(&nm_clone), address, tcp_stream).await;
 
 				// Incoming connections can't be retried (we don't know their real port)
-				nm_clone.set_state(&node_endpoint, NodeState::Dead);
+				nm_clone.set_state(&address, NodeState::Dead);
 			});
 		} else {
-			debug!("Dropping connection {} as node exists already", node_endpoint);
+			debug!("Dropping connection from {} as node exists already", address);
 
 			_ = tcp_stream.shutdown().await;
 		}

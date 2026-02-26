@@ -152,7 +152,7 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		.iter()
 		.map(|node| {
 			Row::new(vec![
-				Cell::from(node.endpoint.to_string()),
+				Cell::from(format!("{}:{}", node.address, node.port)),
 				Cell::from(node.height.to_string()),
 				Cell::from(node.state_label.clone()),
 				Cell::from(node.connection_type.to_string()),
