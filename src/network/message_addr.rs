@@ -37,6 +37,13 @@ impl MessageAddr {
 		Self { addr_list }
 	}
 
+	/// Creates an addr message from pre-built entries, preserving their original timestamps
+	///
+	/// Used for relaying: we forward the timestamp the originator set, not our own
+	pub const fn from_entries(entries: Vec<AddrEntry>) -> Self {
+		Self { addr_list: entries }
+	}
+
 	/// Decodes an addr message from wire bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		let mut cursor = Cursor::new(bytes);
@@ -149,5 +156,24 @@ mod tests {
 		let decoded = MessageAddr::from_bytes(&bytes).unwrap();
 		assert_eq!(decoded.entries()[0].address.port, 9933);
 		assert_eq!(decoded.entries()[1].address.port, 8080);
+	}
+
+	#[test]
+	fn from_entries_preserves_timestamps() {
+		let entries = vec![
+			AddrEntry {
+				timestamp: 1000,
+				address: NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933),
+			},
+			AddrEntry {
+				timestamp: 2000,
+				address: NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 9933),
+			},
+		];
+		let msg = MessageAddr::from_entries(entries);
+		let bytes = msg.to_bytes();
+		let decoded = MessageAddr::from_bytes(&bytes).unwrap();
+		assert_eq!(decoded.entries()[0].timestamp, 1000);
+		assert_eq!(decoded.entries()[1].timestamp, 2000);
 	}
 }

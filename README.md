@@ -13,6 +13,15 @@ RUST_LOG=debug cargo run                     # Control log level
 cargo run -- --help                          # Show help
 ```
 
+## Features
+
+- Full Catcoin P2P handshake (version/verack)
+- Peer discovery via DNS seeds and addr gossip
+- Proactive addr relay with deterministic peer selection and rate limiting
+- Periodic self-announcement when publicly reachable
+- Exponential backoff with jitter for disconnected peers
+- TUI and daemon modes
+
 ## TUI mode
 
 The default mode launches a terminal UI with node stats, a connected nodes table, and a live log panel. Press `q` to quit.

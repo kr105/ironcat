@@ -12,7 +12,7 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 | Max message size | 5,000,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.1/` |
+| User agent | `/Ironcat:0.0.4/` |
 
 ## Message Framing
 
@@ -86,7 +86,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.1/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.4/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -137,6 +137,32 @@ Repeated `count` times:
 Addresses older than 24 hours (with 10-minute future tolerance for clock skew) are filtered out on receipt. New addresses are added as outgoing nodes. Dead nodes can be revived if the addr timestamp is newer than their `last_seen`.
 
 An empty addr list encodes as a single `0x00` byte (varint zero).
+
+#### Addr rate limiting
+
+Incoming addr entries are rate limited per peer using a token bucket:
+
+| Parameter | Value |
+|-----------|-------|
+| Refill rate | 0.1 tokens/second (1 token per 10 seconds) |
+| Bucket capacity | 1000 tokens |
+
+Each entry in an addr message consumes 1 token. Entries that arrive when the bucket is empty are silently discarded. The bucket starts full and refills lazily at processing time.
+
+#### Addr relay
+
+When receiving an addr message with 10 or fewer entries from a peer we did NOT send a getaddr to, recently-active entries are relayed to 2 other connected outgoing peers. Addr responses triggered by our own getaddr are full dumps, not organic gossip, so they are excluded from relay to prevent amplification.
+
+Peer selection is deterministic: each candidate peer is scored using `DefaultHasher(relay_key, addr_hash, time_bucket_24h, peer_hash)`. The top 2 peers by score are chosen. This ensures the same address goes to the same peers within a 24-hour window, preventing amplification.
+
+Each peer maintains an `addr_known` set. Addresses already in the set are not sent again. The set is cleared when the 24-hour time bucket rotates, bounding memory usage.
+
+#### Self-announcement
+
+Every 6 hours, Ironcat announces its own address to all connected peers, but only if:
+
+- At least 1 incoming peer is connected (proves our port is publicly reachable)
+- At least 3 peers agree on our external IP (consensus from `addr_recv` in version messages, non-routable IPs are rejected)
 
 ### alert
 

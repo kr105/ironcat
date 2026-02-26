@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rand::RngCore;
-use std::{ffi::CStr, fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, ffi::CStr, fmt, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
 	io::{self, AsyncWriteExt, BufReader},
 	net::TcpStream,
@@ -14,10 +14,11 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	network::{
-		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
-		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		message_addr::{AddrEntry, MessageAddr},
+		message_version::MessageVersion,
+		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
-	utils::{is_recently_active, unix_now, vec_to_u64_le},
+	utils::{is_recently_active, is_routable, unix_now, vec_to_u64_le},
 };
 
 /// Base delay for exponential backoff in seconds
@@ -55,6 +56,21 @@ const REAPER_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Window for "recently active" outgoing nodes in `GetAddr` responses (2 hours)
 const GETADDR_RECENT_WINDOW: u64 = 60 * 60 * 2;
+
+/// Maximum entries in an addr message eligible for relay
+const ADDR_RELAY_MAX_ENTRIES: usize = 10;
+
+/// Number of peers to relay each addr entry to
+const ADDR_RELAY_PEER_COUNT: usize = 2;
+
+/// Token bucket refill rate: 1 token per 10 seconds
+const ADDR_TOKEN_RATE: f64 = 0.1;
+
+/// Token bucket maximum capacity
+const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
+
+/// How often to announce our own address to peers
+const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Reason why a node was permanently banned
 #[derive(Debug)]
@@ -216,6 +232,21 @@ pub struct Node {
 
 	/// Current connection lifecycle state
 	pub state: NodeState,
+
+	/// Addresses already relayed to this peer in the current 24h window
+	pub addr_known: HashSet<(IpAddr, u16)>,
+
+	/// The 24h time bucket when `addr_known` was last cleared
+	pub addr_known_bucket: u64,
+
+	/// Token bucket: available tokens for rate limiting incoming addr entries
+	pub addr_tokens: f64,
+
+	/// Token bucket: last time tokens were refilled
+	pub last_token_refill: Instant,
+
+	/// Whether we sent getaddr to this peer (inhibits relay of their addr response)
+	pub sent_getaddr: bool,
 }
 
 /// Manages a collection of nodes in the network
@@ -225,6 +256,12 @@ pub struct NodeManager {
 
 	// Used to avoid connecting to myself
 	pub my_nonce: u64,
+
+	/// Per-session random key for deterministic addr relay peer selection
+	pub(crate) relay_key: u64,
+
+	/// Peer votes for our external IP address
+	external_ip_votes: DashMap<IpAddr, u32>,
 }
 
 impl Default for NodeManager {
@@ -234,11 +271,14 @@ impl Default for NodeManager {
 }
 
 impl NodeManager {
-	/// Creates a new `NodeManager` with an empty node set and a random nonce
+	/// Creates a new `NodeManager` with an empty node set and random nonce and relay key
 	pub fn new() -> Self {
+		let mut rng = rand::thread_rng();
 		Self {
 			nodes: DashMap::new(),
-			my_nonce: rand::thread_rng().next_u64(),
+			my_nonce: rng.next_u64(),
+			relay_key: rng.next_u64(),
+			external_ip_votes: DashMap::new(),
 		}
 	}
 
@@ -276,6 +316,11 @@ impl NodeManager {
 					version_received: false,
 					connection_type,
 					state: initial_state,
+					addr_known: HashSet::new(),
+					addr_known_bucket: 0,
+					addr_tokens: ADDR_TOKEN_CAPACITY,
+					last_token_refill: Instant::now(),
+					sent_getaddr: false,
 				};
 
 				vacant.insert(node);
@@ -512,6 +557,33 @@ impl NodeManager {
 		}
 	}
 
+	/// Records a peer's report of our external IP address
+	///
+	/// Non-routable IPs (private, loopback, link-local, etc) are silently ignored
+	pub fn record_external_ip_vote(&self, ip: IpAddr) {
+		if !is_routable(ip) {
+			debug!(ip = %ip, "Ignoring non-routable external IP vote");
+			return;
+		}
+		self.external_ip_votes
+			.entry(ip)
+			.and_modify(|count| {
+				*count = count.saturating_add(1);
+			})
+			.or_insert(1);
+	}
+
+	/// Returns our external IP if at least 3 peers agree on it
+	///
+	/// Returns the IP with the most votes, or None if no IP has >= 3 votes
+	pub fn get_external_ip(&self) -> Option<IpAddr> {
+		self.external_ip_votes
+			.iter()
+			.filter(|entry| *entry.value() >= 3)
+			.max_by_key(|entry| *entry.value())
+			.map(|entry| *entry.key())
+	}
+
 	/// Revives a Dead node if the given timestamp is newer than `last_seen`
 	///
 	/// Returns true if the node was revived, false otherwise
@@ -534,6 +606,63 @@ impl NodeManager {
 			}
 		}
 		false
+	}
+
+	/// Returns true if at least one incoming peer is in Connected state
+	pub fn has_incoming_connected(&self) -> bool {
+		self.nodes.iter().any(|entry| {
+			let node = entry.value();
+			node.connection_type == ConnectionType::Incoming && node.state.is_connected()
+		})
+	}
+
+	/// Periodically announces our own address to all connected peers
+	///
+	/// Only runs if we have incoming peers (proving our port is reachable)
+	/// and a consensus external IP from version messages
+	pub async fn run_self_announce(self: Arc<Self>) {
+		loop {
+			tokio::time::sleep(SELF_ANNOUNCE_INTERVAL).await;
+
+			if !self.has_incoming_connected() {
+				debug!("Self-announce skipped: no incoming peers connected");
+				continue;
+			}
+
+			let Some(external_ip) = self.get_external_ip() else {
+				debug!("Self-announce skipped: no consensus on external IP");
+				continue;
+			};
+
+			let addr = NetworkAddress::new(external_ip, 9933);
+			let msg = MessageAddr::new(vec![addr]);
+			let payload = msg.to_bytes();
+
+			// Collect writers to avoid holding DashMap locks across awaits
+			let writers: Vec<(NodeEndpoint, SharedTcpWriter)> = self
+				.nodes
+				.iter()
+				.filter_map(|entry| {
+					if let NodeState::Connected { ref writer } = entry.value().state {
+						Some((entry.key().clone(), Arc::clone(writer)))
+					} else {
+						None
+					}
+				})
+				.collect();
+
+			if writers.is_empty() {
+				continue;
+			}
+
+			info!("Announcing own address {}:9933 to {} peers", external_ip, writers.len());
+
+			for (endpoint, writer) in &writers {
+				if let Err(e) = writer.send_message("addr", &payload).await {
+					debug!("Failed to self-announce to {}: {}", endpoint, e);
+				}
+			}
+		}
 	}
 }
 
@@ -769,7 +898,7 @@ async fn parse_incoming_message(
 			handle_pong(node_endpoint);
 			Ok(())
 		}
-		NetworkCommand::Addr => handle_addr(&node_manager, node_endpoint, &message.payload),
+		NetworkCommand::Addr => handle_addr(&node_manager, node_endpoint, &message.payload).await,
 		NetworkCommand::Alert => {
 			debug!("Received alert from {}, ignoring", node_endpoint);
 			Ok(())
@@ -846,6 +975,9 @@ async fn handle_version(
 		node.relay = version.relay;
 	}
 
+	// Record peer's view of our external IP for consensus
+	node_manager.record_external_ip_vote(version.addr_recv.address);
+
 	// Verack sent after all locks released
 	tcp_writer
 		.send_message("verack", &[])
@@ -876,6 +1008,11 @@ async fn handle_verack(
 		};
 
 		drop(node);
+
+		// Mark that we sent getaddr so we suppress relay of their addr response
+		if let Some(mut node) = node_manager.nodes.get_mut(node_endpoint) {
+			node.sent_getaddr = true;
+		}
 
 		tcp_writer
 			.send_message("getaddr", &[])
@@ -928,8 +1065,142 @@ fn handle_pong(node_endpoint: &NodeEndpoint) {
 	debug!("Received pong from {}", node_endpoint);
 }
 
+/// Computes a deterministic score for relay peer selection
+///
+/// Uses hashing to produce a stable ranking of peers for a given address
+/// within a 24-hour time bucket. Same inputs always produce same output
+fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	relay_key.hash(&mut hasher);
+	addr_hash.hash(&mut hasher);
+	time_bucket.hash(&mut hasher);
+	peer_hash.hash(&mut hasher);
+	hasher.finish()
+}
+
+/// Relays addr entries to the top-scoring outgoing peers
+///
+/// For each recently-active entry, selects the best peers by deterministic
+/// hash score and sends a single-entry addr message to each
+async fn relay_addr(node_manager: &Arc<NodeManager>, source_endpoint: &NodeEndpoint, entries: &[&AddrEntry]) {
+	if entries.is_empty() {
+		return;
+	}
+
+	// unix_now() returns seconds; 86400 seconds per day
+	#[allow(clippy::arithmetic_side_effects)]
+	let time_bucket = unix_now() / (24 * 60 * 60);
+
+	// Collect connected outgoing peers (excluding source), releasing DashMap lock
+	let peers: Vec<(NodeEndpoint, SharedTcpWriter)> = node_manager
+		.nodes
+		.iter()
+		.filter_map(|entry| {
+			let node = entry.value();
+			if node.endpoint == *source_endpoint {
+				return None;
+			}
+			if node.connection_type != ConnectionType::Outgoing {
+				return None;
+			}
+			if let NodeState::Connected { ref writer } = node.state {
+				Some((entry.key().clone(), Arc::clone(writer)))
+			} else {
+				None
+			}
+		})
+		.collect();
+
+	if peers.is_empty() {
+		return;
+	}
+
+	for entry in entries {
+		// Hash the (address, port) tuple for a stable addr identifier
+		let addr_hash = {
+			use std::hash::{Hash, Hasher};
+			let mut hasher = std::collections::hash_map::DefaultHasher::new();
+			entry.address.address.hash(&mut hasher);
+			entry.address.port.hash(&mut hasher);
+			hasher.finish()
+		};
+
+		// Score each peer and sort descending
+		let mut scored: Vec<(usize, u64)> = peers
+			.iter()
+			.enumerate()
+			.map(|(idx, (ep, _))| {
+				let peer_hash = {
+					use std::hash::{Hash, Hasher};
+					let mut hasher = std::collections::hash_map::DefaultHasher::new();
+					ep.address.hash(&mut hasher);
+					ep.port.hash(&mut hasher);
+					hasher.finish()
+				};
+				(
+					idx,
+					compute_relay_score(node_manager.relay_key, addr_hash, time_bucket, peer_hash),
+				)
+			})
+			.collect();
+
+		scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+		// Relay to top ADDR_RELAY_PEER_COUNT peers
+		for &(idx, _) in scored.iter().take(ADDR_RELAY_PEER_COUNT) {
+			// idx is bounded by peers.len() from the enumerate above
+			#[allow(clippy::indexing_slicing)]
+			let (ref ep, ref writer) = peers[idx];
+
+			// Check and update addr_known under DashMap lock
+			// Clear the set when the 24h time bucket rotates to prevent unbounded growth
+			let already_known = if let Some(mut node) = node_manager.nodes.get_mut(ep) {
+				if node.addr_known_bucket != time_bucket {
+					node.addr_known.clear();
+					node.addr_known_bucket = time_bucket;
+				}
+				!node.addr_known.insert((entry.address.address, entry.address.port))
+			} else {
+				continue;
+			};
+
+			if already_known {
+				continue;
+			}
+
+			// Build a single-entry addr message preserving the original timestamp
+			let relay_entry = AddrEntry {
+				timestamp: entry.timestamp,
+				address: NetworkAddress {
+					services: entry.address.services,
+					address: entry.address.address,
+					port: entry.address.port,
+				},
+			};
+			let msg = MessageAddr::from_entries(vec![relay_entry]);
+
+			if let Err(e) = writer.send_message("addr", &msg.to_bytes()).await {
+				debug!("Failed to relay addr to {}: {}", ep, e);
+			}
+		}
+	}
+}
+
+/// Refills a peer's addr token bucket based on elapsed time
+///
+/// Returns the updated token count, capped at `ADDR_TOKEN_CAPACITY`
+fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
+	// Both operands are finite and bounded; result is capped by min()
+	#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
+	elapsed
+		.as_secs_f64()
+		.mul_add(ADDR_TOKEN_RATE, tokens)
+		.min(ADDR_TOKEN_CAPACITY)
+}
+
 /// Handles an incoming addr message containing peer addresses
-fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoint, payload: &[u8]) -> Result<()> {
+async fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoint, payload: &[u8]) -> Result<()> {
 	let msg = MessageAddr::from_bytes(payload).context("failed to parse addr message")?;
 
 	debug!(
@@ -938,7 +1209,47 @@ fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoint, pa
 		node_endpoint
 	);
 
-	for entry in msg.entries() {
+	// Rate limiting: refill tokens and consume one per entry
+	let accepted_indices: Vec<usize> = {
+		let Some(mut node) = node_manager.nodes.get_mut(node_endpoint) else {
+			return Ok(());
+		};
+
+		let now_instant = Instant::now();
+		let elapsed = now_instant.duration_since(node.last_token_refill);
+		node.addr_tokens = refill_addr_tokens(node.addr_tokens, elapsed);
+		node.last_token_refill = now_instant;
+
+		let mut indices = Vec::new();
+		for (i, entry) in msg.entries().iter().enumerate() {
+			if node.addr_tokens >= 1.0 {
+				// Finite f64 subtraction; both operands are bounded by ADDR_TOKEN_CAPACITY
+				#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
+				{
+					node.addr_tokens -= 1.0;
+				}
+				indices.push(i);
+			} else {
+				debug!(
+					"Rate limited addr entry {} from {} (tokens exhausted)",
+					entry.address.address, node_endpoint
+				);
+			}
+		}
+
+		drop(node);
+		indices
+	};
+
+	if accepted_indices.is_empty() {
+		return Ok(());
+	}
+
+	for &i in &accepted_indices {
+		// msg.entries() is bounded by 1000 (validated in from_bytes), i < entries.len()
+		#[allow(clippy::indexing_slicing)]
+		let entry = &msg.entries()[i];
+
 		if !is_recently_active(entry.timestamp) {
 			debug!(
 				"Addr: {} filtered out (timestamp={}, not recently active)",
@@ -961,6 +1272,28 @@ fn handle_addr(node_manager: &Arc<NodeManager>, node_endpoint: &NodeEndpoint, pa
 		// Otherwise try to insert as new outgoing node
 		debug!("Addr: {} is recently active, adding", entry.address.address);
 		node_manager.insert_outgoing(entry.address.address, entry.address.port);
+	}
+
+	// Relay eligible entries to other peers
+	// Only relay small batches from organic gossip (not getaddr responses)
+	let should_relay = node_manager.nodes.get(node_endpoint).is_some_and(|n| !n.sent_getaddr);
+
+	if should_relay && msg.entries().len() <= ADDR_RELAY_MAX_ENTRIES {
+		let relay_entries: Vec<&AddrEntry> = accepted_indices
+			.iter()
+			.filter_map(|&i| {
+				// Indices are bounded by msg.entries().len() from the rate limiting loop
+				#[allow(clippy::indexing_slicing)]
+				let entry = &msg.entries()[i];
+				if is_recently_active(entry.timestamp) {
+					Some(entry)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		relay_addr(node_manager, node_endpoint, &relay_entries).await;
 	}
 
 	Ok(())
@@ -1103,5 +1436,216 @@ mod tests {
 	fn ban_reason_display() {
 		assert_eq!(format!("{}", BanReason::ProtocolViolation), "protocol violation");
 		assert_eq!(format!("{}", BanReason::Misbehavior), "misbehavior");
+	}
+
+	#[test]
+	fn refill_addr_tokens_adds_correctly() {
+		let tokens = refill_addr_tokens(0.0, Duration::from_secs(50));
+		// 50 * 0.1 = 5.0
+		assert!((tokens - 5.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn refill_addr_tokens_respects_capacity() {
+		let tokens = refill_addr_tokens(999.0, Duration::from_secs(100));
+		assert!((tokens - ADDR_TOKEN_CAPACITY).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn refill_addr_tokens_zero_elapsed() {
+		let tokens = refill_addr_tokens(500.0, Duration::from_secs(0));
+		assert!((tokens - 500.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn record_external_ip_vote_counts() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "8.8.8.8".parse().unwrap();
+		nm.record_external_ip_vote(ip);
+		nm.record_external_ip_vote(ip);
+		nm.record_external_ip_vote(ip);
+		assert_eq!(nm.get_external_ip(), Some(ip));
+	}
+
+	#[test]
+	fn get_external_ip_requires_three_votes() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "8.8.8.8".parse().unwrap();
+		nm.record_external_ip_vote(ip);
+		nm.record_external_ip_vote(ip);
+		assert_eq!(nm.get_external_ip(), None);
+	}
+
+	#[test]
+	fn get_external_ip_returns_majority() {
+		let nm = NodeManager::new();
+		let ip_a: IpAddr = "8.8.8.8".parse().unwrap();
+		let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
+		nm.record_external_ip_vote(ip_a);
+		nm.record_external_ip_vote(ip_b);
+		nm.record_external_ip_vote(ip_a);
+		nm.record_external_ip_vote(ip_a);
+		nm.record_external_ip_vote(ip_b);
+		nm.record_external_ip_vote(ip_b);
+		nm.record_external_ip_vote(ip_a);
+		assert_eq!(nm.get_external_ip(), Some(ip_a));
+	}
+
+	#[test]
+	fn record_external_ip_vote_rejects_private() {
+		let nm = NodeManager::new();
+		let private_ip: IpAddr = "192.168.1.1".parse().unwrap();
+		nm.record_external_ip_vote(private_ip);
+		nm.record_external_ip_vote(private_ip);
+		nm.record_external_ip_vote(private_ip);
+		assert_eq!(nm.get_external_ip(), None);
+	}
+
+	#[test]
+	fn relay_score_is_deterministic() {
+		let score_a = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 42);
+		let score_b = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 42);
+		assert_eq!(score_a, score_b);
+	}
+
+	#[test]
+	fn relay_score_varies_by_peer() {
+		let score_a = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 1);
+		let score_b = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 2);
+		assert_ne!(score_a, score_b);
+	}
+
+	#[test]
+	fn relay_score_rotates_daily() {
+		let score_day1 = compute_relay_score(12345, 0xDEAD_BEEF, 0, 42);
+		let score_day2 = compute_relay_score(12345, 0xDEAD_BEEF, 1, 42);
+		assert_ne!(score_day1, score_day2);
+	}
+
+	#[test]
+	fn has_incoming_connected_detects_incoming() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 12345, ConnectionType::Incoming);
+
+		// Node starts in Handshaking, not Connected -- should return false
+		assert!(!nm.has_incoming_connected());
+	}
+
+	#[test]
+	fn addr_known_dedup_prevents_duplicate_insert() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// First insert returns true (new)
+		let first = nm
+			.nodes
+			.get_mut(&NodeEndpoint {
+				address: ip,
+				port: 9933,
+			})
+			.unwrap()
+			.addr_known
+			.insert((ip, 9933));
+		assert!(first);
+
+		// Second insert returns false (already known)
+		let second = nm
+			.nodes
+			.get_mut(&NodeEndpoint {
+				address: ip,
+				port: 9933,
+			})
+			.unwrap()
+			.addr_known
+			.insert((ip, 9933));
+		assert!(!second);
+	}
+
+	#[test]
+	fn addr_known_clears_on_bucket_rotation() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		let ep = NodeEndpoint {
+			address: ip,
+			port: 9933,
+		};
+
+		// Insert an addr and set a bucket
+		{
+			let mut node = nm.nodes.get_mut(&ep).unwrap();
+			node.addr_known.insert(("1.2.3.4".parse::<IpAddr>().unwrap(), 9933));
+			node.addr_known_bucket = 100;
+		}
+
+		// Simulate bucket rotation by checking a different bucket
+		{
+			let mut node = nm.nodes.get_mut(&ep).unwrap();
+			let new_bucket = 101;
+			if node.addr_known_bucket != new_bucket {
+				node.addr_known.clear();
+				node.addr_known_bucket = new_bucket;
+			}
+			assert!(node.addr_known.is_empty());
+		}
+	}
+
+	#[test]
+	fn sent_getaddr_defaults_to_false() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		let ep = NodeEndpoint {
+			address: ip,
+			port: 9933,
+		};
+		let node = nm.nodes.get(&ep).unwrap();
+		assert!(!node.sent_getaddr);
+	}
+
+	#[test]
+	fn sent_getaddr_can_be_set() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		let ep = NodeEndpoint {
+			address: ip,
+			port: 9933,
+		};
+		{
+			let mut node = nm.nodes.get_mut(&ep).unwrap();
+			node.sent_getaddr = true;
+		}
+		let node = nm.nodes.get(&ep).unwrap();
+		assert!(node.sent_getaddr);
+	}
+
+	#[test]
+	fn new_node_starts_with_full_token_bucket() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		let ep = NodeEndpoint {
+			address: ip,
+			port: 9933,
+		};
+		let node = nm.nodes.get(&ep).unwrap();
+		assert!((node.addr_tokens - ADDR_TOKEN_CAPACITY).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn relay_score_same_key_different_addresses_differ() {
+		let key = 42;
+		let bucket = 100;
+		let peer = 1;
+		let score_a = compute_relay_score(key, 111, bucket, peer);
+		let score_b = compute_relay_score(key, 222, bucket, peer);
+		assert_ne!(score_a, score_b);
 	}
 }

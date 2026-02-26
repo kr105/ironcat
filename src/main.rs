@@ -63,6 +63,10 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let nm = Arc::clone(&node_manager);
 	let reaper_handle = tokio::spawn(nm.run_reaper());
 
+	// Spawn self-announcement task
+	let nm = Arc::clone(&node_manager);
+	let announce_handle = tokio::spawn(nm.run_self_announce());
+
 	// Discover peers via DNS seeds
 	if !args.no_dns_seed {
 		let dns_addrs = dns::resolve_dns_seeds().await;
@@ -83,6 +87,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = reaper_handle => {
 			info!("Reaper task ended, shutting down");
+		}
+		_ = announce_handle => {
+			info!("Self-announce task ended, shutting down");
 		}
 		() = async {
 			match ui_handle {
