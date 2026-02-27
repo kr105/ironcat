@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-mod cli;
-mod dns;
-mod network;
-mod nodes;
-mod tui_layer;
-mod ui;
-mod utils;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::Args;
-use network::listening_start;
-use nodes::NodeManager;
+use ironcat::{
+	cli::Args,
+	dns,
+	network::listening_start,
+	nodes::NodeManager,
+	tui_layer::{TuiLayer, TuiLogEntry},
+	ui::tui::tui_start,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tui_layer::{TuiLayer, TuiLogEntry};
-use ui::tui::tui_start;
 
 #[tokio::main]
 async fn main() -> Result<()> {

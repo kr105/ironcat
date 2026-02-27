@@ -3,9 +3,20 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rand::RngCore;
-use std::{collections::HashSet, ffi::CStr, fmt, net::IpAddr, sync::Arc, time::Duration};
+use siphasher::sip::SipHasher13;
+use std::{
+	collections::HashSet,
+	ffi::CStr,
+	fmt,
+	net::IpAddr,
+	sync::{
+		atomic::{AtomicUsize, Ordering},
+		Arc,
+	},
+	time::Duration,
+};
 use tokio::{
-	io::{self, AsyncWriteExt, BufReader},
+	io::{self, AsyncWriteExt},
 	net::TcpStream,
 	sync::Mutex,
 	time::{sleep, timeout, Instant},
@@ -70,6 +81,9 @@ const ADDR_TOKEN_RATE: f64 = 0.1;
 /// Token bucket maximum capacity
 const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
 
+/// Token bucket initial fill for new/reactivated connections
+const ADDR_TOKEN_INITIAL: f64 = 10.0;
+
 /// How often to announce our own address to peers
 const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -81,6 +95,12 @@ const MAX_EXTERNAL_IP_VOTES: usize = 100;
 
 /// Maximum entries in a peer's `addr_known` set within a 24h bucket
 const MAX_ADDR_KNOWN: usize = 5000;
+
+/// Maximum concurrent incoming connections
+const MAX_INCOMING_CONNECTIONS: usize = 125;
+
+/// How long a connection can sit idle before being dropped (2x `PING_INTERVAL`)
+const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Reason why a node was permanently banned
 #[derive(Debug)]
@@ -197,6 +217,50 @@ impl fmt::Display for ConnectionType {
 	}
 }
 
+/// Copy-friendly label for node state, avoiding String allocation under `DashMap` locks
+#[derive(Debug, Clone, Copy)]
+pub enum NodeStateLabel {
+	/// TCP connect in progress
+	Connecting,
+	/// Version handshake in progress
+	Handshaking,
+	/// Fully connected
+	Connected,
+	/// Waiting for backoff retry
+	Disconnected(u32),
+	/// All retries exhausted
+	Dead,
+	/// Permanently banned
+	Banned,
+}
+
+impl fmt::Display for NodeStateLabel {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Connecting => write!(f, "Connecting"),
+			Self::Handshaking => write!(f, "Handshaking"),
+			Self::Connected => write!(f, "Connected"),
+			Self::Disconnected(attempt) => write!(f, "Disconnected({attempt})"),
+			Self::Dead => write!(f, "Dead"),
+			Self::Banned => write!(f, "Banned"),
+		}
+	}
+}
+
+impl NodeStateLabel {
+	/// Creates a label from a `NodeState` reference
+	const fn from_state(state: &NodeState) -> Self {
+		match state {
+			NodeState::Connecting { .. } => Self::Connecting,
+			NodeState::Handshaking { .. } => Self::Handshaking,
+			NodeState::Connected { .. } => Self::Connected,
+			NodeState::Disconnected { attempt, .. } => Self::Disconnected(*attempt),
+			NodeState::Dead => Self::Dead,
+			NodeState::Banned { .. } => Self::Banned,
+		}
+	}
+}
+
 /// Lightweight snapshot of node data for display purposes
 ///
 /// Contains only the fields needed by the TUI, without internal state
@@ -211,7 +275,7 @@ pub struct NodeSnapshot {
 	/// Whether this is an incoming or outgoing connection
 	pub connection_type: ConnectionType,
 	/// Human-readable state label for display
-	pub state_label: String,
+	pub state_label: NodeStateLabel,
 }
 
 /// Represents a node in the Catcoin network
@@ -266,6 +330,9 @@ pub struct Node {
 
 	/// When we last responded to a getaddr from this peer
 	pub last_getaddr_response: Option<Instant>,
+
+	/// IP voted by this peer in their version message, applied on verack
+	pub pending_external_ip: Option<IpAddr>,
 }
 
 impl Node {
@@ -285,17 +352,22 @@ impl Node {
 			state,
 			addr_known: HashSet::new(),
 			addr_known_bucket: 0,
-			addr_tokens: ADDR_TOKEN_CAPACITY,
+			addr_tokens: ADDR_TOKEN_INITIAL,
 			last_token_refill: Instant::now(),
 			sent_getaddr: false,
 			last_getaddr_response: None,
+			pending_external_ip: None,
 		}
 	}
 }
 
-/// Manages a collection of nodes in the network
+/// Manages all tracked nodes in the Catcoin P2P network
+///
+/// Uses `DashMap` for lock-free concurrent access across Tokio tasks.
+/// The `my_nonce` field detects self-connections during handshake.
+/// The `relay_key` seeds deterministic peer selection for addr relay
 pub struct NodeManager {
-	// Using DashMap for concurrent access without needing explicit locking
+	/// Concurrent map of all tracked nodes, keyed by IP address
 	pub(crate) nodes: DashMap<IpAddr, Node>,
 
 	/// Random nonce for self-connection detection
@@ -306,6 +378,9 @@ pub struct NodeManager {
 
 	/// Peer votes for our external IP address
 	external_ip_votes: DashMap<IpAddr, u32>,
+
+	/// Number of currently active incoming connections
+	incoming_count: AtomicUsize,
 }
 
 impl Default for NodeManager {
@@ -323,6 +398,7 @@ impl NodeManager {
 			my_nonce: rng.next_u64(),
 			relay_key: rng.next_u64(),
 			external_ip_votes: DashMap::new(),
+			incoming_count: AtomicUsize::new(0),
 		}
 	}
 
@@ -331,33 +407,7 @@ impl NodeManager {
 	/// For occupied entries that are Disconnected or Dead, silently updates port
 	/// and connection type. Returns true only if a new entry was inserted
 	pub fn insert(&self, address: IpAddr, port: u16, connection_type: ConnectionType) -> bool {
-		if self.nodes.len() >= MAX_NODES {
-			debug!("Node limit reached ({}), not adding {}:{}", MAX_NODES, address, port);
-			return false;
-		}
-
-		// Use entry API for atomic check-and-insert
-		let entry = self.nodes.entry(address);
-
-		match entry {
-			dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-				let node = occupied.get_mut();
-				if matches!(node.state, NodeState::Disconnected { .. } | NodeState::Dead) {
-					node.port = port;
-					node.connection_type = connection_type;
-				}
-				false
-			}
-			dashmap::mapref::entry::Entry::Vacant(vacant) => {
-				let initial_state = match connection_type {
-					ConnectionType::Outgoing => NodeState::Connecting { since: Instant::now() },
-					ConnectionType::Incoming => NodeState::Handshaking { since: Instant::now() },
-				};
-
-				vacant.insert(Node::new(port, connection_type, initial_state));
-				true
-			}
-		}
+		self.try_insert_or_reactivate(address, port, connection_type, false)
 	}
 
 	/// Inserts or reactivates a node for an incoming connection
@@ -367,11 +417,49 @@ impl NodeManager {
 	/// If the node doesn't exist, inserts it in Handshaking state
 	/// Returns true if the node is ready to accept the incoming connection
 	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> bool {
-		if self.nodes.len() >= MAX_NODES {
+		if self.incoming_count.load(Ordering::Relaxed) >= MAX_INCOMING_CONNECTIONS {
 			debug!(
-				"Node limit reached ({}), not adding incoming {}:{}",
-				MAX_NODES, address, port
+				"Incoming connection limit reached ({}), rejecting {}:{}",
+				MAX_INCOMING_CONNECTIONS, address, port
 			);
+			return false;
+		}
+
+		if self.try_insert_or_reactivate(address, port, ConnectionType::Incoming, true) {
+			self.incoming_count.fetch_add(1, Ordering::Relaxed);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Decrements the incoming connection counter
+	pub fn decrement_incoming_count(&self) {
+		// Saturating semantics via fetch_update to prevent underflow
+		let _ = self
+			.incoming_count
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+				if v > 0 {
+					Some(v.saturating_sub(1))
+				} else {
+					None
+				}
+			});
+	}
+
+	/// Shared insert/reactivate logic for both outgoing and incoming nodes
+	///
+	/// When `reset_handshake` is true (incoming connections), resets handshake
+	/// fields on reactivation so stale state from a previous connection is cleared
+	fn try_insert_or_reactivate(
+		&self,
+		address: IpAddr,
+		port: u16,
+		connection_type: ConnectionType,
+		reset_handshake: bool,
+	) -> bool {
+		if self.nodes.len() >= MAX_NODES {
+			debug!("Node limit reached ({}), not adding {}:{}", MAX_NODES, address, port);
 			return false;
 		}
 
@@ -382,23 +470,32 @@ impl NodeManager {
 				let node = occupied.get_mut();
 				if matches!(node.state, NodeState::Disconnected { .. } | NodeState::Dead) {
 					node.port = port;
-					node.connection_type = ConnectionType::Incoming;
-					node.state = NodeState::Handshaking { since: Instant::now() };
-					node.version_received = false;
-					node.sent_getaddr = false;
-					node.addr_tokens = ADDR_TOKEN_CAPACITY;
-					node.last_token_refill = Instant::now();
-					true
+					node.connection_type = connection_type;
+
+					if reset_handshake {
+						node.state = NodeState::Handshaking { since: Instant::now() };
+						node.version_received = false;
+						node.sent_getaddr = false;
+						node.addr_tokens = ADDR_TOKEN_INITIAL;
+						node.last_token_refill = Instant::now();
+					}
+
+					reset_handshake
 				} else {
 					false
 				}
 			}
 			dashmap::mapref::entry::Entry::Vacant(vacant) => {
-				vacant.insert(Node::new(
-					port,
-					ConnectionType::Incoming,
-					NodeState::Handshaking { since: Instant::now() },
-				));
+				let initial_state = if reset_handshake {
+					NodeState::Handshaking { since: Instant::now() }
+				} else {
+					match connection_type {
+						ConnectionType::Outgoing => NodeState::Connecting { since: Instant::now() },
+						ConnectionType::Incoming => NodeState::Handshaking { since: Instant::now() },
+					}
+				};
+
+				vacant.insert(Node::new(port, connection_type, initial_state));
 				true
 			}
 		}
@@ -450,23 +547,9 @@ impl NodeManager {
 		}
 	}
 
-	/// Returns summary statistics about the managed nodes
-	pub fn get_stats(&self) -> NodeStats {
-		let total = self.nodes.len();
-		let connected = self.nodes.iter().filter(|n| n.state.is_connected()).count();
-		let disconnected = total.saturating_sub(connected);
-
-		NodeStats {
-			total,
-			connected,
-			disconnected,
-		}
-	}
-
 	/// Returns stats and node snapshots in a single `DashMap` iteration
 	///
-	/// More efficient than calling `get_stats()` + a separate snapshot method,
-	/// as it only acquires shard locks once
+	/// Only acquires shard locks once for both stats and snapshot data
 	pub fn get_snapshot(&self) -> (NodeStats, Vec<NodeSnapshot>) {
 		let mut connected: usize = 0;
 		let snapshots: Vec<NodeSnapshot> = self
@@ -482,7 +565,7 @@ impl NodeManager {
 					port: node.port,
 					height: node.height,
 					connection_type: node.connection_type,
-					state_label: node.state.to_string(),
+					state_label: NodeStateLabel::from_state(&node.state),
 				}
 			})
 			.collect();
@@ -503,26 +586,38 @@ impl NodeManager {
 	/// Background task that periodically scans for disconnected nodes ready for retry
 	///
 	/// Runs every 30 seconds and spawns connection tasks for nodes whose
-	/// backoff period has elapsed
+	/// backoff period has elapsed. Collects ready and stale nodes in a single pass
 	pub async fn run_reaper(self: Arc<Self>) {
 		loop {
 			tokio::time::sleep(REAPER_SCAN_INTERVAL).await;
 
-			// Collect addresses of nodes ready for retry
-			// We collect first to avoid holding DashMap locks during spawning
-			let ready_nodes: Vec<(IpAddr, u32)> = self
-				.nodes
-				.iter()
-				.filter_map(|entry| {
-					let node = entry.value();
-					if let NodeState::Disconnected { attempt, .. } = &node.state {
-						if node.state.is_connectable() {
-							return Some((*entry.key(), *attempt));
-						}
+			// Single-pass scan: collect both ready-for-retry and stale nodes,
+			// plus count connected for stats
+			let mut ready_nodes: Vec<(IpAddr, u32)> = Vec::new();
+			let mut stale_nodes: Vec<IpAddr> = Vec::new();
+			let mut total: usize = 0;
+			let mut connected: usize = 0;
+
+			for entry in &self.nodes {
+				total = total.saturating_add(1);
+				let node = entry.value();
+
+				match &node.state {
+					NodeState::Disconnected { attempt, .. } if node.state.is_connectable() => {
+						ready_nodes.push((*entry.key(), *attempt));
 					}
-					None
-				})
-				.collect();
+					NodeState::Connecting { since } if since.elapsed() > STALE_CONNECTING_TIMEOUT => {
+						stale_nodes.push(*entry.key());
+					}
+					NodeState::Handshaking { since } if since.elapsed() > STALE_HANDSHAKE_TIMEOUT => {
+						stale_nodes.push(*entry.key());
+					}
+					NodeState::Connected { .. } => {
+						connected = connected.saturating_add(1);
+					}
+					_ => {}
+				}
+			}
 
 			if !ready_nodes.is_empty() {
 				info!("Reaper: {} nodes ready for retry", ready_nodes.len());
@@ -547,24 +642,6 @@ impl NodeManager {
 				});
 			}
 
-			// Detect nodes stuck in Connecting or Handshaking for too long
-			let stale_nodes: Vec<IpAddr> = self
-				.nodes
-				.iter()
-				.filter_map(|entry| {
-					let is_stale = match &entry.value().state {
-						NodeState::Connecting { since } => since.elapsed() > STALE_CONNECTING_TIMEOUT,
-						NodeState::Handshaking { since } => since.elapsed() > STALE_HANDSHAKE_TIMEOUT,
-						_ => false,
-					};
-					if is_stale {
-						Some(*entry.key())
-					} else {
-						None
-					}
-				})
-				.collect();
-
 			for address in stale_nodes {
 				warn!("Node {} stuck in stale state, scheduling retry", address);
 				if let Some(mut node) = self.nodes.get_mut(&address) {
@@ -577,10 +654,11 @@ impl NodeManager {
 				}
 			}
 
-			let stats = self.get_stats();
 			debug!(
 				"Reaper scan complete: {} total, {} connected, {} disconnected",
-				stats.total, stats.connected, stats.disconnected
+				total,
+				connected,
+				total.saturating_sub(connected)
 			);
 		}
 	}
@@ -652,13 +730,21 @@ impl NodeManager {
 			.or_insert(1);
 	}
 
-	/// Returns our external IP if at least 3 peers agree on it
+	/// Returns our external IP if at least 3 peers agree and it has > 50% of votes
 	///
-	/// Returns the IP with the most votes, or None if no IP has >= 3 votes
+	/// Returns the IP with the most votes, or None if no IP meets both thresholds
 	pub fn get_external_ip(&self) -> Option<IpAddr> {
+		let total_votes: u32 = self.external_ip_votes.iter().map(|entry| *entry.value()).sum();
+
 		self.external_ip_votes
 			.iter()
-			.filter(|entry| *entry.value() >= 3)
+			.filter(|entry| {
+				let votes = *entry.value();
+				// total_votes is always >= votes, so * 2 won't overflow for realistic vote counts
+				#[allow(clippy::arithmetic_side_effects)]
+				let majority = votes * 2 > total_votes;
+				votes >= 3 && majority
+			})
 			.max_by_key(|entry| *entry.value())
 			.map(|entry| *entry.key())
 	}
@@ -788,49 +874,32 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	let mut tcp_stream = None;
 
 	for tcp_attempt in 1..=TCP_MAX_ATTEMPTS {
-		match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
+		let fail_reason = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
 			Ok(Ok(stream)) => {
 				info!("Connected to {}:{} on attempt {}", address, port, tcp_attempt);
 				tcp_stream = Some(stream);
 				break;
 			}
-			Ok(Err(e)) => {
-				if tcp_attempt < TCP_MAX_ATTEMPTS {
-					trace!(
-						"Failed to connect to {}:{} on attempt {}: {}",
-						address,
-						port,
-						tcp_attempt,
-						e
-					);
-					sleep(TCP_RETRY_DELAY).await;
-				} else {
-					debug!(
-						"Failed to connect to {}:{} after {} attempts: {}",
-						address, port, TCP_MAX_ATTEMPTS, e
-					);
-					schedule_retry(&node_manager, &address, attempt);
-					return;
-				}
-			}
-			Err(_) => {
-				if tcp_attempt < TCP_MAX_ATTEMPTS {
-					trace!(
-						"Connection to {}:{} timed out on attempt {}",
-						address,
-						port,
-						tcp_attempt
-					);
-					sleep(TCP_RETRY_DELAY).await;
-				} else {
-					debug!(
-						"Connection to {}:{} timed out after {} attempts",
-						address, port, TCP_MAX_ATTEMPTS
-					);
-					schedule_retry(&node_manager, &address, attempt);
-					return;
-				}
-			}
+			Ok(Err(e)) => format!("{e}"),
+			Err(_) => "timed out".to_string(),
+		};
+
+		if tcp_attempt < TCP_MAX_ATTEMPTS {
+			trace!(
+				"Failed to connect to {}:{} on attempt {}: {}",
+				address,
+				port,
+				tcp_attempt,
+				fail_reason
+			);
+			sleep(TCP_RETRY_DELAY).await;
+		} else {
+			debug!(
+				"Failed to connect to {}:{} after {} attempts: {}",
+				address, port, TCP_MAX_ATTEMPTS, fail_reason
+			);
+			schedule_retry(&node_manager, &address, attempt);
+			return;
 		}
 	}
 
@@ -891,8 +960,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address: IpAddr, tcp_stream: TcpStream) {
 	// Split the TCP stream into separate reader and writer
-	let (tcp_reader, tcp_writer) = tcp_stream.into_split();
-	let mut tcp_reader = BufReader::with_capacity(8192, tcp_reader);
+	let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
 
 	// Wrap the writer on Arc<Mutex> so we can write from multiple places later on
 	let shared_writer: SharedTcpWriter = Arc::new(Mutex::new(tcp_writer));
@@ -902,14 +970,22 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 	ping_interval.tick().await;
 
 	let mut incoming_queue = NetworkQueue::new();
-	let mut buf = [0; 4096];
+	let mut buf = [0; 8192];
+	let mut last_activity = Instant::now();
 
 	'main: loop {
+		// Compute idle deadline outside select! to avoid attribute issues on arms
+		// Instant::now() + bounded Duration cannot overflow in practice
+		#[allow(clippy::arithmetic_side_effects)]
+		let idle_deadline = last_activity + IDLE_TIMEOUT;
+
 		tokio::select! {
 			result = io::AsyncReadExt::read(&mut tcp_reader, &mut buf) => {
 				match result {
 					Ok(0) => break, // Connection closed
 					Ok(n) => {
+						last_activity = Instant::now();
+
 						// Process the incoming data
 						// n is bounded by buf.len() since it comes from read()
 						#[allow(clippy::indexing_slicing)]
@@ -929,6 +1005,10 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 			}
 			_ = ping_interval.tick() => {
 				node_manager.send_ping(&address).await;
+			}
+			() = tokio::time::sleep_until(idle_deadline) => {
+				warn!("Connection to {} idle for {:?}, disconnecting", address, IDLE_TIMEOUT);
+				break;
 			}
 		}
 
@@ -1048,6 +1128,29 @@ async fn handle_version(
 			.context("failed to send version reply for inbound connection")?;
 	}
 
+	// Validate start_height
+	if version.start_height < 0 {
+		if let Some(mut node) = node_manager.nodes.get_mut(address) {
+			node.state = NodeState::Banned {
+				reason: BanReason::Misbehavior,
+			};
+		}
+		warn!(
+			"Node {} sent negative start_height {}, banning",
+			address, version.start_height
+		);
+		return Err(anyhow!("Node {address} sent negative start_height"));
+	}
+
+	// Warn on extreme clock skew but don't ban (clock drift is common)
+	// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
+	// i64 subtraction of two timestamps can't overflow in practice (both near current epoch)
+	#[allow(clippy::cast_possible_wrap, clippy::arithmetic_side_effects)]
+	let time_diff = (version.timestamp - unix_now() as i64).unsigned_abs();
+	if time_diff > 4200 {
+		warn!("Node {} clock skew is {}s (threshold 4200s)", address, time_diff);
+	}
+
 	// Phase 3: Re-acquire lock to write fields
 	{
 		let mut node = node_manager
@@ -1062,10 +1165,8 @@ async fn handle_version(
 		node.version = version.version;
 		node.version_received = true;
 		node.relay = version.relay;
+		node.pending_external_ip = Some(version.addr_recv.address);
 	}
-
-	// Record peer's view of our external IP for consensus
-	node_manager.record_external_ip_vote(version.addr_recv.address);
 
 	// Verack sent after all locks released
 	tcp_writer
@@ -1076,31 +1177,39 @@ async fn handle_version(
 
 /// Handles an incoming verack message from a peer
 async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
-	let mut node = node_manager
-		.nodes
-		.get_mut(address)
-		.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
+	let pending_ip = {
+		let mut node = node_manager
+			.nodes
+			.get_mut(address)
+			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
 
-	// Verack before version is a protocol violation
-	if !node.version_received {
-		node.state = NodeState::Banned {
-			reason: BanReason::ProtocolViolation,
+		// Verack before version is a protocol violation
+		if !node.version_received {
+			node.state = NodeState::Banned {
+				reason: BanReason::ProtocolViolation,
+			};
+			warn!("Node {} sent verack before version, banning", address);
+			return Err(anyhow!("Node {address} sent verack before version"));
+		}
+
+		info!(
+			"Connection ready with node {} version={}, blocks={}, user_agent={}",
+			address, node.version, node.height, node.user_agent
+		);
+
+		node.state = NodeState::Connected {
+			writer: Arc::clone(tcp_writer),
 		};
-		warn!("Node {} sent verack before version, banning", address);
-		return Err(anyhow!("Node {address} sent verack before version"));
-	}
+		node.sent_getaddr = true;
 
-	info!(
-		"Connection ready with node {} version={}, blocks={}, user_agent={}",
-		address, node.version, node.height, node.user_agent
-	);
-
-	node.state = NodeState::Connected {
-		writer: Arc::clone(tcp_writer),
+		node.pending_external_ip.take()
+		// RefMut dropped here
 	};
-	node.sent_getaddr = true;
 
-	drop(node);
+	// Record external IP vote only after handshake completes
+	if let Some(ip) = pending_ip {
+		node_manager.record_external_ip_vote(ip);
+	}
 
 	tcp_writer
 		.send_message("getaddr", &[])
@@ -1164,12 +1273,11 @@ fn sanitize_user_agent(s: &str) -> String {
 
 /// Computes a deterministic score for relay peer selection
 ///
-/// Uses hashing to produce a stable ranking of peers for a given address
-/// within a 24-hour time bucket. Same inputs always produce same output
+/// Uses `SipHash-1-3` keyed by `relay_key` to produce a stable ranking of peers
+/// for a given address within a 24-hour time bucket. Same inputs always produce same output
 fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
 	use std::hash::{Hash, Hasher};
-	let mut hasher = std::collections::hash_map::DefaultHasher::new();
-	relay_key.hash(&mut hasher);
+	let mut hasher = SipHasher13::new_with_keys(relay_key, 0);
 	addr_hash.hash(&mut hasher);
 	time_bucket.hash(&mut hasher);
 	peer_hash.hash(&mut hasher);
@@ -1217,7 +1325,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 		// Hash the IP for a stable addr identifier
 		let addr_hash = {
 			use std::hash::{Hash, Hasher};
-			let mut hasher = std::collections::hash_map::DefaultHasher::new();
+			let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
 			entry.address.address.hash(&mut hasher);
 			hasher.finish()
 		};
@@ -1241,7 +1349,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 			.map(|(idx, (ip, _))| {
 				let peer_hash = {
 					use std::hash::{Hash, Hasher};
-					let mut hasher = std::collections::hash_map::DefaultHasher::new();
+					let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
 					ip.hash(&mut hasher);
 					hasher.finish()
 				};
@@ -1310,8 +1418,9 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 		address
 	);
 
-	// Rate limiting: refill tokens and consume one per entry
-	let accepted_indices: Vec<usize> = {
+	// Rate limiting: refill tokens, check freshness before deducting
+	let mut recently_active_indices: Vec<usize> = Vec::new();
+	{
 		let Some(mut node) = node_manager.nodes.get_mut(address) else {
 			return Ok(());
 		};
@@ -1321,15 +1430,23 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 		node.addr_tokens = refill_addr_tokens(node.addr_tokens, elapsed);
 		node.last_token_refill = now_instant;
 
-		let mut indices = Vec::new();
 		for (i, entry) in msg.entries().iter().enumerate() {
+			// Check freshness before consuming a token so stale entries don't drain budget
+			if !is_recently_active(entry.timestamp) {
+				debug!(
+					"Addr: {} filtered out (timestamp={}, not recently active)",
+					entry.address.address, entry.timestamp
+				);
+				continue;
+			}
+
 			if node.addr_tokens >= 1.0 {
 				// Finite f64 subtraction; both operands are bounded by ADDR_TOKEN_CAPACITY
 				#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
 				{
 					node.addr_tokens -= 1.0;
 				}
-				indices.push(i);
+				recently_active_indices.push(i);
 			} else {
 				debug!(
 					"Rate limited addr entry {} from {} (tokens exhausted)",
@@ -1337,28 +1454,16 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 				);
 			}
 		}
+	}
 
-		drop(node);
-		indices
-	};
-
-	if accepted_indices.is_empty() {
+	if recently_active_indices.is_empty() {
 		return Ok(());
 	}
 
-	for &i in &accepted_indices {
+	for &i in &recently_active_indices {
 		// msg.entries() is bounded by 1000 (validated in from_bytes), i < entries.len()
 		#[allow(clippy::indexing_slicing)]
 		let entry = &msg.entries()[i];
-
-		if !is_recently_active(entry.timestamp) {
-			debug!(
-				"Addr: {} filtered out (timestamp={}, not recently active)",
-				entry.address.address, entry.timestamp
-			);
-			continue;
-		}
-
 		let entry_ip = entry.address.address;
 
 		// Reject non-routable IPs to prevent internal network probing
@@ -1389,17 +1494,13 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 	let should_relay = node_manager.nodes.get(address).is_some_and(|n| !n.sent_getaddr);
 
 	if should_relay && msg.entries().len() <= ADDR_RELAY_MAX_ENTRIES {
-		let relay_entries: Vec<&AddrEntry> = accepted_indices
+		// recently_active_indices already filters by is_recently_active, no re-check needed
+		let relay_entries: Vec<&AddrEntry> = recently_active_indices
 			.iter()
-			.filter_map(|&i| {
+			.map(|&i| {
 				// Indices are bounded by msg.entries().len() from the rate limiting loop
 				#[allow(clippy::indexing_slicing)]
-				let entry = &msg.entries()[i];
-				if is_recently_active(entry.timestamp) {
-					Some(entry)
-				} else {
-					None
-				}
+				&msg.entries()[i]
 			})
 			.collect();
 
@@ -1719,13 +1820,13 @@ mod tests {
 	}
 
 	#[test]
-	fn new_node_starts_with_full_token_bucket() {
+	fn new_node_starts_with_initial_token_bucket() {
 		let nm = NodeManager::new();
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
 		let node = nm.nodes.get(&ip).unwrap();
-		assert!((node.addr_tokens - ADDR_TOKEN_CAPACITY).abs() < f64::EPSILON);
+		assert!((node.addr_tokens - ADDR_TOKEN_INITIAL).abs() < f64::EPSILON);
 	}
 
 	#[test]

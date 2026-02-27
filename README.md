@@ -7,7 +7,7 @@ A Catcoin network client implemented from scratch in Rust.
 ```bash
 cargo run                                    # TUI mode (default)
 cargo run -- --daemon                        # Daemon mode, logs to stderr
-cargo run -- --seed 10.0.0.1:9933            # Custom seed node
+cargo run -- --seed 10.0.0.1:9933            # Custom seed node (default: 161.129.176.92:9933)
 cargo run -- --no-dns-seed                   # Disable DNS peer discovery
 RUST_LOG=debug cargo run                     # Control log level
 cargo run -- --help                          # Show help
@@ -40,3 +40,7 @@ RUST_LOG=info cargo run -- --daemon    # Only info and above
 RUST_LOG=debug cargo run               # Debug and above
 RUST_LOG=trace cargo run               # Everything
 ```
+
+## Notable dependencies
+
+- **siphasher** -- Keyed SipHash for deterministic addr relay peer selection. Provides stable, cross-platform hashing independent of Rust's `DefaultHasher` which can change between compiler versions
