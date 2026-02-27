@@ -22,7 +22,7 @@ const DNS_SEEDS: &[&str] = &[
 ];
 
 /// Default port for the Catcoin mainnet P2P protocol
-const DEFAULT_PORT: u16 = 9933;
+pub const DEFAULT_PORT: u16 = 9933;
 
 /// Timeout applied to each individual DNS resolution attempt
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);

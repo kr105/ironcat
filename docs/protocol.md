@@ -119,7 +119,7 @@ Ironcat sends pings every 180 seconds using `tokio::time::interval` (not reset b
 
 Empty payload. Requests the peer's known addresses.
 
-On receipt, Ironcat responds with an addr message containing up to 1000 outgoing, connected nodes seen within the last 2 hours. Incoming connections are never shared (their port is ephemeral and useless).
+On receipt, Ironcat responds with an addr message containing up to 1000 outgoing, connected nodes seen within the last 2 hours. Incoming connections are never shared (their port is ephemeral and useless). If no eligible nodes exist, no response is sent. Getaddr responses are rate limited to one per peer per minute.
 
 ### addr
 
@@ -174,12 +174,11 @@ Ignored. Legacy Bitcoin alert system, deprecated.
 
 ```
 Us              Peer
-|-- version -->  |
-|               |-- version -->|
-|<-- version --|
-|-- verack -->  |
-|<-- verack --|
-|-- getaddr --> |
+|-- version  -->  |
+|<-- version  --|
+|-- verack   -->  |
+|<-- verack   --|
+|-- getaddr  --> |
 ```
 
 1. We connect and immediately send our version
@@ -193,11 +192,11 @@ Us              Peer
 
 ```
 Peer            Us
-|-- version -->  |
-|<-- version --|
-|<-- verack  --|
-|-- verack -->  |
-|<-- getaddr --|
+|-- version  -->  |
+|<-- version  --|
+|<-- verack   --|
+|-- verack   -->  |
+|<-- getaddr  --|
 ```
 
 1. Peer connects and sends their version
@@ -211,6 +210,7 @@ Peer            Us
 - Self-connections (matching nonce) trigger a ban
 - The `version_received` flag tracks whether we got a version from the peer, independent of the version number itself
 - On reconnect, `version_received` is reset to false
+- Receiving verack before version is a protocol violation and triggers a ban
 
 ## Node State Machine
 
@@ -254,14 +254,14 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 
 | Reason | Trigger |
 |--------|---------|
-| ProtocolViolation | Duplicate version message, self-connection |
+| ProtocolViolation | Duplicate version message, self-connection, verack before version |
 | Misbehavior | Malformed ping (non-zero, non-8 byte payload) |
 
 ## Connection Details
 
 - TCP listener binds to `0.0.0.0:9933`
 - Reader uses `BufReader` with 8192-byte capacity
-- Read buffer: 4096 bytes per read call
+- Read buffer: 4096 bytes per read call (BufReader handles internal buffering; 4096 is the per-call slice passed to NetworkQueue for message parsing)
 - Writer is `Arc<Mutex<OwnedWriteHalf>>` for concurrent access
 - Max tracked nodes: 5000
 - Nodes are keyed by IP address (one connection per IP, both inbound and outbound, for sybil/eclipse defense)

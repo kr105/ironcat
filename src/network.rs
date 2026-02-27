@@ -16,7 +16,7 @@ use tokio::{
 	net::{tcp::OwnedWriteHalf, TcpListener},
 	sync::Mutex,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	nodes::{node_connection_loop, NodeManager, NodeState},
@@ -55,6 +55,7 @@ impl SharedTcpWriterExt for SharedTcpWriter {
 		})?;
 
 		if let Err(error) = self.lock().await.write_all(&packet.to_bytes()).await {
+			warn!("Failed to send '{command}': {error:?}");
 			return Err(anyhow!("Error in write_all: {error:?}"));
 		}
 
@@ -401,13 +402,25 @@ pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
 }
 
 /// Encodes a string as a variable-length string for the wire protocol
-pub fn encode_varstr(s: &str) -> Vec<u8> {
+#[cfg(test)]
+fn encode_varstr(s: &str) -> Vec<u8> {
 	// s.len() + 9 (max varint) cannot overflow usize for any real string
 	#[allow(clippy::arithmetic_side_effects)]
 	let mut encoded = Vec::with_capacity(s.len() + 9);
 	write_varint(&mut encoded, s.len() as u64);
 	encoded.extend_from_slice(s.as_bytes());
 	encoded
+}
+
+/// Writes a variable-length string directly into the given buffer
+///
+/// More efficient than `encode_varstr` when appending to an existing buffer,
+/// as it avoids an intermediate Vec allocation
+pub fn write_varstr(buf: &mut Vec<u8>, s: &str) {
+	// s.len() fits in u64 on any supported platform (usize <= u64)
+	#[allow(clippy::cast_possible_truncation)]
+	write_varint(buf, s.len() as u64);
+	buf.extend_from_slice(s.as_bytes());
 }
 
 /// Decodes a variable-length integer from a cursor
@@ -468,6 +481,13 @@ impl NetworkQueue {
 
 	/// Processes incoming data, extracting complete messages and buffering incomplete ones
 	pub fn process_incoming_data(&mut self, data: &[u8]) -> Result<()> {
+		// Reject data that would push the buffer beyond safety limits
+		// buffer.len() + data.len() is bounded by MAX_MESSAGE_SIZE * 2 (max ~10MB); no overflow
+		#[allow(clippy::arithmetic_side_effects)]
+		if self.buffer.len() + data.len() > MAX_MESSAGE_SIZE * 2 {
+			return Err(anyhow!("Buffer would exceed safety limit"));
+		}
+
 		self.buffer.extend_from_slice(data);
 
 		let mut consumed = 0;
@@ -493,6 +513,12 @@ impl NetworkQueue {
 		if consumed > 0 {
 			// Batch drain instead of per-message split_off
 			self.buffer.drain(..consumed);
+
+			// Reclaim memory if buffer is mostly empty but over-allocated
+			#[allow(clippy::arithmetic_side_effects)]
+			if self.buffer.capacity() > 65536 && self.buffer.len() < self.buffer.capacity() / 4 {
+				self.buffer.shrink_to(self.buffer.len().max(8192));
+			}
 		}
 
 		if self.buffer.len() > MAX_MESSAGE_SIZE {
@@ -510,6 +536,9 @@ impl NetworkQueue {
 
 /// Starts the TCP listener for incoming peer connections
 pub async fn listening_start(node_manager: Arc<NodeManager>) {
+	// Rate limiter: track accepts per second to prevent fd exhaustion
+	const MAX_ACCEPTS_PER_SECOND: u32 = 50;
+
 	trace!("listening_start task started");
 
 	let tcp_listener = match TcpListener::bind("0.0.0.0:9933").await {
@@ -520,7 +549,24 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 		}
 	};
 
+	info!("Listening on 0.0.0.0:9933");
+
+	let mut accepts_this_second: u32 = 0;
+	let mut second_start = tokio::time::Instant::now();
+
 	loop {
+		// Reset counter each second
+		if second_start.elapsed() >= std::time::Duration::from_secs(1) {
+			accepts_this_second = 0;
+			second_start = tokio::time::Instant::now();
+		}
+
+		// Back off if too many accepts this second
+		if accepts_this_second >= MAX_ACCEPTS_PER_SECOND {
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			continue;
+		}
+
 		let connection = match tcp_listener.accept().await {
 			Ok(handle) => handle,
 			Err(error) => {
@@ -529,6 +575,8 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 				continue;
 			}
 		};
+
+		accepts_this_second = accepts_this_second.saturating_add(1);
 
 		let (mut tcp_stream, socket_addr) = connection;
 

@@ -13,6 +13,7 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+	dns::DEFAULT_PORT,
 	network::{
 		message_addr::{AddrEntry, MessageAddr},
 		message_version::MessageVersion,
@@ -71,6 +72,15 @@ const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
 
 /// How often to announce our own address to peers
 const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Maximum length of user agent string after sanitization
+const MAX_USER_AGENT_DISPLAY: usize = 256;
+
+/// Maximum number of entries in the external IP votes map
+const MAX_EXTERNAL_IP_VOTES: usize = 100;
+
+/// Maximum entries in a peer's `addr_known` set within a 24h bucket
+const MAX_ADDR_KNOWN: usize = 5000;
 
 /// Reason why a node was permanently banned
 #[derive(Debug)]
@@ -161,15 +171,20 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 /// Summary statistics about managed nodes
 #[derive(Debug)]
 pub struct NodeStats {
+	/// Total number of tracked nodes
 	pub total: usize,
+	/// Number of nodes in Connected state
 	pub connected: usize,
+	/// Number of nodes not in Connected state
 	pub disconnected: usize,
 }
 
 /// Direction of a node connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionType {
+	/// Peer connected to us
 	Incoming,
+	/// We connected to the peer
 	Outgoing,
 }
 
@@ -187,10 +202,15 @@ impl fmt::Display for ConnectionType {
 /// Contains only the fields needed by the TUI, without internal state
 /// like `tcp_writer` or the full `NodeState` enum
 pub struct NodeSnapshot {
+	/// IP address of the node
 	pub address: IpAddr,
+	/// Listening port of the node
 	pub port: u16,
+	/// Last known block height
 	pub height: i32,
+	/// Whether this is an incoming or outgoing connection
 	pub connection_type: ConnectionType,
+	/// Human-readable state label for display
 	pub state_label: String,
 }
 
@@ -199,24 +219,31 @@ pub struct Node {
 	/// Port number for this node's listening socket
 	pub port: u16,
 
-	/// Unix timestamp
+	/// Unix timestamp of the last message received from this node
 	pub last_seen: u64,
 
+	/// Protocol version reported by this node
 	pub version: u32,
 
 	/// Whether we have received a version message from this peer
 	pub version_received: bool,
 
+	/// Service flags advertised by this node
 	pub services: ServiceMask,
 
+	/// Unix timestamp from the node's version message
 	pub timestamp: i64,
 
+	/// User agent string reported by this node
 	pub user_agent: String,
 
+	/// Last known block height from this node
 	pub height: i32,
 
+	/// Whether this node wants transaction relay (BIP37)
 	pub relay: bool,
 
+	/// Direction of this connection (incoming or outgoing)
 	pub connection_type: ConnectionType,
 
 	/// Current connection lifecycle state
@@ -236,6 +263,34 @@ pub struct Node {
 
 	/// Whether we sent getaddr to this peer (inhibits relay of their addr response)
 	pub sent_getaddr: bool,
+
+	/// When we last responded to a getaddr from this peer
+	pub last_getaddr_response: Option<Instant>,
+}
+
+impl Node {
+	/// Creates a new node with default field values
+	fn new(port: u16, connection_type: ConnectionType, state: NodeState) -> Self {
+		Self {
+			port,
+			last_seen: 0,
+			height: 0,
+			relay: false,
+			services: ServiceMask::empty(),
+			timestamp: 0,
+			user_agent: String::new(),
+			version: 0,
+			version_received: false,
+			connection_type,
+			state,
+			addr_known: HashSet::new(),
+			addr_known_bucket: 0,
+			addr_tokens: ADDR_TOKEN_CAPACITY,
+			last_token_refill: Instant::now(),
+			sent_getaddr: false,
+			last_getaddr_response: None,
+		}
+	}
 }
 
 /// Manages a collection of nodes in the network
@@ -243,7 +298,7 @@ pub struct NodeManager {
 	// Using DashMap for concurrent access without needing explicit locking
 	pub(crate) nodes: DashMap<IpAddr, Node>,
 
-	// Used to avoid connecting to myself
+	/// Random nonce for self-connection detection
 	pub my_nonce: u64,
 
 	/// Per-session random key for deterministic addr relay peer selection
@@ -299,26 +354,7 @@ impl NodeManager {
 					ConnectionType::Incoming => NodeState::Handshaking { since: Instant::now() },
 				};
 
-				let node = Node {
-					port,
-					last_seen: 0,
-					height: 0,
-					relay: false,
-					services: ServiceMask::empty(),
-					timestamp: 0,
-					user_agent: String::new(),
-					version: 0,
-					version_received: false,
-					connection_type,
-					state: initial_state,
-					addr_known: HashSet::new(),
-					addr_known_bucket: 0,
-					addr_tokens: ADDR_TOKEN_CAPACITY,
-					last_token_refill: Instant::now(),
-					sent_getaddr: false,
-				};
-
-				vacant.insert(node);
+				vacant.insert(Node::new(port, connection_type, initial_state));
 				true
 			}
 		}
@@ -358,26 +394,11 @@ impl NodeManager {
 				}
 			}
 			dashmap::mapref::entry::Entry::Vacant(vacant) => {
-				let node = Node {
+				vacant.insert(Node::new(
 					port,
-					last_seen: 0,
-					height: 0,
-					relay: false,
-					services: ServiceMask::empty(),
-					timestamp: 0,
-					user_agent: String::new(),
-					version: 0,
-					version_received: false,
-					connection_type: ConnectionType::Incoming,
-					state: NodeState::Handshaking { since: Instant::now() },
-					addr_known: HashSet::new(),
-					addr_known_bucket: 0,
-					addr_tokens: ADDR_TOKEN_CAPACITY,
-					last_token_refill: Instant::now(),
-					sent_getaddr: false,
-				};
-
-				vacant.insert(node);
+					ConnectionType::Incoming,
+					NodeState::Handshaking { since: Instant::now() },
+				));
 				true
 			}
 		}
@@ -442,12 +463,20 @@ impl NodeManager {
 		}
 	}
 
-	/// Returns snapshots of all nodes for display in the TUI
-	pub fn get_all_nodes(&self) -> Vec<NodeSnapshot> {
-		self.nodes
+	/// Returns stats and node snapshots in a single `DashMap` iteration
+	///
+	/// More efficient than calling `get_stats()` + a separate snapshot method,
+	/// as it only acquires shard locks once
+	pub fn get_snapshot(&self) -> (NodeStats, Vec<NodeSnapshot>) {
+		let mut connected: usize = 0;
+		let snapshots: Vec<NodeSnapshot> = self
+			.nodes
 			.iter()
 			.map(|entry| {
 				let node = entry.value();
+				if node.state.is_connected() {
+					connected = connected.saturating_add(1);
+				}
 				NodeSnapshot {
 					address: *entry.key(),
 					port: node.port,
@@ -456,7 +485,19 @@ impl NodeManager {
 					state_label: node.state.to_string(),
 				}
 			})
-			.collect()
+			.collect();
+
+		let total = snapshots.len();
+		let disconnected = total.saturating_sub(connected);
+
+		(
+			NodeStats {
+				total,
+				connected,
+				disconnected,
+			},
+			snapshots,
+		)
 	}
 
 	/// Background task that periodically scans for disconnected nodes ready for retry
@@ -556,20 +597,6 @@ impl NodeManager {
 		}
 	}
 
-	/// Retrieves the `tcp_writer` for a connected node
-	///
-	/// Returns None if the node doesn't exist or isn't in Connected state
-	// Part of the NodeManager encapsulation API, will replace direct field access
-	#[allow(dead_code)]
-	pub fn get_writer(&self, address: &IpAddr) -> Option<SharedTcpWriter> {
-		if let Some(node) = self.nodes.get(address) {
-			if let NodeState::Connected { ref writer } = node.state {
-				return Some(Arc::clone(writer));
-			}
-		}
-		None
-	}
-
 	/// Shuts down all connected nodes cleanly by sending TCP FIN
 	///
 	/// Collects writers first to avoid holding `DashMap` locks across awaits
@@ -602,15 +629,6 @@ impl NodeManager {
 		info!("Graceful shutdown complete");
 	}
 
-	/// Marks a node as permanently banned
-	// Part of the NodeManager encapsulation API, will replace direct state mutation
-	#[allow(dead_code)]
-	pub fn ban_node(&self, address: &IpAddr, reason: BanReason) {
-		if let Some(mut node) = self.nodes.get_mut(address) {
-			node.state = NodeState::Banned { reason };
-		}
-	}
-
 	/// Records a peer's report of our external IP address
 	///
 	/// Non-routable IPs (private, loopback, link-local, etc) are silently ignored
@@ -619,6 +637,13 @@ impl NodeManager {
 			debug!(ip = %ip, "Ignoring non-routable external IP vote");
 			return;
 		}
+
+		// Cap the votes map to prevent unbounded growth
+		if self.external_ip_votes.len() >= MAX_EXTERNAL_IP_VOTES {
+			debug!(ip = %ip, "External IP votes map full, ignoring vote");
+			return;
+		}
+
 		self.external_ip_votes
 			.entry(ip)
 			.and_modify(|count| {
@@ -689,7 +714,7 @@ impl NodeManager {
 				continue;
 			};
 
-			let addr = NetworkAddress::new(external_ip, 9933);
+			let addr = NetworkAddress::new(external_ip, DEFAULT_PORT);
 			let msg = MessageAddr::new(vec![addr]);
 			let payload = msg.to_bytes();
 
@@ -710,7 +735,12 @@ impl NodeManager {
 				continue;
 			}
 
-			info!("Announcing own address {}:9933 to {} peers", external_ip, writers.len());
+			info!(
+				"Announcing own address {}:{} to {} peers",
+				external_ip,
+				DEFAULT_PORT,
+				writers.len()
+			);
 
 			for (address, writer) in &writers {
 				if let Err(e) = writer.send_message("addr", &payload).await {
@@ -872,10 +902,9 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 	ping_interval.tick().await;
 
 	let mut incoming_queue = NetworkQueue::new();
+	let mut buf = [0; 4096];
 
 	'main: loop {
-		let mut buf = [0; 4096];
-
 		tokio::select! {
 			result = io::AsyncReadExt::read(&mut tcp_reader, &mut buf) => {
 				match result {
@@ -907,9 +936,7 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 		while let Some(message) = incoming_queue.get_next_message() {
 			node_manager.update_last_seen(&address);
 
-			if let Err(e) =
-				parse_incoming_message(Arc::clone(&node_manager), &address, Arc::clone(&shared_writer), message).await
-			{
+			if let Err(e) = parse_incoming_message(&node_manager, &address, &shared_writer, message).await {
 				warn!("Error parsing message: {:?}", e);
 
 				// Close the connection
@@ -924,9 +951,9 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 
 /// Parses and dispatches an incoming message to the appropriate handler
 async fn parse_incoming_message(
-	node_manager: Arc<NodeManager>,
+	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
-	tcp_writer: SharedTcpWriter,
+	tcp_writer: &SharedTcpWriter,
 	message: Message,
 ) -> Result<()> {
 	let command = if let Ok(str) = CStr::from_bytes_until_nul(&message.command) {
@@ -941,20 +968,32 @@ async fn parse_incoming_message(
 
 	debug!("Received message: {:?} from {}", command, address);
 
+	// Only allow Version/Verack before the handshake completes
+	if !matches!(command, NetworkCommand::Version | NetworkCommand::Verack) {
+		let is_connected = node_manager.nodes.get(address).is_some_and(|n| n.state.is_connected());
+		if !is_connected {
+			warn!(
+				"Received {:?} from {} before handshake complete, ignoring",
+				command, address
+			);
+			return Ok(());
+		}
+	}
+
 	match command {
-		NetworkCommand::Version => handle_version(&node_manager, address, &tcp_writer, &message.payload).await,
-		NetworkCommand::Verack => handle_verack(&node_manager, address, &tcp_writer).await,
-		NetworkCommand::Ping => handle_ping(&node_manager, address, &tcp_writer, &message.payload).await,
+		NetworkCommand::Version => handle_version(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::Verack => handle_verack(node_manager, address, tcp_writer).await,
+		NetworkCommand::Ping => handle_ping(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
 			handle_pong(address);
 			Ok(())
 		}
-		NetworkCommand::Addr => handle_addr(&node_manager, address, &message.payload).await,
+		NetworkCommand::Addr => handle_addr(node_manager, address, &message.payload).await,
 		NetworkCommand::Alert => {
 			debug!("Received alert from {}, ignoring", address);
 			Ok(())
 		}
-		NetworkCommand::GetAddr => handle_getaddr(&node_manager, address, &tcp_writer).await,
+		NetworkCommand::GetAddr => handle_getaddr(node_manager, address, tcp_writer).await,
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())
@@ -1018,7 +1057,7 @@ async fn handle_version(
 
 		node.services = version.services;
 		node.timestamp = version.timestamp;
-		node.user_agent = version.user_agent;
+		node.user_agent = sanitize_user_agent(&version.user_agent);
 		node.height = version.start_height;
 		node.version = version.version;
 		node.version_received = true;
@@ -1042,30 +1081,31 @@ async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_wr
 		.get_mut(address)
 		.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
 
-	// If we already received version from the peer, the handshake is complete
-	if node.version_received {
-		info!(
-			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			address, node.version, node.height, node.user_agent
-		);
-
-		node.state = NodeState::Connected {
-			writer: Arc::clone(tcp_writer),
+	// Verack before version is a protocol violation
+	if !node.version_received {
+		node.state = NodeState::Banned {
+			reason: BanReason::ProtocolViolation,
 		};
-
-		drop(node);
-
-		// Mark that we sent getaddr so we suppress relay of their addr response
-		if let Some(mut node) = node_manager.nodes.get_mut(address) {
-			node.sent_getaddr = true;
-		}
-
-		tcp_writer
-			.send_message("getaddr", &[])
-			.await
-			.context("failed to send getaddr")?;
+		warn!("Node {} sent verack before version, banning", address);
+		return Err(anyhow!("Node {address} sent verack before version"));
 	}
-	// If version not received yet, stay in Handshaking state
+
+	info!(
+		"Connection ready with node {} version={}, blocks={}, user_agent={}",
+		address, node.version, node.height, node.user_agent
+	);
+
+	node.state = NodeState::Connected {
+		writer: Arc::clone(tcp_writer),
+	};
+	node.sent_getaddr = true;
+
+	drop(node);
+
+	tcp_writer
+		.send_message("getaddr", &[])
+		.await
+		.context("failed to send getaddr")?;
 
 	Ok(())
 }
@@ -1106,9 +1146,20 @@ async fn handle_ping(
 }
 
 /// Handles an incoming pong message from a peer
+///
+/// Currently logs receipt only; nonce validation is not implemented
 fn handle_pong(address: &IpAddr) {
-	// TODO: Handle pong properly
 	debug!("Received pong from {}", address);
+}
+
+/// Strips non-printable and non-ASCII characters from a user agent string
+///
+/// Prevents terminal escape sequence injection via malicious user agents
+fn sanitize_user_agent(s: &str) -> String {
+	s.chars()
+		.filter(|c| c.is_ascii_graphic() || *c == ' ')
+		.take(MAX_USER_AGENT_DISPLAY)
+		.collect()
 }
 
 /// Computes a deterministic score for relay peer selection
@@ -1171,6 +1222,18 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 			hasher.finish()
 		};
 
+		// Serialize once per entry, reuse for all peers
+		let relay_entry = AddrEntry {
+			timestamp: entry.timestamp,
+			address: NetworkAddress {
+				services: entry.address.services,
+				address: entry.address.address,
+				port: entry.address.port,
+			},
+		};
+		let msg = MessageAddr::from_entries(vec![relay_entry]);
+		let payload = msg.to_bytes();
+
 		// Score each peer and sort descending
 		let mut scored: Vec<(usize, u64)> = peers
 			.iter()
@@ -1204,7 +1267,12 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 					node.addr_known.clear();
 					node.addr_known_bucket = time_bucket;
 				}
-				!node.addr_known.insert(entry.address.address)
+				// Cap addr_known to prevent unbounded growth within a 24h bucket
+				if node.addr_known.len() >= MAX_ADDR_KNOWN {
+					true
+				} else {
+					!node.addr_known.insert(entry.address.address)
+				}
 			} else {
 				continue;
 			};
@@ -1213,18 +1281,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 				continue;
 			}
 
-			// Build a single-entry addr message preserving the original timestamp
-			let relay_entry = AddrEntry {
-				timestamp: entry.timestamp,
-				address: NetworkAddress {
-					services: entry.address.services,
-					address: entry.address.address,
-					port: entry.address.port,
-				},
-			};
-			let msg = MessageAddr::from_entries(vec![relay_entry]);
-
-			if let Err(e) = writer.send_message("addr", &msg.to_bytes()).await {
+			if let Err(e) = writer.send_message("addr", &payload).await {
 				debug!("Failed to relay addr to {}: {}", peer_ip, e);
 			}
 		}
@@ -1304,6 +1361,18 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 
 		let entry_ip = entry.address.address;
 
+		// Reject non-routable IPs to prevent internal network probing
+		if !is_routable(entry_ip) {
+			debug!("Addr: {} filtered out (not routable)", entry_ip);
+			continue;
+		}
+
+		// Reject port 0 which has undefined connect behavior
+		if entry.address.port == 0 {
+			debug!("Addr: {} filtered out (port 0)", entry_ip);
+			continue;
+		}
+
 		// Try to revive Dead nodes with a newer timestamp
 		if node_manager.revive_if_newer(&entry_ip, entry.address.port, entry.timestamp) {
 			info!("Revived dead node {} with newer addr timestamp", entry_ip);
@@ -1342,6 +1411,22 @@ async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload:
 
 /// Handles an incoming getaddr request from a peer
 async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
+	// Rate limit getaddr responses to 1 per minute
+	{
+		let Some(mut node) = node_manager.nodes.get_mut(address) else {
+			return Ok(());
+		};
+
+		if let Some(last) = node.last_getaddr_response {
+			if last.elapsed() < Duration::from_secs(60) {
+				debug!("Rate limiting getaddr from {}", address);
+				return Ok(());
+			}
+		}
+
+		node.last_getaddr_response = Some(Instant::now());
+	}
+
 	let now = unix_now();
 
 	// Filter the node list so we share only recently active outgoing connections

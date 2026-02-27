@@ -24,8 +24,7 @@ use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
 pub fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<TuiLogEntry>) {
 	let terminal = ratatui::init();
 	if let Err(e) = run(terminal, &node_manager, log_receiver) {
-		// TUI owns the terminal, tracing may route to the dead TUI channel,
-		// so use stderr directly
+		// TUI owns the terminal and the tracing channel may be dead, stderr is the only output option
 		#[allow(clippy::print_stderr)]
 		{
 			eprintln!("TUI error: {e:?}");
@@ -126,8 +125,10 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
 		.split(area);
 
+	// Single iteration for both stats and node list
+	let (stats, mut nodes) = node_manager.get_snapshot();
+
 	// Top half: Stats display
-	let stats = node_manager.get_stats();
 	let stats_text = format!(
 		"Total Nodes: {}\nConnected Nodes: {}\nDisconnected Nodes: {}",
 		stats.total, stats.connected, stats.disconnected
@@ -138,7 +139,6 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	frame.render_widget(stats_paragraph, chunks[0]);
 
 	// Bottom half: Nodes table sorted by height
-	let mut nodes = node_manager.get_all_nodes();
 	nodes.sort_by(|a, b| b.height.cmp(&a.height));
 
 	let header = Row::new(vec![

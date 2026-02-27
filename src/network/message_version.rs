@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{decode_varstr, encode_varstr, NetworkAddress, ServiceMask};
+use super::{decode_varstr, write_varstr, NetworkAddress, ServiceMask};
 use crate::utils::unix_now;
 use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -67,10 +67,10 @@ impl MessageVersion {
 		bytes.extend_from_slice(&self.version.to_le_bytes());
 		bytes.extend_from_slice(&self.services.bits().to_le_bytes());
 		bytes.extend_from_slice(&self.timestamp.to_le_bytes());
-		bytes.extend(&self.addr_recv.to_bytes());
+		bytes.extend_from_slice(&self.addr_recv.to_bytes());
 		bytes.extend_from_slice(&[0u8; 26]); // Placeholder for addr_from
 		bytes.extend_from_slice(&self.nonce.to_le_bytes());
-		bytes.extend_from_slice(&encode_varstr(&self.user_agent));
+		write_varstr(&mut bytes, &self.user_agent);
 		bytes.extend_from_slice(&self.start_height.to_le_bytes());
 		bytes.push(u8::from(self.relay));
 		bytes
