@@ -12,7 +12,7 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 | Max message size | 500,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.4/` |
+| User agent | `/Ironcat:0.0.6/` |
 
 ## Message Framing
 
@@ -86,7 +86,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.4/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.6/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
