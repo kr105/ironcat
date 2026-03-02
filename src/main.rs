@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-mod cli;
-mod dns;
-mod network;
-mod nodes;
-mod tui_layer;
-mod ui;
-mod utils;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::Args;
-use network::listening_start;
-use nodes::NodeManager;
+use ironcat::{
+	cli::Args,
+	dns,
+	network::listening_start,
+	nodes::NodeManager,
+	tui_layer::{TuiLayer, TuiLogEntry},
+	ui::tui::tui_start,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tui_layer::{TuiLayer, TuiLogEntry};
-use ui::tui::tui_start;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,6 +58,10 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let nm = Arc::clone(&node_manager);
 	let reaper_handle = tokio::spawn(nm.run_reaper());
 
+	// Spawn self-announcement task
+	let nm = Arc::clone(&node_manager);
+	let announce_handle = tokio::spawn(nm.run_self_announce());
+
 	// Discover peers via DNS seeds
 	if !args.no_dns_seed {
 		let dns_addrs = dns::resolve_dns_seeds().await;
@@ -83,6 +82,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = reaper_handle => {
 			info!("Reaper task ended, shutting down");
+		}
+		_ = announce_handle => {
+			info!("Self-announce task ended, shutting down");
 		}
 		() = async {
 			match ui_handle {

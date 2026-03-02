@@ -9,10 +9,10 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 | Network magic | `0xFC 0xC1 0xB7 0xDC` |
 | Default port | 9933 |
 | Protocol version | 70003 |
-| Max message size | 5,000,000 bytes |
+| Max message size | 500,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.1/` |
+| User agent | `/Ironcat:0.0.4/` |
 
 ## Message Framing
 
@@ -86,7 +86,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.1/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.4/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -119,7 +119,7 @@ Ironcat sends pings every 180 seconds using `tokio::time::interval` (not reset b
 
 Empty payload. Requests the peer's known addresses.
 
-On receipt, Ironcat responds with an addr message containing up to 1000 outgoing, connected nodes seen within the last 2 hours. Incoming connections are never shared (their port is ephemeral and useless).
+On receipt, Ironcat responds with an addr message containing up to 1000 outgoing, connected nodes seen within the last 2 hours. Incoming connections are never shared (their port is ephemeral and useless). If no eligible nodes exist, no response is sent. Getaddr responses are rate limited to one per peer per minute.
 
 ### addr
 
@@ -138,6 +138,32 @@ Addresses older than 24 hours (with 10-minute future tolerance for clock skew) a
 
 An empty addr list encodes as a single `0x00` byte (varint zero).
 
+#### Addr rate limiting
+
+Incoming addr entries are rate limited per peer using a token bucket:
+
+| Parameter | Value |
+|-----------|-------|
+| Refill rate | 0.1 tokens/second (1 token per 10 seconds) |
+| Bucket capacity | 1000 tokens |
+
+Each entry in an addr message consumes 1 token. Only recently-active entries (within 24h) consume tokens; stale entries are filtered without cost. Entries that arrive when the bucket is empty are silently discarded. The bucket starts at 10 tokens for new connections and refills lazily up to 1000 at processing time.
+
+#### Addr relay
+
+When receiving an addr message with 10 or fewer entries from a peer we did NOT send a getaddr to, recently-active entries are relayed to 2 other connected outgoing peers. Addr responses triggered by our own getaddr are full dumps, not organic gossip, so they are excluded from relay to prevent amplification.
+
+Peer selection is deterministic: each candidate peer is scored using `SipHash-1-3(relay_key, addr_hash, time_bucket_24h, peer_hash)`. The top 2 peers by score are chosen. This ensures the same address goes to the same peers within a 24-hour window, preventing amplification.
+
+Each peer maintains an `addr_known` set. Addresses already in the set are not sent again. The set is cleared when the 24-hour time bucket rotates, bounding memory usage.
+
+#### Self-announcement
+
+Every 6 hours, Ironcat announces its own address to all connected peers, but only if:
+
+- At least 1 incoming peer is connected (proves our port is publicly reachable)
+- At least 3 peers agree on our external IP with > 50% of total votes (consensus from `addr_recv` in version messages, applied only after verack; non-routable IPs are rejected)
+
 ### alert
 
 Ignored. Legacy Bitcoin alert system, deprecated.
@@ -148,12 +174,11 @@ Ignored. Legacy Bitcoin alert system, deprecated.
 
 ```
 Us              Peer
-|-- version -->  |
-|               |-- version -->|
-|<-- version --|
-|-- verack -->  |
-|<-- verack --|
-|-- getaddr --> |
+|-- version  -->  |
+|<-- version  --|
+|-- verack   -->  |
+|<-- verack   --|
+|-- getaddr  --> |
 ```
 
 1. We connect and immediately send our version
@@ -167,11 +192,11 @@ Us              Peer
 
 ```
 Peer            Us
-|-- version -->  |
-|<-- version --|
-|<-- verack  --|
-|-- verack -->  |
-|<-- getaddr --|
+|-- version  -->  |
+|<-- version  --|
+|<-- verack   --|
+|-- verack   -->  |
+|<-- getaddr  --|
 ```
 
 1. Peer connects and sends their version
@@ -185,6 +210,7 @@ Peer            Us
 - Self-connections (matching nonce) trigger a ban
 - The `version_received` flag tracks whether we got a version from the peer, independent of the version number itself
 - On reconnect, `version_received` is reset to false
+- Receiving verack before version is a protocol violation and triggers a ban
 
 ## Node State Machine
 
@@ -213,6 +239,7 @@ Dead --> Connecting (revived by fresh addr timestamp)
 |-----------|---------|
 | Stuck in Connecting | 300s, then scheduled for retry |
 | Stuck in Handshaking | 60s, then scheduled for retry |
+| Idle connection | 360s (2x ping interval), then disconnected |
 | Reaper scan interval | 30s |
 
 ### Retry logic
@@ -228,15 +255,19 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 
 | Reason | Trigger |
 |--------|---------|
-| ProtocolViolation | Duplicate version message, self-connection |
-| Misbehavior | Malformed ping (non-zero, non-8 byte payload) |
+| ProtocolViolation | Duplicate version message, self-connection, verack before version |
+| Misbehavior | Malformed ping (non-zero, non-8 byte payload), negative start_height |
 
 ## Connection Details
 
 - TCP listener binds to `0.0.0.0:9933`
-- Reader uses `BufReader` with 8192-byte capacity
-- Read buffer: 4096 bytes per read call
+- Incoming accept rate limited to 50 connections per second
+- Maximum 125 concurrent incoming connections
+- Read buffer: 8192 bytes per read call, passed directly to `NetworkQueue` for message parsing
 - Writer is `Arc<Mutex<OwnedWriteHalf>>` for concurrent access
 - Max tracked nodes: 5000
-- Incoming connections are keyed by their ephemeral port (cannot be retried)
+- Nodes are keyed by IP address (one connection per IP, both inbound and outbound, for sybil/eclipse defense)
+- Incoming connections that arrive for an IP already active (connecting, handshaking, or connected) are rejected
+- Incoming connections can replace disconnected or dead nodes at the same IP, resetting state to Handshaking
+- If a disconnected or dead node receives an addr update with a different port, the stored port is updated silently for the next reconnection attempt
 - `DashMap` locks are never held across await points (version handler uses 3-phase lock pattern)

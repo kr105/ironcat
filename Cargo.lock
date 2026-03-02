@@ -634,6 +634,7 @@ dependencies = [
  "rand",
  "ratatui",
  "sha2",
+ "siphasher",
  "tokio",
  "tracing",
  "tracing-subscriber",

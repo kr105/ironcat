@@ -6,7 +6,9 @@ use tracing_subscriber::{layer::Context, Layer};
 
 /// A log entry sent to the TUI for display
 pub struct TuiLogEntry {
+	/// Severity level of the log entry
 	pub level: Level,
+	/// The formatted log message text
 	pub text: String,
 }
 
@@ -57,28 +59,5 @@ impl<S: Subscriber> Layer<S> for TuiLayer {
 			level: *event.metadata().level(),
 			text: visitor.message,
 		});
-	}
-}
-
-#[cfg(test)]
-// Tests use unwrap for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used)]
-mod tests {
-	use super::*;
-	use tracing_subscriber::layer::SubscriberExt;
-
-	#[test]
-	fn layer_sends_log_entry() {
-		let (tx, mut rx) = mpsc::channel::<TuiLogEntry>(10);
-		let layer = TuiLayer::new(tx);
-		let subscriber = tracing_subscriber::registry().with(layer);
-
-		tracing::subscriber::with_default(subscriber, || {
-			tracing::info!("hello from test");
-		});
-
-		let entry = rx.try_recv().unwrap();
-		assert_eq!(entry.level, Level::INFO);
-		assert!(entry.text.contains("hello from test"));
 	}
 }

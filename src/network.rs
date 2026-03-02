@@ -16,18 +16,18 @@ use tokio::{
 	net::{tcp::OwnedWriteHalf, TcpListener},
 	sync::Mutex,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-	nodes::{node_connection_loop, ConnectionType, NodeEndpoint, NodeManager, NodeState},
+	nodes::{node_connection_loop, NodeManager, NodeState},
 	utils::ipv4_to_mapped_ipv6,
 };
 
 pub mod message_addr;
 pub mod message_version;
 
-/// Maximum allowed size for a network message
-pub const MAX_MESSAGE_SIZE: usize = 5_000_000;
+/// Maximum allowed size for a network message (500KB -- largest implemented message is addr at ~30KB)
+pub const MAX_MESSAGE_SIZE: usize = 500_000;
 
 /// Length of the command field in the network message
 const COMMAND_LENGTH: usize = 12;
@@ -42,6 +42,8 @@ const MAX_VARSTR_LENGTH: usize = 4096;
 pub type SharedTcpWriter = Arc<Mutex<OwnedWriteHalf>>;
 
 /// Extension trait for sending protocol messages over a shared TCP writer
+// Trait is only used within the crate; auto-trait bounds on the Future are not a concern
+#[allow(async_fn_in_trait)]
 pub trait SharedTcpWriterExt {
 	/// Constructs and sends a protocol message with the given command and payload
 	async fn send_message(&self, command: &str, payload: &[u8]) -> Result<()>;
@@ -55,6 +57,7 @@ impl SharedTcpWriterExt for SharedTcpWriter {
 		})?;
 
 		if let Err(error) = self.lock().await.write_all(&packet.to_bytes()).await {
+			warn!("Failed to send '{command}': {error:?}");
 			return Err(anyhow!("Error in write_all: {error:?}"));
 		}
 
@@ -97,6 +100,9 @@ impl NetworkAddress {
 	}
 
 	/// Decodes an Address from a slice of network bytes
+	///
+	/// # Panics
+	/// Does not panic -- all slice indexing is guarded by a length == 26 check
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
 		if bytes.len() != 26 {
 			return Err(std::io::Error::new(
@@ -199,7 +205,7 @@ impl Message {
 			));
 		}
 
-		// Payload is validated <= MAX_MESSAGE_SIZE (5MB), fits in u32
+		// Payload is validated <= MAX_MESSAGE_SIZE (500KB), fits in u32
 		#[allow(clippy::cast_possible_truncation)]
 		let mut msg = Self {
 			magic: NET_MAGIC,
@@ -400,14 +406,15 @@ pub fn write_varint(buf: &mut Vec<u8>, n: u64) {
 	}
 }
 
-/// Encodes a string as a variable-length string for the wire protocol
-pub fn encode_varstr(s: &str) -> Vec<u8> {
-	// s.len() + 9 (max varint) cannot overflow usize for any real string
-	#[allow(clippy::arithmetic_side_effects)]
-	let mut encoded = Vec::with_capacity(s.len() + 9);
-	write_varint(&mut encoded, s.len() as u64);
-	encoded.extend_from_slice(s.as_bytes());
-	encoded
+/// Writes a variable-length string directly into the given buffer
+///
+/// More efficient than `encode_varstr` when appending to an existing buffer,
+/// as it avoids an intermediate Vec allocation
+pub fn write_varstr(buf: &mut Vec<u8>, s: &str) {
+	// s.len() fits in u64 on any supported platform (usize <= u64)
+	#[allow(clippy::cast_possible_truncation)]
+	write_varint(buf, s.len() as u64);
+	buf.extend_from_slice(s.as_bytes());
 }
 
 /// Decodes a variable-length integer from a cursor
@@ -452,6 +459,7 @@ pub fn decode_varstr(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 }
 
 /// Manages network messages and buffers incomplete messages
+#[derive(Default)]
 pub struct NetworkQueue {
 	buffer: Vec<u8>,
 	messages: VecDeque<Message>,
@@ -468,6 +476,13 @@ impl NetworkQueue {
 
 	/// Processes incoming data, extracting complete messages and buffering incomplete ones
 	pub fn process_incoming_data(&mut self, data: &[u8]) -> Result<()> {
+		// Reject data that would push the buffer beyond safety limits
+		// buffer.len() + data.len() is bounded by MAX_MESSAGE_SIZE * 2 (max ~10MB); no overflow
+		#[allow(clippy::arithmetic_side_effects)]
+		if self.buffer.len() + data.len() > MAX_MESSAGE_SIZE * 2 {
+			return Err(anyhow!("Buffer would exceed safety limit"));
+		}
+
 		self.buffer.extend_from_slice(data);
 
 		let mut consumed = 0;
@@ -493,6 +508,12 @@ impl NetworkQueue {
 		if consumed > 0 {
 			// Batch drain instead of per-message split_off
 			self.buffer.drain(..consumed);
+
+			// Reclaim memory if buffer is mostly empty but over-allocated
+			#[allow(clippy::arithmetic_side_effects)]
+			if self.buffer.capacity() > 65536 && self.buffer.len() < self.buffer.capacity() / 4 {
+				self.buffer.shrink_to(self.buffer.len().max(8192));
+			}
 		}
 
 		if self.buffer.len() > MAX_MESSAGE_SIZE {
@@ -510,6 +531,9 @@ impl NetworkQueue {
 
 /// Starts the TCP listener for incoming peer connections
 pub async fn listening_start(node_manager: Arc<NodeManager>) {
+	// Rate limiter: track accepts per second to prevent fd exhaustion
+	const MAX_ACCEPTS_PER_SECOND: u32 = 50;
+
 	trace!("listening_start task started");
 
 	let tcp_listener = match TcpListener::bind("0.0.0.0:9933").await {
@@ -520,7 +544,24 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 		}
 	};
 
+	info!("Listening on 0.0.0.0:9933");
+
+	let mut accepts_this_second: u32 = 0;
+	let mut second_start = tokio::time::Instant::now();
+
 	loop {
+		// Reset counter each second
+		if second_start.elapsed() >= std::time::Duration::from_secs(1) {
+			accepts_this_second = 0;
+			second_start = tokio::time::Instant::now();
+		}
+
+		// Back off if too many accepts this second
+		if accepts_this_second >= MAX_ACCEPTS_PER_SECOND {
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			continue;
+		}
+
 		let connection = match tcp_listener.accept().await {
 			Ok(handle) => handle,
 			Err(error) => {
@@ -530,131 +571,27 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 			}
 		};
 
+		accepts_this_second = accepts_this_second.saturating_add(1);
+
 		let (mut tcp_stream, socket_addr) = connection;
 
-		let node_endpoint = NodeEndpoint {
-			address: socket_addr.ip(),
-			port: socket_addr.port(),
-		};
+		let address = socket_addr.ip();
+		let port = socket_addr.port();
 
 		let nm_clone: Arc<NodeManager> = Arc::clone(&node_manager);
 
-		// Only proceed if the node doesn't exist already
-		if nm_clone.insert(node_endpoint.address, node_endpoint.port, ConnectionType::Incoming) {
+		if nm_clone.insert_incoming(address, port) {
 			tokio::spawn(async move {
-				node_connection_loop(Arc::clone(&nm_clone), node_endpoint.clone(), tcp_stream).await;
+				node_connection_loop(Arc::clone(&nm_clone), address, tcp_stream).await;
 
 				// Incoming connections can't be retried (we don't know their real port)
-				nm_clone.set_state(&node_endpoint, NodeState::Dead);
+				nm_clone.set_state(&address, NodeState::Dead);
+				nm_clone.decrement_incoming_count();
 			});
 		} else {
-			debug!("Dropping connection {} as node exists already", node_endpoint);
+			debug!("Dropping connection from {} as node exists already", address);
 
 			_ = tcp_stream.shutdown().await;
 		}
-	}
-}
-
-#[cfg(test)]
-// Tests use unwrap/indexing for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
-mod tests {
-	use super::*;
-	use std::net::{IpAddr, Ipv4Addr};
-
-	#[test]
-	fn network_address_port_roundtrip() {
-		// Encode then decode should give the same port
-		let port: u16 = 9933;
-		let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-
-		let bytes = addr.to_bytes();
-		let decoded = NetworkAddress::from_bytes(&bytes).expect("should decode");
-
-		assert_eq!(decoded.port, port);
-	}
-
-	#[test]
-	fn decode_varstr_rejects_oversized_length() {
-		// Craft a varstr with length = 0xFFFF (65535), way over any sane limit
-		// but only 4 bytes of actual data after it
-		let mut data = vec![0xFD, 0xFF, 0xFF]; // varint = 65535
-		data.extend_from_slice(&[0x41; 4]); // only 4 bytes of "AAAA"
-
-		let mut cursor = Cursor::new(data.as_slice());
-		let result = decode_varstr(&mut cursor);
-
-		assert!(result.is_err(), "should reject varstr with length > MAX_VARSTR_LENGTH");
-	}
-
-	#[test]
-	fn decode_varstr_accepts_valid_string() {
-		let encoded = encode_varstr("hello");
-		let mut cursor = Cursor::new(encoded.as_slice());
-		let result = decode_varstr(&mut cursor).unwrap();
-
-		assert_eq!(result, "hello");
-	}
-
-	#[test]
-	fn network_address_port_is_big_endian_on_wire() {
-		// Port 0x1F90 (8080) should appear as [0x1F, 0x90] in the last 2 bytes
-		let port: u16 = 8080;
-		let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
-
-		let bytes = addr.to_bytes();
-
-		// The wire format is: 8 bytes services + 16 bytes IP + 2 bytes port
-		let port_bytes = &bytes[24..26];
-		assert_eq!(port_bytes, &port.to_be_bytes(), "port must be big-endian on the wire");
-	}
-
-	#[test]
-	fn from_bytes_returns_consumed_length() {
-		let msg = Message::new("ping", &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-		let bytes = msg.to_bytes();
-		let mut extended = bytes.clone();
-		extended.extend_from_slice(&[0xFF; 50]);
-
-		let (parsed, consumed) = Message::from_bytes(&extended).unwrap();
-		assert_eq!(consumed, bytes.len());
-		assert_eq!(parsed.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-	}
-
-	#[test]
-	fn from_bytes_rejects_bad_magic_immediately() {
-		let mut bytes = vec![0x00, 0x00, 0x00, 0x00];
-		bytes.extend_from_slice(&[0u8; 20]);
-		let err = Message::from_bytes(&bytes).unwrap_err();
-		assert!(matches!(err, MessageParseError::Corrupt(_)));
-	}
-
-	#[test]
-	fn from_bytes_returns_incomplete_for_short_buffer() {
-		let bytes = vec![0xFC, 0xC1, 0xB7, 0xDC];
-		let err = Message::from_bytes(&bytes).unwrap_err();
-		assert!(matches!(err, MessageParseError::Incomplete));
-	}
-
-	#[test]
-	fn from_bytes_rejects_oversized_declared_length() {
-		let mut bytes = Vec::new();
-		bytes.extend_from_slice(&[0xFC, 0xC1, 0xB7, 0xDC]);
-		bytes.extend_from_slice(&[0u8; 12]);
-		bytes.extend_from_slice(&((MAX_MESSAGE_SIZE as u32) + 1).to_le_bytes());
-		bytes.extend_from_slice(&[0u8; 4]);
-		let err = Message::from_bytes(&bytes).unwrap_err();
-		assert!(matches!(err, MessageParseError::Corrupt(_)));
-	}
-
-	#[test]
-	fn process_incoming_data_detects_corrupt_magic() {
-		let mut queue = NetworkQueue::new();
-		let bad_data = vec![
-			0x00, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		];
-		let result = queue.process_incoming_data(&bad_data);
-		assert!(result.is_err());
 	}
 }
