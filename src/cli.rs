@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// ironcat - Catcoin network client
 #[derive(Parser, Debug)]
@@ -18,4 +19,12 @@ pub struct Args {
 	/// Disable DNS seed discovery
 	#[arg(long)]
 	pub no_dns_seed: bool,
+
+	/// Data directory for persistent storage
+	#[arg(long, default_value_os_t = default_datadir())]
+	pub datadir: PathBuf,
+}
+
+fn default_datadir() -> PathBuf {
+	dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".ironcat")
 }

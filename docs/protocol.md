@@ -258,6 +258,10 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 | ProtocolViolation | Duplicate version message, self-connection, verack before version |
 | Misbehavior | Malformed ping (non-zero, non-8 byte payload), negative start_height |
 
+### Ban duration
+
+All bans expire after 24 hours (86,400 seconds). On startup, expired bans are filtered out. Peer and ban state is persisted to `peers.dat` and `banlist.dat` in the data directory (`~/.ironcat/` by default, configurable via `--datadir`).
+
 ## Connection Details
 
 - TCP listener binds to `0.0.0.0:9933`
