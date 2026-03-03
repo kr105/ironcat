@@ -13,7 +13,7 @@ use ironcat::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
 			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
 			.init();
 
-		info!("ironcat v0.0.6 - Starting in daemon mode");
+		info!("ironcat v{} - Starting in daemon mode", env!("CARGO_PKG_VERSION"));
 		run_core(None, &args).await
 	} else {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
-		info!("ironcat v0.0.6 - Starting ...");
+		info!("ironcat v{} - Starting ...", env!("CARGO_PKG_VERSION"));
 		run_core(Some(log_rx), &args).await
 	}
 }
@@ -76,7 +76,12 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 
 	// Spawn listener
 	let nm = Arc::clone(&node_manager);
-	let listener_handle = tokio::spawn(listening_start(nm));
+	let listen_port = args.port;
+	let listener_handle = tokio::spawn(async move {
+		if let Err(e) = listening_start(nm, listen_port).await {
+			error!("Listener failed: {e:#}");
+		}
+	});
 
 	// Spawn reaper for reconnection
 	let nm = Arc::clone(&node_manager);

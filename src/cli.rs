@@ -12,6 +12,10 @@ pub struct Args {
 	#[arg(long)]
 	pub daemon: bool,
 
+	/// Port to listen on for incoming P2P connections
+	#[arg(long, default_value_t = 9933)]
+	pub port: u16,
+
 	/// Seed node address to connect to on startup
 	#[arg(long, default_value = "161.129.176.92:9933")]
 	pub seed: SocketAddr,

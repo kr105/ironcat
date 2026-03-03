@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Tests use unwrap for brevity since panics are the intended failure mode
-#![allow(clippy::unwrap_used)]
+// Tests use unwrap/expect for brevity since panics are the intended failure mode
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -18,7 +18,7 @@ fn build_version_payload(services_bits: u64) -> Vec<u8> {
 	// timestamp (i64 LE)
 	bytes.extend_from_slice(&1_000_000i64.to_le_bytes());
 	// addr_recv: 26 bytes (services u64 LE + 16 bytes IPv6 + 2 bytes port BE)
-	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9933);
+	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9933);
 	bytes.extend_from_slice(&addr.to_bytes());
 	// addr_from: 26 zero bytes (ignored)
 	bytes.extend_from_slice(&[0u8; 26]);
@@ -85,4 +85,19 @@ fn from_bytes_with_relay_false() {
 	payload.push(0x00);
 	let msg = MessageVersion::from_bytes(&payload).unwrap();
 	assert!(!msg.relay);
+}
+
+#[test]
+fn new_reports_zero_start_height() {
+	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
+	let msg = MessageVersion::new(addr, 42);
+	assert_eq!(msg.start_height, 0, "should report honest 0 height");
+}
+
+#[test]
+fn new_uses_cargo_version_in_user_agent() {
+	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
+	let msg = MessageVersion::new(addr, 42);
+	let expected = format!("/Ironcat:{}/", env!("CARGO_PKG_VERSION"));
+	assert_eq!(msg.user_agent, expected);
 }

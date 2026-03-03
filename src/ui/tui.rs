@@ -15,6 +15,9 @@ use tracing::Level;
 
 use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
 
+/// Interval between stats-driven redraws when no log events arrive
+const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Initializes and runs the TUI application
 ///
 /// Takes ownership of both arguments because this runs via `spawn_blocking`
@@ -34,34 +37,60 @@ pub fn tui_start(node_manager: Arc<NodeManager>, log_receiver: mpsc::Receiver<Tu
 }
 
 /// Main TUI application loop
+///
+/// Only redraws when new log messages arrive, a key is pressed,
+/// or the stats refresh interval elapses
 fn run(
 	mut terminal: DefaultTerminal,
 	node_manager: &Arc<NodeManager>,
 	mut log_receiver: mpsc::Receiver<TuiLogEntry>,
 ) -> Result<()> {
 	let mut log_buffer = VecDeque::new();
+	let mut last_draw = std::time::Instant::now();
+
+	// Initial draw so the screen isn't blank
+	terminal.draw(|f| draw(f, node_manager, &log_buffer))?;
 
 	loop {
-		// Process new log messages
+		let mut needs_redraw = false;
+
+		// Drain all pending log messages
 		while let Ok(log_message) = log_receiver.try_recv() {
 			log_buffer.push_back(log_message);
 			if log_buffer.len() > 100 {
 				log_buffer.pop_front();
 			}
+			needs_redraw = true;
 		}
 
-		let node_manager_clone = Arc::clone(node_manager);
-		terminal.draw(|f| draw(f, &node_manager_clone, &log_buffer))?;
+		// Periodic redraw for node stats changes
+		if last_draw.elapsed() >= STATS_REFRESH_INTERVAL {
+			needs_redraw = true;
+		}
 
-		if should_quit()? {
-			break;
+		if needs_redraw {
+			terminal.draw(|f| draw(f, node_manager, &log_buffer))?;
+			last_draw = std::time::Instant::now();
+		}
+
+		// Block on keyboard events; use shorter timeout if we expect more logs soon
+		let time_to_refresh = STATS_REFRESH_INTERVAL.saturating_sub(last_draw.elapsed());
+		let poll_timeout = time_to_refresh.min(Duration::from_millis(500));
+
+		if event::poll(poll_timeout).context("event poll failed")? {
+			if let Event::Key(key) = event::read().context("event read failed")? {
+				if key.code == KeyCode::Char('q') {
+					break;
+				}
+			}
+			// Any key event triggers a redraw on next iteration
 		}
 	}
 	Ok(())
 }
 
 /// Renders the TUI layout and content
-fn draw(frame: &mut Frame, node_manager: &Arc<NodeManager>, log_buffer: &VecDeque<TuiLogEntry>) {
+fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<TuiLogEntry>) {
 	// Layout returns exactly the number of constraints provided (2)
 	let layout = Layout::default()
 		.direction(Direction::Horizontal)
@@ -175,14 +204,4 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
 	// chunks has 2 elements from the 2 constraints above
 	#[allow(clippy::indexing_slicing)]
 	frame.render_widget(table, chunks[1]);
-}
-
-/// Checks if the user has requested to quit the application
-fn should_quit() -> Result<bool> {
-	if event::poll(Duration::from_millis(250)).context("event poll failed")? {
-		if let Event::Key(key) = event::read().context("event read failed")? {
-			return Ok(KeyCode::Char('q') == key.code);
-		}
-	}
-	Ok(false)
 }

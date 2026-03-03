@@ -6,11 +6,10 @@ use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
-const USER_AGENT: &str = "/Ironcat:0.0.6/";
 const PROTOCOL_VERSION: u32 = 70003;
 
-/// Placeholder start height until actual chain state is available
-const DEFAULT_START_HEIGHT: i32 = 300_000;
+/// Reports 0 until actual chain state is available (honest: we don't have blocks)
+const DEFAULT_START_HEIGHT: i32 = 0;
 
 /// Represents a version message in the Catcoin protocol
 #[derive(Debug)]
@@ -51,7 +50,7 @@ impl MessageVersion {
 			timestamp,
 			addr_recv,
 			nonce,
-			user_agent: USER_AGENT.to_string(),
+			user_agent: format!("/Ironcat:{}/", env!("CARGO_PKG_VERSION")),
 			start_height: DEFAULT_START_HEIGHT,
 			relay: true,
 		}

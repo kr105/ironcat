@@ -54,3 +54,15 @@ fn custom_datadir() {
 	let args = Args::parse_from(["ironcat", "--datadir", "/tmp/test-ironcat"]);
 	assert_eq!(args.datadir, std::path::PathBuf::from("/tmp/test-ironcat"));
 }
+
+#[test]
+fn default_port() {
+	let args = Args::parse_from(["ironcat"]);
+	assert_eq!(args.port, 9933);
+}
+
+#[test]
+fn custom_port() {
+	let args = Args::parse_from(["ironcat", "--port", "8080"]);
+	assert_eq!(args.port, 8080);
+}

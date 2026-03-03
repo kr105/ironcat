@@ -99,6 +99,9 @@ const MAX_ADDR_KNOWN: usize = 5000;
 /// Maximum concurrent incoming connections
 const MAX_INCOMING_CONNECTIONS: usize = 125;
 
+/// Cooldown period before the same IP can make a new incoming connection
+const INCOMING_IP_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// How long a ban lasts in seconds (24 hours)
 const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
 
@@ -350,6 +353,9 @@ pub struct Node {
 
 	/// IP voted by this peer in their version message, applied on verack
 	pub pending_external_ip: Option<IpAddr>,
+
+	/// Nonce of the last ping we sent to this peer, for pong validation
+	pub last_ping_nonce: Option<u64>,
 }
 
 impl Node {
@@ -374,7 +380,21 @@ impl Node {
 			sent_getaddr: false,
 			last_getaddr_response: None,
 			pending_external_ip: None,
+			last_ping_nonce: None,
 		}
+	}
+}
+
+/// RAII guard that decrements the incoming connection counter on drop
+///
+/// Ensures the counter is always decremented even if the task panics
+pub struct IncomingGuard {
+	counter: Arc<AtomicUsize>,
+}
+
+impl Drop for IncomingGuard {
+	fn drop(&mut self) {
+		self.counter.fetch_sub(1, Ordering::Release);
 	}
 }
 
@@ -397,7 +417,10 @@ pub struct NodeManager {
 	external_ip_votes: DashMap<IpAddr, u32>,
 
 	/// Number of currently active incoming connections
-	incoming_count: AtomicUsize,
+	incoming_count: Arc<AtomicUsize>,
+
+	/// Per-IP cooldown for incoming connections to prevent reconnect spam
+	incoming_cooldowns: DashMap<IpAddr, Instant>,
 }
 
 impl Default for NodeManager {
@@ -415,7 +438,8 @@ impl NodeManager {
 			my_nonce: rng.next_u64(),
 			relay_key: rng.next_u64(),
 			external_ip_votes: DashMap::new(),
-			incoming_count: AtomicUsize::new(0),
+			incoming_count: Arc::new(AtomicUsize::new(0)),
+			incoming_cooldowns: DashMap::new(),
 		}
 	}
 
@@ -429,39 +453,36 @@ impl NodeManager {
 
 	/// Inserts or reactivates a node for an incoming connection
 	///
-	/// If the node exists and is Disconnected or Dead, resets it to Handshaking
-	/// If the node exists and is active, returns false (reject the connection)
-	/// If the node doesn't exist, inserts it in Handshaking state
-	/// Returns true if the node is ready to accept the incoming connection
-	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> bool {
-		if self.incoming_count.load(Ordering::Relaxed) >= MAX_INCOMING_CONNECTIONS {
+	/// If the node exists and is Disconnected or Dead, resets it to Handshaking.
+	/// If the node exists and is active, returns None (reject the connection).
+	/// If the node doesn't exist, inserts it in Handshaking state.
+	/// Returns an `IncomingGuard` that auto-decrements the counter on drop
+	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> Option<IncomingGuard> {
+		if self.incoming_count.load(Ordering::Acquire) >= MAX_INCOMING_CONNECTIONS {
 			debug!(
 				"Incoming connection limit reached ({}), rejecting {}:{}",
 				MAX_INCOMING_CONNECTIONS, address, port
 			);
-			return false;
+			return None;
+		}
+
+		// Per-IP cooldown: reject if this IP connected too recently
+		if let Some(last) = self.incoming_cooldowns.get(&address) {
+			if last.elapsed() < INCOMING_IP_COOLDOWN {
+				debug!("Rejecting {}:{} (per-IP cooldown)", address, port);
+				return None;
+			}
 		}
 
 		if self.try_insert_or_reactivate(address, port, ConnectionType::Incoming, true) {
-			self.incoming_count.fetch_add(1, Ordering::Relaxed);
-			true
+			self.incoming_count.fetch_add(1, Ordering::Release);
+			self.incoming_cooldowns.insert(address, Instant::now());
+			Some(IncomingGuard {
+				counter: Arc::clone(&self.incoming_count),
+			})
 		} else {
-			false
+			None
 		}
-	}
-
-	/// Decrements the incoming connection counter
-	pub fn decrement_incoming_count(&self) {
-		// Saturating semantics via fetch_update to prevent underflow
-		let _ = self
-			.incoming_count
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-				if v > 0 {
-					Some(v.saturating_sub(1))
-				} else {
-					None
-				}
-			});
 	}
 
 	/// Shared insert/reactivate logic for both outgoing and incoming nodes
@@ -532,8 +553,10 @@ impl NodeManager {
 		}
 	}
 
-	/// Checks if the node is appropriate to try a connection
-	pub fn is_candidate(&self, address: &IpAddr) -> bool {
+	/// Checks if the node is in a state where a connection attempt should proceed
+	///
+	/// Returns true for Connecting (we just set this state) or Disconnected with elapsed backoff
+	pub fn should_attempt_connection(&self, address: &IpAddr) -> bool {
 		if let Some(node) = self.nodes.get(address) {
 			return matches!(node.state, NodeState::Connecting { .. }) || node.state.is_connectable();
 		}
@@ -541,23 +564,25 @@ impl NodeManager {
 		false
 	}
 
-	/// Sends a ping message to a connected node
+	/// Sends a ping message to a connected node and stores the nonce for pong validation
 	pub async fn send_ping(&self, address: &IpAddr) {
-		let tcp_writer = if let Some(node) = self.nodes.get(address) {
-			if let NodeState::Connected { ref writer } = node.state {
+		let nonce = rand::thread_rng().next_u64();
+
+		let tcp_writer = if let Some(mut node) = self.nodes.get_mut(address) {
+			let writer = if let NodeState::Connected { ref writer } = node.state {
 				Arc::clone(writer)
 			} else {
 				debug!("Skipping ping to {}, not connected", address);
 				return;
-			}
+			};
+			node.last_ping_nonce = Some(nonce);
+			writer
 		} else {
 			debug!("Skipping ping to {}, node not found", address);
 			return;
 		};
 
 		debug!("Sending ping to {}", address);
-
-		let nonce = rand::thread_rng().next_u64();
 
 		if let Err(e) = tcp_writer.send_message("ping", &nonce.to_le_bytes()).await {
 			warn!("Failed to send ping to {}: {}", address, e);
@@ -690,6 +715,19 @@ impl NodeManager {
 					}
 				}
 			}
+
+			// Evict external IP votes from peers that are no longer connected
+			let connected_ips: HashSet<IpAddr> = self
+				.nodes
+				.iter()
+				.filter(|e| e.value().state.is_connected())
+				.map(|e| *e.key())
+				.collect();
+			self.external_ip_votes.retain(|ip, _| connected_ips.contains(ip));
+
+			// Purge stale per-IP incoming cooldowns (older than 2x the cooldown period)
+			self.incoming_cooldowns
+				.retain(|_, instant| instant.elapsed() < INCOMING_IP_COOLDOWN.saturating_mul(2));
 
 			debug!(
 				"Reaper scan complete: {} total, {} connected, {} disconnected",
@@ -1017,7 +1055,7 @@ fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
 
 /// Handles the connection to a node
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16, attempt: u32) {
-	if !node_manager.is_candidate(&address) {
+	if !node_manager.should_attempt_connection(&address) {
 		trace!(
 			"Avoiding connection to node {}:{} as it is not a good candidate",
 			address,
@@ -1221,7 +1259,7 @@ async fn parse_incoming_message(
 		NetworkCommand::Verack => handle_verack(node_manager, address, tcp_writer).await,
 		NetworkCommand::Ping => handle_ping(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
-			handle_pong(address);
+			handle_pong(node_manager, address, &message.payload);
 			Ok(())
 		}
 		NetworkCommand::Addr => handle_addr(node_manager, address, &message.payload).await,
@@ -1317,11 +1355,19 @@ async fn handle_version(
 	}
 
 	// Phase 3: Re-acquire lock to write fields
+	// Verify state hasn't changed between phases (another task could have banned the node)
 	{
 		let mut node = node_manager
 			.nodes
 			.get_mut(address)
 			.ok_or_else(|| anyhow!("node {address} disappeared from manager during version handling"))?;
+
+		if !matches!(node.state, NodeState::Handshaking { .. }) {
+			return Err(anyhow!(
+				"node {address} state changed during version handling (now {})",
+				node.state
+			));
+		}
 
 		node.services = version.services;
 		node.timestamp = version.timestamp;
@@ -1427,19 +1473,51 @@ async fn handle_ping(
 
 /// Handles an incoming pong message from a peer
 ///
-/// Currently logs receipt only; nonce validation is not implemented
-fn handle_pong(address: &IpAddr) {
-	debug!("Received pong from {}", address);
+/// Validates that the nonce matches the last ping we sent
+fn handle_pong(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) {
+	if payload.len() != 8 {
+		warn!(
+			"Received malformed pong from {} ({} bytes, expected 8)",
+			address,
+			payload.len()
+		);
+		return;
+	}
+
+	let Ok(nonce) = vec_to_u64_le(payload) else {
+		warn!("Failed to parse pong nonce from {}", address);
+		return;
+	};
+
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		match node.last_ping_nonce.take() {
+			Some(expected) if expected == nonce => {
+				debug!("Valid pong from {}", address);
+			}
+			Some(expected) => {
+				warn!(
+					"Pong nonce mismatch from {}: expected {}, got {}",
+					address, expected, nonce
+				);
+			}
+			None => {
+				debug!("Received unsolicited pong from {}", address);
+			}
+		}
+	}
 }
 
 /// Strips non-printable and non-ASCII characters from a user agent string
 ///
-/// Prevents terminal escape sequence injection via malicious user agents
+/// Prevents terminal escape sequence injection via malicious user agents.
+/// Trims leading/trailing whitespace to prevent display confusion
 fn sanitize_user_agent(s: &str) -> String {
 	s.chars()
 		.filter(|c| c.is_ascii_graphic() || *c == ' ')
 		.take(MAX_USER_AGENT_DISPLAY)
-		.collect()
+		.collect::<String>()
+		.trim()
+		.to_string()
 }
 
 /// Computes a deterministic score for relay peer selection
@@ -1741,8 +1819,9 @@ async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_w
 }
 
 #[cfg(test)]
-// Tests use unwrap for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used)]
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode.
+// DashMap guard drop order doesn't matter in synchronous test functions
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
 mod tests {
 	use super::*;
 
@@ -2092,7 +2171,7 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -2114,7 +2193,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -2133,7 +2212,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -2149,7 +2228,7 @@ mod tests {
 
 		// Node starts in Connecting -- should reject incoming
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result);
+		assert!(result.is_none());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 9933);
@@ -2191,7 +2270,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result, "should reject incoming for banned node");
+		assert!(result.is_none(), "should reject incoming for banned node");
 	}
 
 	#[tokio::test]
@@ -2235,7 +2314,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result, "should reject incoming when node is connected");
+		assert!(result.is_none(), "should reject incoming when node is connected");
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 9933, "port should not change");
@@ -2366,5 +2445,99 @@ mod tests {
 
 		let db = nm.collect_bans_for_save();
 		assert!(db.bans.is_empty(), "expired bans should not be saved");
+	}
+
+	#[test]
+	fn sanitize_user_agent_strips_control_chars() {
+		assert_eq!(sanitize_user_agent("/Satoshi:0.1/"), "/Satoshi:0.1/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_strips_non_ascii() {
+		assert_eq!(sanitize_user_agent("/Test\x1b[31m:evil/"), "/Test[31m:evil/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_trims_whitespace() {
+		assert_eq!(sanitize_user_agent("  /Satoshi:0.1/  "), "/Satoshi:0.1/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_all_spaces_becomes_empty() {
+		assert_eq!(sanitize_user_agent("       "), "");
+	}
+
+	#[test]
+	fn sanitize_user_agent_truncates_long_input() {
+		let long = "A".repeat(300);
+		let result = sanitize_user_agent(&long);
+		assert_eq!(result.len(), MAX_USER_AGENT_DISPLAY);
+	}
+
+	#[test]
+	fn load_saved_peers_skips_unknown_version() {
+		let nm = Arc::new(NodeManager::new());
+		let db = crate::storage::peers::PeerDb {
+			version: 999,
+			peers: vec![crate::storage::peers::SavedPeer {
+				ip: "1.2.3.4".parse().unwrap(),
+				port: 9933,
+				services: 0,
+				last_seen: 0,
+				user_agent: String::new(),
+				height: 0,
+			}],
+		};
+		nm.load_saved_peers(&db);
+		assert!(nm.nodes.is_empty(), "should skip peers with unknown version");
+	}
+
+	#[test]
+	fn load_saved_bans_skips_unknown_version() {
+		let nm = NodeManager::new();
+		let db = crate::storage::bans::BanDb {
+			version: 999,
+			bans: vec![crate::storage::bans::SavedBan {
+				ip: "1.2.3.4".parse().unwrap(),
+				reason: "test".to_string(),
+				created: 0,
+				expires: u64::MAX,
+			}],
+		};
+		nm.load_saved_bans(&db);
+		assert!(nm.nodes.is_empty(), "should skip bans with unknown version");
+	}
+
+	#[test]
+	fn incoming_cooldown_rejects_rapid_reconnect() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		// First connection should succeed
+		let guard = nm.insert_incoming(ip, 54321);
+		assert!(guard.is_some());
+		drop(guard);
+
+		// Make the node Dead so it's eligible again
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Dead;
+		}
+
+		// Second connection within cooldown should be rejected
+		let guard2 = nm.insert_incoming(ip, 54322);
+		assert!(guard2.is_none(), "should reject per-IP cooldown");
+	}
+
+	#[test]
+	fn incoming_guard_decrements_on_drop() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		let guard = nm.insert_incoming(ip, 54321);
+		assert!(guard.is_some());
+		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 1);
+
+		drop(guard);
+		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 0);
 	}
 }
