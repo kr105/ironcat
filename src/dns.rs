@@ -99,7 +99,7 @@ mod tests {
 	fn dns_seeds_are_hostnames_not_ips() {
 		for seed in DNS_SEEDS {
 			assert!(
-				seed.chars().any(|c| c.is_alphabetic()),
+				seed.chars().any(char::is_alphabetic),
 				"seed '{seed}' does not look like a hostname"
 			);
 		}

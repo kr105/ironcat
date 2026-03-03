@@ -16,7 +16,7 @@ use tokio::{
 	net::{tcp::OwnedWriteHalf, TcpListener},
 	sync::Mutex,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
 	nodes::{node_connection_loop, NodeManager, NodeState},
@@ -418,22 +418,33 @@ pub fn write_varstr(buf: &mut Vec<u8>, s: &str) {
 }
 
 /// Decodes a variable-length integer from a cursor
+///
+/// Rejects non-canonical encodings (e.g. using 0xFD prefix for values < 0xFD)
 pub fn decode_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 	let first_byte: u8 = cursor.read_u8()?;
 
 	match first_byte {
 		0xFD => {
 			let uint16 = cursor.read_u16::<LittleEndian>()?;
+			if uint16 < 0xFD {
+				return Err(anyhow!("non-canonical varint: 0xFD prefix for value {uint16}"));
+			}
 			Ok(u64::from(uint16))
 		}
 
 		0xFE => {
 			let uint32 = cursor.read_u32::<LittleEndian>()?;
+			if uint32 <= 0xFFFF {
+				return Err(anyhow!("non-canonical varint: 0xFE prefix for value {uint32}"));
+			}
 			Ok(u64::from(uint32))
 		}
 
 		0xFF => {
 			let uint64 = cursor.read_u64::<LittleEndian>()?;
+			if uint64 <= 0xFFFF_FFFF {
+				return Err(anyhow!("non-canonical varint: 0xFF prefix for value {uint64}"));
+			}
 			Ok(uint64)
 		}
 
@@ -530,21 +541,18 @@ impl NetworkQueue {
 }
 
 /// Starts the TCP listener for incoming peer connections
-pub async fn listening_start(node_manager: Arc<NodeManager>) {
+pub async fn listening_start(node_manager: Arc<NodeManager>, port: u16) -> Result<()> {
 	// Rate limiter: track accepts per second to prevent fd exhaustion
 	const MAX_ACCEPTS_PER_SECOND: u32 = 50;
 
 	trace!("listening_start task started");
 
-	let tcp_listener = match TcpListener::bind("0.0.0.0:9933").await {
-		Ok(listener) => listener,
-		Err(error) => {
-			error!("Failed to listen: {:?}", error);
-			return;
-		}
-	};
+	let bind_addr = format!("0.0.0.0:{port}");
+	let tcp_listener = TcpListener::bind(&bind_addr)
+		.await
+		.with_context(|| format!("failed to bind to {bind_addr}"))?;
 
-	info!("Listening on 0.0.0.0:9933");
+	info!("Listening on {}", bind_addr);
 
 	let mut accepts_this_second: u32 = 0;
 	let mut second_start = tokio::time::Instant::now();
@@ -580,13 +588,15 @@ pub async fn listening_start(node_manager: Arc<NodeManager>) {
 
 		let nm_clone: Arc<NodeManager> = Arc::clone(&node_manager);
 
-		if nm_clone.insert_incoming(address, port) {
+		if let Some(guard) = nm_clone.insert_incoming(address, port) {
 			tokio::spawn(async move {
 				node_connection_loop(Arc::clone(&nm_clone), address, tcp_stream).await;
 
 				// Incoming connections can't be retried (we don't know their real port)
 				nm_clone.set_state(&address, NodeState::Dead);
-				nm_clone.decrement_incoming_count();
+
+				// Guard decrements incoming_count on drop, even if we panic above
+				drop(guard);
 			});
 		} else {
 			debug!("Dropping connection from {} as node exists already", address);

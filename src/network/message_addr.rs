@@ -94,9 +94,7 @@ impl MessageAddr {
 
 		for entry in &self.addr_list {
 			bytes.extend_from_slice(&entry.timestamp.to_le_bytes());
-			bytes.extend_from_slice(&entry.address.services.bits().to_le_bytes());
-			bytes.extend_from_slice(&entry.address.address_to_network_bytes());
-			bytes.extend_from_slice(&entry.address.port.to_be_bytes());
+			bytes.extend_from_slice(&entry.address.to_bytes());
 		}
 
 		bytes

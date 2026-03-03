@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use ironcat::{
 	cli::Args,
 	dns,
 	network::listening_start,
 	nodes::NodeManager,
+	storage,
 	tui_layer::{TuiLayer, TuiLogEntry},
 	ui::tui::tui_start,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -27,7 +28,7 @@ async fn main() -> Result<()> {
 			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
 			.init();
 
-		info!("ironcat v0.0.4 - Starting in daemon mode");
+		info!("ironcat v{} - Starting in daemon mode", env!("CARGO_PKG_VERSION"));
 		run_core(None, &args).await
 	} else {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
@@ -35,7 +36,7 @@ async fn main() -> Result<()> {
 
 		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
 
-		info!("ironcat v0.0.4 - Starting ...");
+		info!("ironcat v{} - Starting ...", env!("CARGO_PKG_VERSION"));
 		run_core(Some(log_rx), &args).await
 	}
 }
@@ -43,6 +44,29 @@ async fn main() -> Result<()> {
 /// Core application loop shared between TUI and daemon modes
 async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
 	let node_manager = Arc::new(NodeManager::new());
+
+	// Ensure data directory exists
+	std::fs::create_dir_all(&args.datadir)
+		.with_context(|| format!("failed to create data directory {}", args.datadir.display()))?;
+
+	// Load bans first so banned IPs get rejected when loading peers
+	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
+		info!(count = ban_db.bans.len(), "Loaded banlist.dat");
+		node_manager.load_saved_bans(&ban_db);
+	}
+
+	// Load saved peers
+	let loaded_peers =
+		if let Some(peer_db) = storage::load_file::<storage::peers::PeerDb>(&args.datadir.join("peers.dat")) {
+			let count = peer_db.peers.len();
+			if count > 0 {
+				info!(count, "Loaded peers.dat");
+				node_manager.load_saved_peers(&peer_db);
+			}
+			count
+		} else {
+			0
+		};
 
 	// Spawn TUI if in TUI mode
 	let ui_handle = tui_rx.map(|log_rx| {
@@ -52,7 +76,12 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 
 	// Spawn listener
 	let nm = Arc::clone(&node_manager);
-	let listener_handle = tokio::spawn(listening_start(nm));
+	let listen_port = args.port;
+	let listener_handle = tokio::spawn(async move {
+		if let Err(e) = listening_start(nm, listen_port).await {
+			error!("Listener failed: {e:#}");
+		}
+	});
 
 	// Spawn reaper for reconnection
 	let nm = Arc::clone(&node_manager);
@@ -62,16 +91,40 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let nm = Arc::clone(&node_manager);
 	let announce_handle = tokio::spawn(nm.run_self_announce());
 
-	// Discover peers via DNS seeds
-	if !args.no_dns_seed {
-		let dns_addrs = dns::resolve_dns_seeds().await;
-		for addr in &dns_addrs {
-			node_manager.insert_outgoing(addr.ip(), addr.port());
-		}
-	}
+	// Spawn periodic persistence task
+	let nm = Arc::clone(&node_manager);
+	let datadir = args.datadir.clone();
+	let persistence_handle = tokio::spawn(storage::persistence_task(nm, datadir));
 
-	// Always connect to --seed as fallback
-	node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
+	// Peer discovery: if we have saved peers, try them first and only
+	// fall back to DNS seeds if none connect within 30 seconds
+	if loaded_peers > 0 {
+		let nm = Arc::clone(&node_manager);
+		let seed = args.seed;
+		let no_dns = args.no_dns_seed;
+		tokio::spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+			if nm.connected_count() > 0 {
+				return;
+			}
+			info!("No saved peers connected after 30s, falling back to DNS seeds");
+			if !no_dns {
+				let dns_addrs = dns::resolve_dns_seeds().await;
+				for addr in &dns_addrs {
+					nm.insert_outgoing(addr.ip(), addr.port());
+				}
+			}
+			nm.insert_outgoing(seed.ip(), seed.port());
+		});
+	} else {
+		if !args.no_dns_seed {
+			let dns_addrs = dns::resolve_dns_seeds().await;
+			for addr in &dns_addrs {
+				node_manager.insert_outgoing(addr.ip(), addr.port());
+			}
+		}
+		node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
+	}
 
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
@@ -86,6 +139,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		_ = announce_handle => {
 			info!("Self-announce task ended, shutting down");
 		}
+		_ = persistence_handle => {
+			info!("Persistence task ended, shutting down");
+		}
 		() = async {
 			match ui_handle {
 				Some(handle) => { let _ = handle.await; }
@@ -95,6 +151,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 			info!("UI task ended, shutting down");
 		}
 	}
+
+	// Save state before shutting down
+	storage::save_all(&node_manager, &args.datadir);
 
 	node_manager.graceful_shutdown().await;
 

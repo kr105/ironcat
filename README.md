@@ -9,6 +9,7 @@ cargo run                                    # TUI mode (default)
 cargo run -- --daemon                        # Daemon mode, logs to stderr
 cargo run -- --seed 10.0.0.1:9933            # Custom seed node (default: 161.129.176.92:9933)
 cargo run -- --no-dns-seed                   # Disable DNS peer discovery
+cargo run -- --datadir /path/to/data         # Custom data directory (default: ~/.ironcat)
 RUST_LOG=debug cargo run                     # Control log level
 cargo run -- --help                          # Show help
 ```
@@ -22,6 +23,7 @@ cargo run -- --help                          # Show help
 - Periodic self-announcement when publicly reachable
 - Exponential backoff with jitter for disconnected peers
 - TUI and daemon modes
+- Persistent peer and ban storage across restarts
 
 ## TUI mode
 

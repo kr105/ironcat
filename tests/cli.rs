@@ -41,3 +41,28 @@ fn no_dns_seed_flag() {
 	let args = Args::parse_from(["ironcat", "--no-dns-seed"]);
 	assert!(args.no_dns_seed);
 }
+
+#[test]
+fn default_datadir() {
+	let args = Args::parse_from(["ironcat"]);
+	let expected = dirs::home_dir().unwrap().join(".ironcat");
+	assert_eq!(args.datadir, expected);
+}
+
+#[test]
+fn custom_datadir() {
+	let args = Args::parse_from(["ironcat", "--datadir", "/tmp/test-ironcat"]);
+	assert_eq!(args.datadir, std::path::PathBuf::from("/tmp/test-ironcat"));
+}
+
+#[test]
+fn default_port() {
+	let args = Args::parse_from(["ironcat"]);
+	assert_eq!(args.port, 9933);
+}
+
+#[test]
+fn custom_port() {
+	let args = Args::parse_from(["ironcat", "--port", "8080"]);
+	assert_eq!(args.port, 8080);
+}

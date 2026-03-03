@@ -12,7 +12,7 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 | Max message size | 500,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.4/` |
+| User agent | `/Ironcat:0.0.6/` |
 
 ## Message Framing
 
@@ -86,7 +86,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.4/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.6/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -257,6 +257,10 @@ Exponential backoff: `base * 2^attempt`, capped at 30 minutes, with +/-25% jitte
 |--------|---------|
 | ProtocolViolation | Duplicate version message, self-connection, verack before version |
 | Misbehavior | Malformed ping (non-zero, non-8 byte payload), negative start_height |
+
+### Ban duration
+
+All bans expire after 24 hours (86,400 seconds). On startup, expired bans are filtered out. Peer and ban state is persisted to `peers.dat` and `banlist.dat` in the data directory (`~/.ironcat/` by default, configurable via `--datadir`).
 
 ## Connection Details
 

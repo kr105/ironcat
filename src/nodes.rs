@@ -99,10 +99,16 @@ const MAX_ADDR_KNOWN: usize = 5000;
 /// Maximum concurrent incoming connections
 const MAX_INCOMING_CONNECTIONS: usize = 125;
 
+/// Cooldown period before the same IP can make a new incoming connection
+const INCOMING_IP_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How long a ban lasts in seconds (24 hours)
+const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
+
 /// How long a connection can sit idle before being dropped (2x `PING_INTERVAL`)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
 
-/// Reason why a node was permanently banned
+/// Reason why a node was banned (bans expire after `BAN_DURATION_SECS`)
 #[derive(Debug)]
 pub enum BanReason {
 	/// Sent version twice, self-connection, etc
@@ -120,6 +126,13 @@ impl fmt::Display for BanReason {
 	}
 }
 
+/// Returns the ban expiration timestamp given a creation time
+///
+/// All ban reasons share the same duration (`BAN_DURATION_SECS`)
+pub const fn ban_expires_at(created: u64) -> u64 {
+	created.saturating_add(BAN_DURATION_SECS)
+}
+
 /// Represents the connection state of a node
 #[derive(Debug)]
 pub enum NodeState {
@@ -133,8 +146,12 @@ pub enum NodeState {
 	Disconnected { retry_at: Instant, attempt: u32 },
 	/// Exhausted all retry attempts -- can be revived by a fresh addr message
 	Dead,
-	/// Permanently banned -- never retry
-	Banned { reason: BanReason },
+	/// Banned -- will expire after `BAN_DURATION_SECS`
+	Banned {
+		reason: BanReason,
+		created: u64,
+		expires: u64,
+	},
 }
 
 impl NodeState {
@@ -148,9 +165,12 @@ impl NodeState {
 		matches!(self, Self::Connected { .. })
 	}
 
-	/// Whether this node is permanently banned
-	pub const fn is_banned(&self) -> bool {
-		matches!(self, Self::Banned { .. })
+	/// Whether this node is currently banned (ban may have expired)
+	pub fn is_banned(&self) -> bool {
+		match self {
+			Self::Banned { expires, .. } => crate::utils::unix_now() < *expires,
+			_ => false,
+		}
 	}
 }
 
@@ -162,7 +182,7 @@ impl fmt::Display for NodeState {
 			Self::Connected { .. } => write!(f, "Connected"),
 			Self::Disconnected { attempt, .. } => write!(f, "Disconnected({attempt})"),
 			Self::Dead => write!(f, "Dead"),
-			Self::Banned { reason } => write!(f, "Banned({reason})"),
+			Self::Banned { reason, .. } => write!(f, "Banned({reason})"),
 		}
 	}
 }
@@ -333,6 +353,9 @@ pub struct Node {
 
 	/// IP voted by this peer in their version message, applied on verack
 	pub pending_external_ip: Option<IpAddr>,
+
+	/// Nonce of the last ping we sent to this peer, for pong validation
+	pub last_ping_nonce: Option<u64>,
 }
 
 impl Node {
@@ -357,7 +380,21 @@ impl Node {
 			sent_getaddr: false,
 			last_getaddr_response: None,
 			pending_external_ip: None,
+			last_ping_nonce: None,
 		}
+	}
+}
+
+/// RAII guard that decrements the incoming connection counter on drop
+///
+/// Ensures the counter is always decremented even if the task panics
+pub struct IncomingGuard {
+	counter: Arc<AtomicUsize>,
+}
+
+impl Drop for IncomingGuard {
+	fn drop(&mut self) {
+		self.counter.fetch_sub(1, Ordering::Release);
 	}
 }
 
@@ -380,7 +417,10 @@ pub struct NodeManager {
 	external_ip_votes: DashMap<IpAddr, u32>,
 
 	/// Number of currently active incoming connections
-	incoming_count: AtomicUsize,
+	incoming_count: Arc<AtomicUsize>,
+
+	/// Per-IP cooldown for incoming connections to prevent reconnect spam
+	incoming_cooldowns: DashMap<IpAddr, Instant>,
 }
 
 impl Default for NodeManager {
@@ -398,7 +438,8 @@ impl NodeManager {
 			my_nonce: rng.next_u64(),
 			relay_key: rng.next_u64(),
 			external_ip_votes: DashMap::new(),
-			incoming_count: AtomicUsize::new(0),
+			incoming_count: Arc::new(AtomicUsize::new(0)),
+			incoming_cooldowns: DashMap::new(),
 		}
 	}
 
@@ -412,39 +453,36 @@ impl NodeManager {
 
 	/// Inserts or reactivates a node for an incoming connection
 	///
-	/// If the node exists and is Disconnected or Dead, resets it to Handshaking
-	/// If the node exists and is active, returns false (reject the connection)
-	/// If the node doesn't exist, inserts it in Handshaking state
-	/// Returns true if the node is ready to accept the incoming connection
-	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> bool {
-		if self.incoming_count.load(Ordering::Relaxed) >= MAX_INCOMING_CONNECTIONS {
+	/// If the node exists and is Disconnected or Dead, resets it to Handshaking.
+	/// If the node exists and is active, returns None (reject the connection).
+	/// If the node doesn't exist, inserts it in Handshaking state.
+	/// Returns an `IncomingGuard` that auto-decrements the counter on drop
+	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> Option<IncomingGuard> {
+		if self.incoming_count.load(Ordering::Acquire) >= MAX_INCOMING_CONNECTIONS {
 			debug!(
 				"Incoming connection limit reached ({}), rejecting {}:{}",
 				MAX_INCOMING_CONNECTIONS, address, port
 			);
-			return false;
+			return None;
+		}
+
+		// Per-IP cooldown: reject if this IP connected too recently
+		if let Some(last) = self.incoming_cooldowns.get(&address) {
+			if last.elapsed() < INCOMING_IP_COOLDOWN {
+				debug!("Rejecting {}:{} (per-IP cooldown)", address, port);
+				return None;
+			}
 		}
 
 		if self.try_insert_or_reactivate(address, port, ConnectionType::Incoming, true) {
-			self.incoming_count.fetch_add(1, Ordering::Relaxed);
-			true
+			self.incoming_count.fetch_add(1, Ordering::Release);
+			self.incoming_cooldowns.insert(address, Instant::now());
+			Some(IncomingGuard {
+				counter: Arc::clone(&self.incoming_count),
+			})
 		} else {
-			false
+			None
 		}
-	}
-
-	/// Decrements the incoming connection counter
-	pub fn decrement_incoming_count(&self) {
-		// Saturating semantics via fetch_update to prevent underflow
-		let _ = self
-			.incoming_count
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-				if v > 0 {
-					Some(v.saturating_sub(1))
-				} else {
-					None
-				}
-			});
 	}
 
 	/// Shared insert/reactivate logic for both outgoing and incoming nodes
@@ -515,8 +553,10 @@ impl NodeManager {
 		}
 	}
 
-	/// Checks if the node is appropriate to try a connection
-	pub fn is_candidate(&self, address: &IpAddr) -> bool {
+	/// Checks if the node is in a state where a connection attempt should proceed
+	///
+	/// Returns true for Connecting (we just set this state) or Disconnected with elapsed backoff
+	pub fn should_attempt_connection(&self, address: &IpAddr) -> bool {
 		if let Some(node) = self.nodes.get(address) {
 			return matches!(node.state, NodeState::Connecting { .. }) || node.state.is_connectable();
 		}
@@ -524,15 +564,19 @@ impl NodeManager {
 		false
 	}
 
-	/// Sends a ping message to a connected node
+	/// Sends a ping message to a connected node and stores the nonce for pong validation
 	pub async fn send_ping(&self, address: &IpAddr) {
-		let tcp_writer = if let Some(node) = self.nodes.get(address) {
-			if let NodeState::Connected { ref writer } = node.state {
+		let nonce = rand::thread_rng().next_u64();
+
+		let tcp_writer = if let Some(mut node) = self.nodes.get_mut(address) {
+			let writer = if let NodeState::Connected { ref writer } = node.state {
 				Arc::clone(writer)
 			} else {
 				debug!("Skipping ping to {}, not connected", address);
 				return;
-			}
+			};
+			node.last_ping_nonce = Some(nonce);
+			writer
 		} else {
 			debug!("Skipping ping to {}, node not found", address);
 			return;
@@ -540,11 +584,14 @@ impl NodeManager {
 
 		debug!("Sending ping to {}", address);
 
-		let nonce = rand::thread_rng().next_u64();
-
 		if let Err(e) = tcp_writer.send_message("ping", &nonce.to_le_bytes()).await {
 			warn!("Failed to send ping to {}: {}", address, e);
 		}
+	}
+
+	/// Returns the number of nodes currently in Connected state
+	pub fn connected_count(&self) -> usize {
+		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
 	}
 
 	/// Returns stats and node snapshots in a single `DashMap` iteration
@@ -595,6 +642,7 @@ impl NodeManager {
 			// plus count connected for stats
 			let mut ready_nodes: Vec<(IpAddr, u32)> = Vec::new();
 			let mut stale_nodes: Vec<IpAddr> = Vec::new();
+			let mut expired_bans: Vec<IpAddr> = Vec::new();
 			let mut total: usize = 0;
 			let mut connected: usize = 0;
 
@@ -614,6 +662,9 @@ impl NodeManager {
 					}
 					NodeState::Connected { .. } => {
 						connected = connected.saturating_add(1);
+					}
+					NodeState::Banned { .. } if !node.state.is_banned() => {
+						expired_bans.push(*entry.key());
 					}
 					_ => {}
 				}
@@ -653,6 +704,30 @@ impl NodeManager {
 					}
 				}
 			}
+
+			if !expired_bans.is_empty() {
+				info!(count = expired_bans.len(), "Reaper: clearing expired bans");
+			}
+			for address in expired_bans {
+				if let Some(mut node) = self.nodes.get_mut(&address) {
+					if matches!(node.state, NodeState::Banned { .. }) && !node.state.is_banned() {
+						node.state = NodeState::Dead;
+					}
+				}
+			}
+
+			// Evict external IP votes from peers that are no longer connected
+			let connected_ips: HashSet<IpAddr> = self
+				.nodes
+				.iter()
+				.filter(|e| e.value().state.is_connected())
+				.map(|e| *e.key())
+				.collect();
+			self.external_ip_votes.retain(|ip, _| connected_ips.contains(ip));
+
+			// Purge stale per-IP incoming cooldowns (older than 2x the cooldown period)
+			self.incoming_cooldowns
+				.retain(|_, instant| instant.elapsed() < INCOMING_IP_COOLDOWN.saturating_mul(2));
 
 			debug!(
 				"Reaper scan complete: {} total, {} connected, {} disconnected",
@@ -835,6 +910,125 @@ impl NodeManager {
 			}
 		}
 	}
+
+	/// Collects outgoing peers with activity for persistence
+	pub fn collect_peers_for_save(&self) -> crate::storage::peers::PeerDb {
+		let peers = self
+			.nodes
+			.iter()
+			.filter(|entry| {
+				let node = entry.value();
+				// Only save outgoing nodes that completed a handshake this session.
+				// node.version is set when a version message is received and never
+				// reset on reconnection, unlike version_received which toggles
+				node.connection_type == ConnectionType::Outgoing && node.version > 0 && node.last_seen > 0
+			})
+			.map(|entry| {
+				let node = entry.value();
+				crate::storage::peers::SavedPeer {
+					ip: *entry.key(),
+					port: node.port,
+					services: node.services.bits(),
+					last_seen: node.last_seen,
+					user_agent: node.user_agent.clone(),
+					height: node.height,
+				}
+			})
+			.collect();
+
+		crate::storage::peers::PeerDb { version: 1, peers }
+	}
+
+	/// Collects active bans for persistence
+	pub fn collect_bans_for_save(&self) -> crate::storage::bans::BanDb {
+		let now = unix_now();
+		let bans = self
+			.nodes
+			.iter()
+			.filter_map(|entry| {
+				if let NodeState::Banned {
+					reason,
+					created,
+					expires,
+				} = &entry.value().state
+				{
+					if *expires > now {
+						return Some(crate::storage::bans::SavedBan {
+							ip: *entry.key(),
+							reason: reason.to_string(),
+							created: *created,
+							expires: *expires,
+						});
+					}
+				}
+				None
+			})
+			.collect();
+
+		crate::storage::bans::BanDb { version: 1, bans }
+	}
+
+	/// Loads saved peers and connects them immediately
+	///
+	/// Skips loading if the db version is unrecognized. Uses `insert_outgoing`
+	/// to spawn connection tasks so peers connect right away on startup
+	pub fn load_saved_peers(self: &Arc<Self>, db: &crate::storage::peers::PeerDb) {
+		if db.version != 1 {
+			warn!(version = db.version, "Unknown peers.dat version, skipping");
+			return;
+		}
+		for peer in &db.peers {
+			// Populate metadata before connecting so we retain peer info from last session
+			if self.insert(peer.ip, peer.port, ConnectionType::Outgoing) {
+				if let Some(mut node) = self.nodes.get_mut(&peer.ip) {
+					node.services = ServiceMask::from_bits_truncate(peer.services);
+					node.last_seen = peer.last_seen;
+					node.user_agent.clone_from(&peer.user_agent);
+					node.height = peer.height;
+				}
+				// Spawn connection task
+				let nm = Arc::clone(self);
+				let addr = peer.ip;
+				let port = peer.port;
+				tokio::spawn(async move {
+					handle_node_connection(nm, addr, port, 0).await;
+				});
+			}
+		}
+	}
+
+	/// Loads saved bans and applies them
+	///
+	/// Skips loading if the db version is unrecognized
+	pub fn load_saved_bans(&self, db: &crate::storage::bans::BanDb) {
+		if db.version != 1 {
+			warn!(version = db.version, "Unknown banlist.dat version, skipping");
+			return;
+		}
+		let now = unix_now();
+		for ban in &db.bans {
+			if ban.expires <= now {
+				continue;
+			}
+			// Port is irrelevant for banned nodes -- gets updated if the node
+			// is later revived by an addr message
+			self.insert(ban.ip, 0, ConnectionType::Outgoing);
+			if let Some(mut node) = self.nodes.get_mut(&ban.ip) {
+				node.state = NodeState::Banned {
+					reason: match ban.reason.as_str() {
+						"protocol violation" => BanReason::ProtocolViolation,
+						"misbehavior" => BanReason::Misbehavior,
+						other => {
+							warn!(reason = other, ip = %ban.ip, "Unknown ban reason, defaulting to ProtocolViolation");
+							BanReason::ProtocolViolation
+						}
+					},
+					created: ban.created,
+					expires: ban.expires,
+				};
+			}
+		}
+	}
 }
 
 /// Schedules a retry or marks a node as dead based on attempt count
@@ -861,7 +1055,7 @@ fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
 
 /// Handles the connection to a node
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16, attempt: u32) {
-	if !node_manager.is_candidate(&address) {
+	if !node_manager.should_attempt_connection(&address) {
 		trace!(
 			"Avoiding connection to node {}:{} as it is not a good candidate",
 			address,
@@ -1065,7 +1259,7 @@ async fn parse_incoming_message(
 		NetworkCommand::Verack => handle_verack(node_manager, address, tcp_writer).await,
 		NetworkCommand::Ping => handle_ping(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
-			handle_pong(address);
+			handle_pong(node_manager, address, &message.payload);
 			Ok(())
 		}
 		NetworkCommand::Addr => handle_addr(node_manager, address, &message.payload).await,
@@ -1099,16 +1293,22 @@ async fn handle_version(
 
 		// Nodes can send only one version command
 		if node.version_received {
+			let now = unix_now();
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
+				created: now,
+				expires: ban_expires_at(now),
 			};
 			warn!("Node {} sent version command twice, banning", address);
 			return Err(anyhow!("Node {address} sent version command twice"));
 		}
 
 		if version.nonce == node_manager.my_nonce {
+			let now = unix_now();
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
+				created: now,
+				expires: ban_expires_at(now),
 			};
 			warn!("Self-connection detected to {}, banning", address);
 			return Err(anyhow!("Node {address} is myself"));
@@ -1131,8 +1331,11 @@ async fn handle_version(
 	// Validate start_height
 	if version.start_height < 0 {
 		if let Some(mut node) = node_manager.nodes.get_mut(address) {
+			let now = unix_now();
 			node.state = NodeState::Banned {
 				reason: BanReason::Misbehavior,
+				created: now,
+				expires: ban_expires_at(now),
 			};
 		}
 		warn!(
@@ -1152,11 +1355,19 @@ async fn handle_version(
 	}
 
 	// Phase 3: Re-acquire lock to write fields
+	// Verify state hasn't changed between phases (another task could have banned the node)
 	{
 		let mut node = node_manager
 			.nodes
 			.get_mut(address)
 			.ok_or_else(|| anyhow!("node {address} disappeared from manager during version handling"))?;
+
+		if !matches!(node.state, NodeState::Handshaking { .. }) {
+			return Err(anyhow!(
+				"node {address} state changed during version handling (now {})",
+				node.state
+			));
+		}
 
 		node.services = version.services;
 		node.timestamp = version.timestamp;
@@ -1185,8 +1396,11 @@ async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_wr
 
 		// Verack before version is a protocol violation
 		if !node.version_received {
+			let now = unix_now();
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
+				created: now,
+				expires: ban_expires_at(now),
 			};
 			warn!("Node {} sent verack before version, banning", address);
 			return Err(anyhow!("Node {address} sent verack before version"));
@@ -1235,10 +1449,13 @@ async fn handle_ping(
 	if payload.len() != 8 {
 		warn!("Received malformed ping command from {}", address);
 
+		let now = unix_now();
 		node_manager.set_state(
 			address,
 			NodeState::Banned {
 				reason: BanReason::Misbehavior,
+				created: now,
+				expires: ban_expires_at(now),
 			},
 		);
 
@@ -1256,19 +1473,51 @@ async fn handle_ping(
 
 /// Handles an incoming pong message from a peer
 ///
-/// Currently logs receipt only; nonce validation is not implemented
-fn handle_pong(address: &IpAddr) {
-	debug!("Received pong from {}", address);
+/// Validates that the nonce matches the last ping we sent
+fn handle_pong(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) {
+	if payload.len() != 8 {
+		warn!(
+			"Received malformed pong from {} ({} bytes, expected 8)",
+			address,
+			payload.len()
+		);
+		return;
+	}
+
+	let Ok(nonce) = vec_to_u64_le(payload) else {
+		warn!("Failed to parse pong nonce from {}", address);
+		return;
+	};
+
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		match node.last_ping_nonce.take() {
+			Some(expected) if expected == nonce => {
+				debug!("Valid pong from {}", address);
+			}
+			Some(expected) => {
+				warn!(
+					"Pong nonce mismatch from {}: expected {}, got {}",
+					address, expected, nonce
+				);
+			}
+			None => {
+				debug!("Received unsolicited pong from {}", address);
+			}
+		}
+	}
 }
 
 /// Strips non-printable and non-ASCII characters from a user agent string
 ///
-/// Prevents terminal escape sequence injection via malicious user agents
+/// Prevents terminal escape sequence injection via malicious user agents.
+/// Trims leading/trailing whitespace to prevent display confusion
 fn sanitize_user_agent(s: &str) -> String {
 	s.chars()
 		.filter(|c| c.is_ascii_graphic() || *c == ' ')
 		.take(MAX_USER_AGENT_DISPLAY)
-		.collect()
+		.collect::<String>()
+		.trim()
+		.to_string()
 }
 
 /// Computes a deterministic score for relay peer selection
@@ -1570,8 +1819,9 @@ async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_w
 }
 
 #[cfg(test)]
-// Tests use unwrap for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used)]
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode.
+// DashMap guard drop order doesn't matter in synchronous test functions
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
 mod tests {
 	use super::*;
 
@@ -1597,6 +1847,8 @@ mod tests {
 	fn not_connectable_when_banned() {
 		let state = NodeState::Banned {
 			reason: BanReason::ProtocolViolation,
+			created: 1_000_000,
+			expires: 1_000_000 + 86_400,
 		};
 		assert!(!state.is_connectable());
 	}
@@ -1644,10 +1896,23 @@ mod tests {
 
 	#[test]
 	fn banned_is_banned() {
+		let now = unix_now();
 		let state = NodeState::Banned {
 			reason: BanReason::Misbehavior,
+			created: now,
+			expires: ban_expires_at(now),
 		};
 		assert!(state.is_banned());
+	}
+
+	#[test]
+	fn expired_ban_is_not_banned() {
+		let state = NodeState::Banned {
+			reason: BanReason::ProtocolViolation,
+			created: 0,
+			expires: 1, // expired long ago
+		};
+		assert!(!state.is_banned());
 	}
 
 	#[test]
@@ -1906,7 +2171,7 @@ mod tests {
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -1928,7 +2193,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -1947,7 +2212,7 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(result);
+		assert!(result.is_some());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 54321);
@@ -1963,7 +2228,7 @@ mod tests {
 
 		// Node starts in Connecting -- should reject incoming
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result);
+		assert!(result.is_none());
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 9933);
@@ -1978,6 +2243,8 @@ mod tests {
 		if let Some(mut node) = nm.nodes.get_mut(&ip) {
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
+				created: 1_000_000,
+				expires: 1_000_000 + 86_400,
 			};
 		}
 
@@ -1997,11 +2264,13 @@ mod tests {
 		if let Some(mut node) = nm.nodes.get_mut(&ip) {
 			node.state = NodeState::Banned {
 				reason: BanReason::ProtocolViolation,
+				created: 1_000_000,
+				expires: 1_000_000 + 86_400,
 			};
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result, "should reject incoming for banned node");
+		assert!(result.is_none(), "should reject incoming for banned node");
 	}
 
 	#[tokio::test]
@@ -2045,9 +2314,230 @@ mod tests {
 		}
 
 		let result = nm.insert_incoming(ip, 54321);
-		assert!(!result, "should reject incoming when node is connected");
+		assert!(result.is_none(), "should reject incoming when node is connected");
 
 		let node = nm.nodes.get(&ip).unwrap();
 		assert_eq!(node.port, 9933, "port should not change");
+	}
+
+	#[test]
+	fn collect_peers_includes_connected_peer() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Simulate a peer that completed handshake: set version and last_seen
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.version = 70003;
+			node.last_seen = 1_700_000_000;
+			node.user_agent = "/Test:1.0/".to_string();
+			node.height = 100;
+			node.services = ServiceMask::NODE_NETWORK_LIMITED;
+		}
+
+		let db = nm.collect_peers_for_save();
+		assert_eq!(db.peers.len(), 1);
+		assert_eq!(db.peers[0].port, 9933);
+		assert_eq!(db.peers[0].height, 100);
+	}
+
+	#[test]
+	fn collect_peers_excludes_unconnected_loaded_peer() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Simulate a peer loaded from disk: has last_seen but version stays 0
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.last_seen = 1_700_000_000;
+		}
+
+		let db = nm.collect_peers_for_save();
+		assert!(db.peers.is_empty(), "peer with version=0 should not be saved");
+	}
+
+	#[test]
+	fn collect_peers_excludes_incoming() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Incoming);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.version = 70003;
+			node.last_seen = 1_700_000_000;
+		}
+
+		let db = nm.collect_peers_for_save();
+		assert!(db.peers.is_empty(), "incoming peers should not be saved");
+	}
+
+	#[test]
+	fn collect_peers_includes_disconnected_peer_with_version() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Peer connected once (version set), now disconnected and retrying.
+		// version_received may be false but version field persists
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.version = 70003;
+			node.last_seen = 1_700_000_000;
+			node.version_received = false;
+			node.state = NodeState::Disconnected {
+				retry_at: Instant::now(),
+				attempt: 1,
+			};
+		}
+
+		let db = nm.collect_peers_for_save();
+		assert_eq!(db.peers.len(), 1, "disconnected peer with version>0 should be saved");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn reaper_clears_expired_bans() {
+		let nm = Arc::new(NodeManager::new());
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		// Set an already-expired ban
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Banned {
+				reason: BanReason::ProtocolViolation,
+				created: 0,
+				expires: 1, // expired long ago
+			};
+		}
+
+		// Verify the ban shows as expired
+		let node = nm.nodes.get(&ip).unwrap();
+		assert!(!node.state.is_banned(), "ban should be expired");
+		drop(node);
+
+		// Run one reaper cycle -- with paused time, sleep auto-advances
+		// past the 30s reaper interval, letting the scan execute
+		let nm_clone = Arc::clone(&nm);
+		let reaper = tokio::spawn(async move { nm_clone.run_reaper().await });
+		tokio::time::sleep(REAPER_SCAN_INTERVAL + Duration::from_secs(1)).await;
+		reaper.abort();
+
+		// The expired ban should have been cleared to Dead
+		let node = nm.nodes.get(&ip).unwrap();
+		assert!(
+			matches!(node.state, NodeState::Dead),
+			"expired ban should become Dead, got {}",
+			node.state
+		);
+	}
+
+	#[test]
+	fn collect_bans_excludes_expired() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "1.2.3.4".parse().unwrap();
+		nm.insert(ip, 9933, ConnectionType::Outgoing);
+
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Banned {
+				reason: BanReason::Misbehavior,
+				created: 0,
+				expires: 1, // expired
+			};
+		}
+
+		let db = nm.collect_bans_for_save();
+		assert!(db.bans.is_empty(), "expired bans should not be saved");
+	}
+
+	#[test]
+	fn sanitize_user_agent_strips_control_chars() {
+		assert_eq!(sanitize_user_agent("/Satoshi:0.1/"), "/Satoshi:0.1/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_strips_non_ascii() {
+		assert_eq!(sanitize_user_agent("/Test\x1b[31m:evil/"), "/Test[31m:evil/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_trims_whitespace() {
+		assert_eq!(sanitize_user_agent("  /Satoshi:0.1/  "), "/Satoshi:0.1/");
+	}
+
+	#[test]
+	fn sanitize_user_agent_all_spaces_becomes_empty() {
+		assert_eq!(sanitize_user_agent("       "), "");
+	}
+
+	#[test]
+	fn sanitize_user_agent_truncates_long_input() {
+		let long = "A".repeat(300);
+		let result = sanitize_user_agent(&long);
+		assert_eq!(result.len(), MAX_USER_AGENT_DISPLAY);
+	}
+
+	#[test]
+	fn load_saved_peers_skips_unknown_version() {
+		let nm = Arc::new(NodeManager::new());
+		let db = crate::storage::peers::PeerDb {
+			version: 999,
+			peers: vec![crate::storage::peers::SavedPeer {
+				ip: "1.2.3.4".parse().unwrap(),
+				port: 9933,
+				services: 0,
+				last_seen: 0,
+				user_agent: String::new(),
+				height: 0,
+			}],
+		};
+		nm.load_saved_peers(&db);
+		assert!(nm.nodes.is_empty(), "should skip peers with unknown version");
+	}
+
+	#[test]
+	fn load_saved_bans_skips_unknown_version() {
+		let nm = NodeManager::new();
+		let db = crate::storage::bans::BanDb {
+			version: 999,
+			bans: vec![crate::storage::bans::SavedBan {
+				ip: "1.2.3.4".parse().unwrap(),
+				reason: "test".to_string(),
+				created: 0,
+				expires: u64::MAX,
+			}],
+		};
+		nm.load_saved_bans(&db);
+		assert!(nm.nodes.is_empty(), "should skip bans with unknown version");
+	}
+
+	#[test]
+	fn incoming_cooldown_rejects_rapid_reconnect() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		// First connection should succeed
+		let guard = nm.insert_incoming(ip, 54321);
+		assert!(guard.is_some());
+		drop(guard);
+
+		// Make the node Dead so it's eligible again
+		if let Some(mut node) = nm.nodes.get_mut(&ip) {
+			node.state = NodeState::Dead;
+		}
+
+		// Second connection within cooldown should be rejected
+		let guard2 = nm.insert_incoming(ip, 54322);
+		assert!(guard2.is_none(), "should reject per-IP cooldown");
+	}
+
+	#[test]
+	fn incoming_guard_decrements_on_drop() {
+		let nm = NodeManager::new();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+		let guard = nm.insert_incoming(ip, 54321);
+		assert!(guard.is_some());
+		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 1);
+
+		drop(guard);
+		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 0);
 	}
 }
