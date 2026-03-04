@@ -25,13 +25,16 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	dns::DEFAULT_PORT,
+	headers::HeaderStore,
 	network::{
 		message_addr::{AddrEntry, MessageAddr},
-		message_inv::MessageInv,
+		message_getheaders::MessageGetHeaders,
+		message_headers::{MessageHeaders, MAX_HEADERS_PER_MSG},
+		message_inv::{InvType, MessageInv},
 		message_version::MessageVersion,
 		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
-	types::hash::Hash256,
+	types::{block::BlockHeader, hash::Hash256},
 	utils::{is_recently_active, is_routable, unix_now, vec_to_u64_le},
 };
 
@@ -100,6 +103,10 @@ const MAX_ADDR_KNOWN: usize = 5000;
 
 /// Maximum entries in a peer's `inv_known` set before clearing
 const MAX_INV_KNOWN: usize = 50_000;
+
+/// Minimum protocol version that supports sendheaders (BIP 130)
+#[allow(dead_code)] // used in subsequent headers-sync tasks
+const SENDHEADERS_VERSION: u32 = 70012;
 
 /// Maximum concurrent incoming connections
 const MAX_INCOMING_CONNECTIONS: usize = 125;
@@ -304,6 +311,7 @@ pub struct NodeSnapshot {
 }
 
 /// Represents a node in the Catcoin network
+#[allow(clippy::struct_excessive_bools)] // each bool is a distinct protocol flag, not a state machine
 pub struct Node {
 	/// Port number for this node's listening socket
 	pub port: u16,
@@ -364,6 +372,9 @@ pub struct Node {
 
 	/// Inventory hashes known to this peer (announced via inv)
 	pub inv_known: HashSet<Hash256>,
+
+	/// Whether this peer prefers block announcements via headers (BIP 130)
+	pub prefer_headers: bool,
 }
 
 impl Node {
@@ -390,6 +401,7 @@ impl Node {
 			pending_external_ip: None,
 			last_ping_nonce: None,
 			inv_known: HashSet::new(),
+			prefer_headers: false,
 		}
 	}
 }
@@ -430,17 +442,14 @@ pub struct NodeManager {
 
 	/// Per-IP cooldown for incoming connections to prevent reconnect spam
 	incoming_cooldowns: DashMap<IpAddr, Instant>,
-}
 
-impl Default for NodeManager {
-	fn default() -> Self {
-		Self::new()
-	}
+	/// In-memory block header chain
+	pub header_store: Arc<parking_lot::RwLock<HeaderStore>>,
 }
 
 impl NodeManager {
 	/// Creates a new `NodeManager` with an empty node set and random nonce and relay key
-	pub fn new() -> Self {
+	pub fn new(genesis_header: BlockHeader) -> Self {
 		let mut rng = rand::thread_rng();
 		Self {
 			nodes: DashMap::new(),
@@ -449,6 +458,7 @@ impl NodeManager {
 			external_ip_votes: DashMap::new(),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
+			header_store: Arc::new(parking_lot::RwLock::new(HeaderStore::new(genesis_header))),
 		}
 	}
 
@@ -558,6 +568,10 @@ impl NodeManager {
 	/// Updates the connection state of a node
 	pub fn set_state(&self, address: &IpAddr, state: NodeState) {
 		if let Some(mut node) = self.nodes.get_mut(address) {
+			// Clear per-session state when the connection ends
+			if matches!(state, NodeState::Disconnected { .. } | NodeState::Dead) {
+				node.inv_known.clear();
+			}
 			node.state = state;
 		}
 	}
@@ -706,6 +720,7 @@ impl NodeManager {
 				warn!("Node {} stuck in stale state, scheduling retry", address);
 				if let Some(mut node) = self.nodes.get_mut(&address) {
 					if matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. }) {
+						node.inv_known.clear();
 						node.state = NodeState::Disconnected {
 							retry_at: Instant::now(),
 							attempt: 0,
@@ -1277,10 +1292,16 @@ async fn parse_incoming_message(
 			Ok(())
 		}
 		NetworkCommand::GetAddr => handle_getaddr(node_manager, address, tcp_writer).await,
-		NetworkCommand::Inv => handle_inv(node_manager, address, &message.payload),
+		NetworkCommand::Inv => handle_inv(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::GetData => handle_getdata(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::NotFound => {
 			handle_notfound(address, &message.payload);
+			Ok(())
+		}
+		NetworkCommand::Headers => handle_headers(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::GetHeaders => handle_getheaders(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::SendHeaders => {
+			handle_sendheaders(node_manager, address);
 			Ok(())
 		}
 		NetworkCommand::Unknown(cmd) => {
@@ -1444,6 +1465,25 @@ async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_wr
 		.send_message("getaddr", &[])
 		.await
 		.context("failed to send getaddr")?;
+
+	// Send sendheaders if peer supports it (BIP 130)
+	let peer_version = node_manager.nodes.get(address).map_or(0, |n| n.version);
+	if peer_version >= SENDHEADERS_VERSION {
+		tcp_writer
+			.send_message("sendheaders", &[])
+			.await
+			.context("failed to send sendheaders")?;
+	}
+
+	// Begin header sync
+	let locator = node_manager.header_store.read().build_locator();
+	let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+	tcp_writer
+		.send_message("getheaders", &getheaders.to_bytes())
+		.await
+		.context("failed to send initial getheaders")?;
+
+	debug!(peer = %address, "sent initial getheaders for header sync");
 
 	Ok(())
 }
@@ -1834,7 +1874,12 @@ async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_w
 }
 
 /// Handles an incoming inv message from a peer
-fn handle_inv(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) -> Result<()> {
+async fn handle_inv(
+	node_manager: &Arc<NodeManager>,
+	address: &IpAddr,
+	tcp_writer: &SharedTcpWriter,
+	payload: &[u8],
+) -> Result<()> {
 	let inv = MessageInv::from_bytes(payload).context("failed to parse inv message")?;
 
 	debug!(count = inv.items().len(), peer = %address, "received inv");
@@ -1849,7 +1894,24 @@ fn handle_inv(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) -> R
 		}
 	}
 
-	// No data requests yet -- block sync not implemented
+	// Request headers if any announced blocks are unknown to us
+	let has_new_blocks = {
+		let store = node_manager.header_store.read();
+		inv.items()
+			.iter()
+			.any(|item| item.inv_type == InvType::Block && store.get(&item.hash).is_none())
+	};
+
+	if has_new_blocks {
+		let locator = node_manager.header_store.read().build_locator();
+		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+		tcp_writer
+			.send_message("getheaders", &getheaders.to_bytes())
+			.await
+			.context("failed to send getheaders after block inv")?;
+		debug!(peer = %address, "requesting headers after block inv");
+	}
+
 	Ok(())
 }
 
@@ -1886,12 +1948,128 @@ fn handle_notfound(address: &IpAddr, payload: &[u8]) {
 	}
 }
 
+/// Handles an incoming sendheaders message (BIP 130)
+///
+/// Sets the peer's preference flag so we send future block
+/// announcements via headers instead of inv
+fn handle_sendheaders(node_manager: &NodeManager, address: &IpAddr) {
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		node.prefer_headers = true;
+		debug!("Peer {} prefers headers announcements", address);
+	}
+}
+
+/// Handles an incoming headers message from a peer
+///
+/// Validates chain continuity via batch insertion, then requests
+/// more headers if we received a full batch (2000)
+async fn handle_headers(
+	node_manager: &Arc<NodeManager>,
+	address: &IpAddr,
+	tcp_writer: &SharedTcpWriter,
+	payload: &[u8],
+) -> Result<()> {
+	let msg = MessageHeaders::from_bytes(payload).context("failed to parse headers message")?;
+	let count = msg.headers().len();
+
+	if count == 0 {
+		return Ok(());
+	}
+
+	let headers = msg.into_headers();
+
+	// Batch insert under a single write lock. Don't disconnect on failure --
+	// the peer may have sent orphan or fork headers that we can't connect yet.
+	// Log the error and move on instead of killing the connection
+	let insert_result = node_manager.header_store.write().add_headers(&headers);
+	let added = match insert_result {
+		Ok(n) => n,
+		Err(e) => {
+			warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
+			return Ok(());
+		}
+	};
+
+	info!(received = count, added, peer = %address, "processed headers");
+
+	// If we got a full batch, request more
+	if count == MAX_HEADERS_PER_MSG {
+		let locator = node_manager.header_store.read().build_locator();
+		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+		tcp_writer
+			.send_message("getheaders", &getheaders.to_bytes())
+			.await
+			.context("failed to send follow-up getheaders")?;
+		debug!(peer = %address, "requesting more headers");
+	}
+
+	Ok(())
+}
+
+/// Handles an incoming getheaders request from a peer
+///
+/// Finds the fork point using the locator hashes, then sends
+/// up to 2000 headers from our chain via the height index
+async fn handle_getheaders(
+	node_manager: &Arc<NodeManager>,
+	address: &IpAddr,
+	tcp_writer: &SharedTcpWriter,
+	payload: &[u8],
+) -> Result<()> {
+	let msg = MessageGetHeaders::from_bytes(payload).context("failed to parse getheaders")?;
+
+	// Scope the read lock so it drops before any await point
+	let response_headers = {
+		let store = node_manager.header_store.read();
+
+		// Find fork point: first locator hash that exists in our chain
+		let mut start_height: u32 = 0;
+		for hash in msg.locator_hashes() {
+			if *hash == store.genesis() {
+				start_height = 0;
+				break;
+			}
+			if let Some(stored) = store.get(hash) {
+				start_height = stored.height;
+				break;
+			}
+		}
+
+		store.get_headers_after(start_height, MAX_HEADERS_PER_MSG, msg.hash_stop())
+	};
+
+	if response_headers.is_empty() {
+		debug!(peer = %address, "no headers to send for getheaders");
+		return Ok(());
+	}
+
+	debug!(count = response_headers.len(), peer = %address, "sending headers response");
+
+	let response = MessageHeaders::new(response_headers);
+	tcp_writer
+		.send_message("headers", &response.to_bytes())
+		.await
+		.context("failed to send headers response")
+}
+
 #[cfg(test)]
 // Tests use unwrap/indexing for brevity since panics are the intended failure mode.
 // DashMap guard drop order doesn't matter in synchronous test functions
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
 mod tests {
 	use super::*;
+
+	/// Dummy genesis header for tests that don't care about header data
+	const fn test_genesis() -> BlockHeader {
+		BlockHeader {
+			version: 1,
+			prev_hash: Hash256::ZERO,
+			merkle_root: Hash256::ZERO,
+			timestamp: 0,
+			bits: 0,
+			nonce: 0,
+		}
+	}
 
 	#[test]
 	fn connectable_when_retry_time_passed() {
@@ -2015,7 +2193,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_counts() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -2025,7 +2203,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_requires_three_votes() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -2034,7 +2212,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_returns_majority() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip_a: IpAddr = "8.8.8.8".parse().unwrap();
 		let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
 		nm.record_external_ip_vote(ip_a);
@@ -2049,7 +2227,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_rejects_private() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let private_ip: IpAddr = "192.168.1.1".parse().unwrap();
 		nm.record_external_ip_vote(private_ip);
 		nm.record_external_ip_vote(private_ip);
@@ -2080,7 +2258,7 @@ mod tests {
 
 	#[test]
 	fn has_incoming_connected_detects_incoming() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 12345, ConnectionType::Incoming);
 
@@ -2090,7 +2268,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_dedup_prevents_duplicate_insert() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2105,7 +2283,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_clears_on_bucket_rotation() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2130,7 +2308,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_defaults_to_false() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2140,7 +2318,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_can_be_set() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2154,7 +2332,7 @@ mod tests {
 
 	#[test]
 	fn new_node_starts_with_initial_token_bucket() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2174,7 +2352,7 @@ mod tests {
 
 	#[test]
 	fn same_ip_different_port_deduplicates() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		assert!(nm.insert(ip, 9933, ConnectionType::Outgoing));
@@ -2184,7 +2362,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_disconnected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2204,7 +2382,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_dead() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2221,7 +2399,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_connecting() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2235,7 +2413,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_new_node() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let result = nm.insert_incoming(ip, 54321);
@@ -2249,7 +2427,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_disconnected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2271,7 +2449,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_dead() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2290,7 +2468,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_connecting() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2304,7 +2482,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_banned() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2325,7 +2503,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_banned() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2343,7 +2521,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_ignores_when_connected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2367,7 +2545,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_incoming_rejects_when_connected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2390,7 +2568,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_connected_peer() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2411,7 +2589,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_unconnected_loaded_peer() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2426,7 +2604,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_incoming() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Incoming);
 
@@ -2441,7 +2619,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_disconnected_peer_with_version() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2463,7 +2641,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn reaper_clears_expired_bans() {
-		let nm = Arc::new(NodeManager::new());
+		let nm = Arc::new(NodeManager::new(test_genesis()));
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2499,7 +2677,7 @@ mod tests {
 
 	#[test]
 	fn collect_bans_excludes_expired() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2544,7 +2722,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_peers_skips_unknown_version() {
-		let nm = Arc::new(NodeManager::new());
+		let nm = Arc::new(NodeManager::new(test_genesis()));
 		let db = crate::storage::peers::PeerDb {
 			version: 999,
 			peers: vec![crate::storage::peers::SavedPeer {
@@ -2562,7 +2740,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_bans_skips_unknown_version() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let db = crate::storage::bans::BanDb {
 			version: 999,
 			bans: vec![crate::storage::bans::SavedBan {
@@ -2578,7 +2756,7 @@ mod tests {
 
 	#[test]
 	fn incoming_cooldown_rejects_rapid_reconnect() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		// First connection should succeed
@@ -2598,7 +2776,7 @@ mod tests {
 
 	#[test]
 	fn incoming_guard_decrements_on_drop() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let guard = nm.insert_incoming(ip, 54321);

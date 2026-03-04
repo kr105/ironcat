@@ -669,6 +669,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dirs",
+ "parking_lot",
  "rand",
  "ratatui",
  "serde",

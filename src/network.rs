@@ -24,6 +24,8 @@ use crate::{
 };
 
 pub mod message_addr;
+pub mod message_getheaders;
+pub mod message_headers;
 pub mod message_inv;
 pub mod message_version;
 
@@ -369,6 +371,9 @@ pub enum NetworkCommand {
 	Inv,
 	GetData,
 	NotFound,
+	GetHeaders,
+	Headers,
+	SendHeaders,
 	Unknown(String),
 }
 
@@ -387,6 +392,9 @@ impl NetworkCommand {
 			"inv" => Self::Inv,
 			"getdata" => Self::GetData,
 			"notfound" => Self::NotFound,
+			"getheaders" => Self::GetHeaders,
+			"headers" => Self::Headers,
+			"sendheaders" => Self::SendHeaders,
 			_ => Self::Unknown(s.to_string()),
 		}
 	}

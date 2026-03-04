@@ -9,12 +9,29 @@ use ironcat::{
 	nodes::NodeManager,
 	storage,
 	tui_layer::{TuiLayer, TuiLogEntry},
+	types::{block::BlockHeader, hash::Hash256},
 	ui::tui::tui_start,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Catcoin mainnet genesis block header
+///
+/// From chainparams.cpp: CreateGenesisBlock(1387838302, 588050, 0x1e0ffff0, 1, 50 * COIN)
+/// Hash: bc3b4ec43c4ebb2fef49e6240812549e61ffa623d9418608aa90eaad26c96296
+const GENESIS_HEADER: BlockHeader = BlockHeader {
+	version: 1,
+	prev_hash: Hash256::ZERO,
+	merkle_root: Hash256::from_bytes([
+		0xf7, 0x9c, 0xf2, 0xa0, 0x69, 0xbe, 0xae, 0xfd, 0x31, 0x40, 0x21, 0xe0, 0x86, 0xfb, 0x13, 0x8d, 0x1c, 0x43,
+		0xb8, 0x5e, 0x33, 0x17, 0xb1, 0xaa, 0xf2, 0xcd, 0xd9, 0xb5, 0x3d, 0xa3, 0x07, 0x40,
+	]),
+	timestamp: 1_387_838_302,
+	bits: 0x1e0f_fff0,
+	nonce: 588_050,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,7 +60,7 @@ async fn main() -> Result<()> {
 
 /// Core application loop shared between TUI and daemon modes
 async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
-	let node_manager = Arc::new(NodeManager::new());
+	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER));
 
 	// Ensure data directory exists
 	std::fs::create_dir_all(&args.datadir)

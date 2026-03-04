@@ -11,8 +11,8 @@ use ironcat::network::{message_version::MessageVersion, NetworkAddress, ServiceM
 fn build_version_payload(services_bits: u64) -> Vec<u8> {
 	let mut bytes = Vec::new();
 
-	// version: 70003 (u32 LE)
-	bytes.extend_from_slice(&70003u32.to_le_bytes());
+	// version: 70012 (u32 LE)
+	bytes.extend_from_slice(&70012u32.to_le_bytes());
 	// services (u64 LE)
 	bytes.extend_from_slice(&services_bits.to_le_bytes());
 	// timestamp (i64 LE)

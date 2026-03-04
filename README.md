@@ -22,8 +22,11 @@ cargo run -- --help                          # Show help
 - Proactive addr relay with deterministic peer selection and rate limiting
 - Periodic self-announcement when publicly reachable
 - Exponential backoff with jitter for disconnected peers
+- Headers-first chain synchronization (getheaders/headers, protocol version 70012)
+- sendheaders signal (BIP 130) for header-based block announcements
+- In-memory header chain with dual indexing (hash and height)
 - Core blockchain types (block headers, transactions, inventory)
-- Inventory protocol (inv/getdata/notfound) with stub handlers
+- Inventory protocol (inv/getdata/notfound) with header-triggered sync
 - TUI and daemon modes
 - Persistent peer and ban storage across restarts
 

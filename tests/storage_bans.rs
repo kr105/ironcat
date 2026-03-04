@@ -97,11 +97,20 @@ fn filter_expired_bans() {
 }
 
 use ironcat::nodes::NodeManager;
+use ironcat::types::{block::BlockHeader, hash::Hash256};
 use ironcat::utils::unix_now;
 
 #[test]
 fn collect_bans_from_node_manager() {
-	let nm = NodeManager::new();
+	let genesis = BlockHeader {
+		version: 1,
+		prev_hash: Hash256::ZERO,
+		merkle_root: Hash256::ZERO,
+		timestamp: 0,
+		bits: 0,
+		nonce: 0,
+	};
+	let nm = NodeManager::new(genesis);
 	// Load a ban via the persistence API
 	let now = unix_now();
 	nm.load_saved_bans(&BanDb {

@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
-const PROTOCOL_VERSION: u32 = 70003;
+const PROTOCOL_VERSION: u32 = 70012;
 
 /// Reports 0 until actual chain state is available (honest: we don't have blocks)
 const DEFAULT_START_HEIGHT: i32 = 0;
