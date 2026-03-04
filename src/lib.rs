@@ -6,5 +6,6 @@ pub mod network;
 pub mod nodes;
 pub mod storage;
 pub mod tui_layer;
+pub mod types;
 pub mod ui;
 pub mod utils;

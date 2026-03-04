@@ -22,6 +22,8 @@ cargo run -- --help                          # Show help
 - Proactive addr relay with deterministic peer selection and rate limiting
 - Periodic self-announcement when publicly reachable
 - Exponential backoff with jitter for disconnected peers
+- Core blockchain types (block headers, transactions, inventory)
+- Inventory protocol (inv/getdata/notfound) with stub handlers
 - TUI and daemon modes
 - Persistent peer and ban storage across restarts
 

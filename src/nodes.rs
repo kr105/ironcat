@@ -27,9 +27,11 @@ use crate::{
 	dns::DEFAULT_PORT,
 	network::{
 		message_addr::{AddrEntry, MessageAddr},
+		message_inv::MessageInv,
 		message_version::MessageVersion,
 		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
+	types::hash::Hash256,
 	utils::{is_recently_active, is_routable, unix_now, vec_to_u64_le},
 };
 
@@ -95,6 +97,9 @@ const MAX_EXTERNAL_IP_VOTES: usize = 100;
 
 /// Maximum entries in a peer's `addr_known` set within a 24h bucket
 const MAX_ADDR_KNOWN: usize = 5000;
+
+/// Maximum entries in a peer's `inv_known` set before clearing
+const MAX_INV_KNOWN: usize = 50_000;
 
 /// Maximum concurrent incoming connections
 const MAX_INCOMING_CONNECTIONS: usize = 125;
@@ -356,6 +361,9 @@ pub struct Node {
 
 	/// Nonce of the last ping we sent to this peer, for pong validation
 	pub last_ping_nonce: Option<u64>,
+
+	/// Inventory hashes known to this peer (announced via inv)
+	pub inv_known: HashSet<Hash256>,
 }
 
 impl Node {
@@ -381,6 +389,7 @@ impl Node {
 			last_getaddr_response: None,
 			pending_external_ip: None,
 			last_ping_nonce: None,
+			inv_known: HashSet::new(),
 		}
 	}
 }
@@ -1268,6 +1277,12 @@ async fn parse_incoming_message(
 			Ok(())
 		}
 		NetworkCommand::GetAddr => handle_getaddr(node_manager, address, tcp_writer).await,
+		NetworkCommand::Inv => handle_inv(node_manager, address, &message.payload),
+		NetworkCommand::GetData => handle_getdata(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::NotFound => {
+			handle_notfound(address, &message.payload);
+			Ok(())
+		}
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())
@@ -1816,6 +1831,59 @@ async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_w
 		.send_message("addr", &message_addr.to_bytes())
 		.await
 		.context("failed to send addr")
+}
+
+/// Handles an incoming inv message from a peer
+fn handle_inv(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) -> Result<()> {
+	let inv = MessageInv::from_bytes(payload).context("failed to parse inv message")?;
+
+	debug!(count = inv.items().len(), peer = %address, "received inv");
+
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		if node.inv_known.len() >= MAX_INV_KNOWN {
+			node.inv_known.clear();
+		}
+
+		for item in inv.items() {
+			node.inv_known.insert(item.hash);
+		}
+	}
+
+	// No data requests yet -- block sync not implemented
+	Ok(())
+}
+
+/// Handles an incoming getdata message from a peer
+///
+/// Responds with notfound for all items since we have no data to serve yet.
+/// Echoes the raw payload back as notfound -- the wire format is identical,
+/// and this preserves items with unknown inv types that `from_bytes` would drop
+async fn handle_getdata(
+	_node_manager: &Arc<NodeManager>,
+	address: &IpAddr,
+	tcp_writer: &SharedTcpWriter,
+	payload: &[u8],
+) -> Result<()> {
+	debug!(peer = %address, payload_len = payload.len(), "received getdata, responding with notfound");
+
+	// Echo the payload verbatim: inv/getdata/notfound share the same wire format,
+	// and we have nothing to serve, so every requested item is "not found"
+	tcp_writer
+		.send_message("notfound", payload)
+		.await
+		.context("failed to send notfound")
+}
+
+/// Handles an incoming notfound message from a peer
+fn handle_notfound(address: &IpAddr, payload: &[u8]) {
+	match MessageInv::from_bytes(payload) {
+		Ok(inv) => {
+			debug!(count = inv.items().len(), peer = %address, "received notfound");
+		}
+		Err(e) => {
+			warn!(peer = %address, error = %e, "failed to parse notfound message");
+		}
+	}
 }
 
 #[cfg(test)]
