@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{anyhow, Context, Result};
+mod handler_addr;
+mod handler_headers;
+mod handler_inv;
+mod handler_ping;
+mod handler_verack;
+mod handler_version;
+
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use rand::RngCore;
-use siphasher::sip::SipHasher13;
 use std::{
 	collections::HashSet,
 	ffi::CStr,
@@ -27,15 +33,11 @@ use crate::{
 	dns::DEFAULT_PORT,
 	headers::HeaderStore,
 	network::{
-		message_addr::{AddrEntry, MessageAddr},
-		message_getheaders::MessageGetHeaders,
-		message_headers::{MessageHeaders, MAX_HEADERS_PER_MSG},
-		message_inv::{InvType, MessageInv},
-		message_version::MessageVersion,
-		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
+		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
 	types::{block::BlockHeader, hash::Hash256},
-	utils::{is_recently_active, is_routable, unix_now, vec_to_u64_le},
+	utils::{is_routable, unix_now},
 };
 
 /// Base delay for exponential backoff in seconds
@@ -105,7 +107,6 @@ const MAX_ADDR_KNOWN: usize = 5000;
 const MAX_INV_KNOWN: usize = 50_000;
 
 /// Minimum protocol version that supports sendheaders (BIP 130)
-#[allow(dead_code)] // used in subsequent headers-sync tasks
 const SENDHEADERS_VERSION: u32 = 70012;
 
 /// Maximum concurrent incoming connections
@@ -227,8 +228,20 @@ pub struct NodeStats {
 	pub total: usize,
 	/// Number of nodes in Connected state
 	pub connected: usize,
-	/// Number of nodes not in Connected state
+	/// Connected incoming peers
+	pub incoming: usize,
+	/// Connected outgoing peers
+	pub outgoing: usize,
+	/// Nodes in Handshaking state
+	pub handshaking: usize,
+	/// Nodes in Connecting state
+	pub connecting: usize,
+	/// Nodes in Disconnected state
 	pub disconnected: usize,
+	/// Nodes in Dead state
+	pub dead: usize,
+	/// Nodes in Banned state
+	pub banned: usize,
 }
 
 /// Direction of a node connection
@@ -291,6 +304,18 @@ impl NodeStateLabel {
 			NodeState::Banned { .. } => Self::Banned,
 		}
 	}
+
+	/// Returns a short 2-char label for compact table display
+	pub const fn short(&self) -> &'static str {
+		match self {
+			Self::Connecting => "Cn",
+			Self::Handshaking => "Hs",
+			Self::Connected => "Co",
+			Self::Disconnected(_) => "Dc",
+			Self::Dead => "De",
+			Self::Banned => "Ba",
+		}
+	}
 }
 
 /// Lightweight snapshot of node data for display purposes
@@ -308,6 +333,10 @@ pub struct NodeSnapshot {
 	pub connection_type: ConnectionType,
 	/// Human-readable state label for display
 	pub state_label: NodeStateLabel,
+	/// Protocol version reported by peer
+	pub version: u32,
+	/// User agent string from version message
+	pub user_agent: String,
 }
 
 /// Represents a node in the Catcoin network
@@ -617,18 +646,56 @@ impl NodeManager {
 		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
 	}
 
+	/// Returns the current chain tip height from the header store
+	pub fn chain_height(&self) -> u32 {
+		self.header_store.read().height()
+	}
+
 	/// Returns stats and node snapshots in a single `DashMap` iteration
 	///
 	/// Only acquires shard locks once for both stats and snapshot data
 	pub fn get_snapshot(&self) -> (NodeStats, Vec<NodeSnapshot>) {
 		let mut connected: usize = 0;
+		let mut incoming: usize = 0;
+		let mut outgoing: usize = 0;
+		let mut handshaking: usize = 0;
+		let mut connecting: usize = 0;
+		let mut disconnected: usize = 0;
+		let mut dead: usize = 0;
+		let mut banned: usize = 0;
+
 		let snapshots: Vec<NodeSnapshot> = self
 			.nodes
 			.iter()
 			.map(|entry| {
 				let node = entry.value();
-				if node.state.is_connected() {
-					connected = connected.saturating_add(1);
+				match &node.state {
+					NodeState::Connected { .. } => {
+						connected = connected.saturating_add(1);
+						match node.connection_type {
+							ConnectionType::Incoming => {
+								incoming = incoming.saturating_add(1);
+							}
+							ConnectionType::Outgoing => {
+								outgoing = outgoing.saturating_add(1);
+							}
+						}
+					}
+					NodeState::Handshaking { .. } => {
+						handshaking = handshaking.saturating_add(1);
+					}
+					NodeState::Connecting { .. } => {
+						connecting = connecting.saturating_add(1);
+					}
+					NodeState::Disconnected { .. } => {
+						disconnected = disconnected.saturating_add(1);
+					}
+					NodeState::Dead => {
+						dead = dead.saturating_add(1);
+					}
+					NodeState::Banned { .. } => {
+						banned = banned.saturating_add(1);
+					}
 				}
 				NodeSnapshot {
 					address: *entry.key(),
@@ -636,18 +703,25 @@ impl NodeManager {
 					height: node.height,
 					connection_type: node.connection_type,
 					state_label: NodeStateLabel::from_state(&node.state),
+					version: node.version,
+					user_agent: node.user_agent.clone(),
 				}
 			})
 			.collect();
 
 		let total = snapshots.len();
-		let disconnected = total.saturating_sub(connected);
 
 		(
 			NodeStats {
 				total,
 				connected,
+				incoming,
+				outgoing,
+				handshaking,
+				connecting,
 				disconnected,
+				dead,
+				banned,
 			},
 			snapshots,
 		)
@@ -1279,29 +1353,37 @@ async fn parse_incoming_message(
 	}
 
 	match command {
-		NetworkCommand::Version => handle_version(node_manager, address, tcp_writer, &message.payload).await,
-		NetworkCommand::Verack => handle_verack(node_manager, address, tcp_writer).await,
-		NetworkCommand::Ping => handle_ping(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::Version => {
+			handler_version::handle_version(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::Verack => handler_verack::handle_verack(node_manager, address, tcp_writer).await,
+		NetworkCommand::Ping => handler_ping::handle_ping(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
-			handle_pong(node_manager, address, &message.payload);
+			handler_ping::handle_pong(node_manager, address, &message.payload);
 			Ok(())
 		}
-		NetworkCommand::Addr => handle_addr(node_manager, address, &message.payload).await,
+		NetworkCommand::Addr => handler_addr::handle_addr(node_manager, address, &message.payload).await,
 		NetworkCommand::Alert => {
 			debug!("Received alert from {}, ignoring", address);
 			Ok(())
 		}
-		NetworkCommand::GetAddr => handle_getaddr(node_manager, address, tcp_writer).await,
-		NetworkCommand::Inv => handle_inv(node_manager, address, tcp_writer, &message.payload).await,
-		NetworkCommand::GetData => handle_getdata(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::GetAddr => handler_addr::handle_getaddr(node_manager, address, tcp_writer).await,
+		NetworkCommand::Inv => handler_inv::handle_inv(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::GetData => {
+			handler_inv::handle_getdata(node_manager, address, tcp_writer, &message.payload).await
+		}
 		NetworkCommand::NotFound => {
-			handle_notfound(address, &message.payload);
+			handler_inv::handle_notfound(address, &message.payload);
 			Ok(())
 		}
-		NetworkCommand::Headers => handle_headers(node_manager, address, tcp_writer, &message.payload).await,
-		NetworkCommand::GetHeaders => handle_getheaders(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::Headers => {
+			handler_headers::handle_headers(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::GetHeaders => {
+			handler_headers::handle_getheaders(node_manager, address, tcp_writer, &message.payload).await
+		}
 		NetworkCommand::SendHeaders => {
-			handle_sendheaders(node_manager, address);
+			handler_headers::handle_sendheaders(node_manager, address);
 			Ok(())
 		}
 		NetworkCommand::Unknown(cmd) => {
@@ -1311,752 +1393,13 @@ async fn parse_incoming_message(
 	}
 }
 
-/// Handles an incoming version message from a peer
-async fn handle_version(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	let version = MessageVersion::from_bytes(payload).context("failed to parse version message")?;
-
-	// Phase 1: Validate under lock, then release
-	let (is_incoming, port) = {
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
-
-		// Nodes can send only one version command
-		if node.version_received {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Node {} sent version command twice, banning", address);
-			return Err(anyhow!("Node {address} sent version command twice"));
-		}
-
-		if version.nonce == node_manager.my_nonce {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Self-connection detected to {}, banning", address);
-			return Err(anyhow!("Node {address} is myself"));
-		}
-
-		(node.connection_type == ConnectionType::Incoming, node.port)
-		// RefMut dropped here
-	};
-
-	// Phase 2: Async sends without holding any lock
-	if is_incoming {
-		let network_address = NetworkAddress::new(*address, port);
-		let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
-		tcp_writer
-			.send_message("version", &version_message.to_bytes())
-			.await
-			.context("failed to send version reply for inbound connection")?;
-	}
-
-	// Validate start_height
-	if version.start_height < 0 {
-		if let Some(mut node) = node_manager.nodes.get_mut(address) {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::Misbehavior,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-		}
-		warn!(
-			"Node {} sent negative start_height {}, banning",
-			address, version.start_height
-		);
-		return Err(anyhow!("Node {address} sent negative start_height"));
-	}
-
-	// Warn on extreme clock skew but don't ban (clock drift is common)
-	// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
-	// i64 subtraction of two timestamps can't overflow in practice (both near current epoch)
-	#[allow(clippy::cast_possible_wrap, clippy::arithmetic_side_effects)]
-	let time_diff = (version.timestamp - unix_now() as i64).unsigned_abs();
-	if time_diff > 4200 {
-		warn!("Node {} clock skew is {}s (threshold 4200s)", address, time_diff);
-	}
-
-	// Phase 3: Re-acquire lock to write fields
-	// Verify state hasn't changed between phases (another task could have banned the node)
-	{
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager during version handling"))?;
-
-		if !matches!(node.state, NodeState::Handshaking { .. }) {
-			return Err(anyhow!(
-				"node {address} state changed during version handling (now {})",
-				node.state
-			));
-		}
-
-		node.services = version.services;
-		node.timestamp = version.timestamp;
-		node.user_agent = sanitize_user_agent(&version.user_agent);
-		node.height = version.start_height;
-		node.version = version.version;
-		node.version_received = true;
-		node.relay = version.relay;
-		node.pending_external_ip = Some(version.addr_recv.address);
-	}
-
-	// Verack sent after all locks released
-	tcp_writer
-		.send_message("verack", &[])
-		.await
-		.context("failed to send verack")
-}
-
-/// Handles an incoming verack message from a peer
-async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
-	let pending_ip = {
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
-
-		// Verack before version is a protocol violation
-		if !node.version_received {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Node {} sent verack before version, banning", address);
-			return Err(anyhow!("Node {address} sent verack before version"));
-		}
-
-		info!(
-			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			address, node.version, node.height, node.user_agent
-		);
-
-		node.state = NodeState::Connected {
-			writer: Arc::clone(tcp_writer),
-		};
-		node.sent_getaddr = true;
-
-		node.pending_external_ip.take()
-		// RefMut dropped here
-	};
-
-	// Record external IP vote only after handshake completes
-	if let Some(ip) = pending_ip {
-		node_manager.record_external_ip_vote(ip);
-	}
-
-	tcp_writer
-		.send_message("getaddr", &[])
-		.await
-		.context("failed to send getaddr")?;
-
-	// Send sendheaders if peer supports it (BIP 130)
-	let peer_version = node_manager.nodes.get(address).map_or(0, |n| n.version);
-	if peer_version >= SENDHEADERS_VERSION {
-		tcp_writer
-			.send_message("sendheaders", &[])
-			.await
-			.context("failed to send sendheaders")?;
-	}
-
-	// Begin header sync
-	let locator = node_manager.header_store.read().build_locator();
-	let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-	tcp_writer
-		.send_message("getheaders", &getheaders.to_bytes())
-		.await
-		.context("failed to send initial getheaders")?;
-
-	debug!(peer = %address, "sent initial getheaders for header sync");
-
-	Ok(())
-}
-
-/// Handles an incoming ping message from a peer
-async fn handle_ping(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	// Pre-BIP31 nodes send 0-byte pings; just acknowledge silently
-	if payload.is_empty() {
-		debug!("Received pre-BIP31 ping (no nonce) from {}", address);
-		return Ok(());
-	}
-
-	if payload.len() != 8 {
-		warn!("Received malformed ping command from {}", address);
-
-		let now = unix_now();
-		node_manager.set_state(
-			address,
-			NodeState::Banned {
-				reason: BanReason::Misbehavior,
-				created: now,
-				expires: ban_expires_at(now),
-			},
-		);
-
-		return Err(anyhow!("Received malformed ping command from {address}"));
-	}
-
-	let nonce = vec_to_u64_le(payload).context("failed to parse ping nonce")?;
-	debug!("Received ping command from {} with nonce {}", address, nonce);
-
-	tcp_writer
-		.send_message("pong", &nonce.to_le_bytes())
-		.await
-		.context("failed to send pong")
-}
-
-/// Handles an incoming pong message from a peer
-///
-/// Validates that the nonce matches the last ping we sent
-fn handle_pong(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) {
-	if payload.len() != 8 {
-		warn!(
-			"Received malformed pong from {} ({} bytes, expected 8)",
-			address,
-			payload.len()
-		);
-		return;
-	}
-
-	let Ok(nonce) = vec_to_u64_le(payload) else {
-		warn!("Failed to parse pong nonce from {}", address);
-		return;
-	};
-
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		match node.last_ping_nonce.take() {
-			Some(expected) if expected == nonce => {
-				debug!("Valid pong from {}", address);
-			}
-			Some(expected) => {
-				warn!(
-					"Pong nonce mismatch from {}: expected {}, got {}",
-					address, expected, nonce
-				);
-			}
-			None => {
-				debug!("Received unsolicited pong from {}", address);
-			}
-		}
-	}
-}
-
-/// Strips non-printable and non-ASCII characters from a user agent string
-///
-/// Prevents terminal escape sequence injection via malicious user agents.
-/// Trims leading/trailing whitespace to prevent display confusion
-fn sanitize_user_agent(s: &str) -> String {
-	s.chars()
-		.filter(|c| c.is_ascii_graphic() || *c == ' ')
-		.take(MAX_USER_AGENT_DISPLAY)
-		.collect::<String>()
-		.trim()
-		.to_string()
-}
-
-/// Computes a deterministic score for relay peer selection
-///
-/// Uses `SipHash-1-3` keyed by `relay_key` to produce a stable ranking of peers
-/// for a given address within a 24-hour time bucket. Same inputs always produce same output
-fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
-	use std::hash::{Hash, Hasher};
-	let mut hasher = SipHasher13::new_with_keys(relay_key, 0);
-	addr_hash.hash(&mut hasher);
-	time_bucket.hash(&mut hasher);
-	peer_hash.hash(&mut hasher);
-	hasher.finish()
-}
-
-/// Relays addr entries to the top-scoring outgoing peers
-///
-/// For each recently-active entry, selects the best peers by deterministic
-/// hash score and sends a single-entry addr message to each
-async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, entries: &[&AddrEntry]) {
-	if entries.is_empty() {
-		return;
-	}
-
-	// unix_now() returns seconds; 86400 seconds per day
-	#[allow(clippy::arithmetic_side_effects)]
-	let time_bucket = unix_now() / (24 * 60 * 60);
-
-	// Collect connected outgoing peers (excluding source), releasing DashMap lock
-	let peers: Vec<(IpAddr, SharedTcpWriter)> = node_manager
-		.nodes
-		.iter()
-		.filter_map(|entry| {
-			let node = entry.value();
-			if *entry.key() == *source_address {
-				return None;
-			}
-			if node.connection_type != ConnectionType::Outgoing {
-				return None;
-			}
-			if let NodeState::Connected { ref writer } = node.state {
-				Some((*entry.key(), Arc::clone(writer)))
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	if peers.is_empty() {
-		return;
-	}
-
-	for entry in entries {
-		// Hash the IP for a stable addr identifier
-		let addr_hash = {
-			use std::hash::{Hash, Hasher};
-			let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
-			entry.address.address.hash(&mut hasher);
-			hasher.finish()
-		};
-
-		// Serialize once per entry, reuse for all peers
-		let relay_entry = AddrEntry {
-			timestamp: entry.timestamp,
-			address: NetworkAddress {
-				services: entry.address.services,
-				address: entry.address.address,
-				port: entry.address.port,
-			},
-		};
-		let msg = MessageAddr::from_entries(vec![relay_entry]);
-		let payload = msg.to_bytes();
-
-		// Score each peer and sort descending
-		let mut scored: Vec<(usize, u64)> = peers
-			.iter()
-			.enumerate()
-			.map(|(idx, (ip, _))| {
-				let peer_hash = {
-					use std::hash::{Hash, Hasher};
-					let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
-					ip.hash(&mut hasher);
-					hasher.finish()
-				};
-				(
-					idx,
-					compute_relay_score(node_manager.relay_key, addr_hash, time_bucket, peer_hash),
-				)
-			})
-			.collect();
-
-		scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-		// Relay to top ADDR_RELAY_PEER_COUNT peers
-		for &(idx, _) in scored.iter().take(ADDR_RELAY_PEER_COUNT) {
-			// idx is bounded by peers.len() from the enumerate above
-			#[allow(clippy::indexing_slicing)]
-			let (ref peer_ip, ref writer) = peers[idx];
-
-			// Check and update addr_known under DashMap lock
-			// Clear the set when the 24h time bucket rotates to prevent unbounded growth
-			let already_known = if let Some(mut node) = node_manager.nodes.get_mut(peer_ip) {
-				if node.addr_known_bucket != time_bucket {
-					node.addr_known.clear();
-					node.addr_known_bucket = time_bucket;
-				}
-				// Cap addr_known to prevent unbounded growth within a 24h bucket
-				if node.addr_known.len() >= MAX_ADDR_KNOWN {
-					true
-				} else {
-					!node.addr_known.insert(entry.address.address)
-				}
-			} else {
-				continue;
-			};
-
-			if already_known {
-				continue;
-			}
-
-			if let Err(e) = writer.send_message("addr", &payload).await {
-				debug!("Failed to relay addr to {}: {}", peer_ip, e);
-			}
-		}
-	}
-}
-
-/// Refills a peer's addr token bucket based on elapsed time
-///
-/// Returns the updated token count, capped at `ADDR_TOKEN_CAPACITY`
-fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
-	// Both operands are finite and bounded; result is capped by min()
-	#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
-	elapsed
-		.as_secs_f64()
-		.mul_add(ADDR_TOKEN_RATE, tokens)
-		.min(ADDR_TOKEN_CAPACITY)
-}
-
-/// Handles an incoming addr message containing peer addresses
-async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload: &[u8]) -> Result<()> {
-	let msg = MessageAddr::from_bytes(payload).context("failed to parse addr message")?;
-
-	debug!(
-		"Received addr message with {} addresses from {}",
-		msg.entries().len(),
-		address
-	);
-
-	// Rate limiting: refill tokens, check freshness before deducting
-	let mut recently_active_indices: Vec<usize> = Vec::new();
-	{
-		let Some(mut node) = node_manager.nodes.get_mut(address) else {
-			return Ok(());
-		};
-
-		let now_instant = Instant::now();
-		let elapsed = now_instant.duration_since(node.last_token_refill);
-		node.addr_tokens = refill_addr_tokens(node.addr_tokens, elapsed);
-		node.last_token_refill = now_instant;
-
-		for (i, entry) in msg.entries().iter().enumerate() {
-			// Check freshness before consuming a token so stale entries don't drain budget
-			if !is_recently_active(entry.timestamp) {
-				debug!(
-					"Addr: {} filtered out (timestamp={}, not recently active)",
-					entry.address.address, entry.timestamp
-				);
-				continue;
-			}
-
-			if node.addr_tokens >= 1.0 {
-				// Finite f64 subtraction; both operands are bounded by ADDR_TOKEN_CAPACITY
-				#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
-				{
-					node.addr_tokens -= 1.0;
-				}
-				recently_active_indices.push(i);
-			} else {
-				debug!(
-					"Rate limited addr entry {} from {} (tokens exhausted)",
-					entry.address.address, address
-				);
-			}
-		}
-	}
-
-	if recently_active_indices.is_empty() {
-		return Ok(());
-	}
-
-	for &i in &recently_active_indices {
-		// msg.entries() is bounded by 1000 (validated in from_bytes), i < entries.len()
-		#[allow(clippy::indexing_slicing)]
-		let entry = &msg.entries()[i];
-		let entry_ip = entry.address.address;
-
-		// Reject non-routable IPs to prevent internal network probing
-		if !is_routable(entry_ip) {
-			debug!("Addr: {} filtered out (not routable)", entry_ip);
-			continue;
-		}
-
-		// Reject port 0 which has undefined connect behavior
-		if entry.address.port == 0 {
-			debug!("Addr: {} filtered out (port 0)", entry_ip);
-			continue;
-		}
-
-		// Try to revive Dead nodes with a newer timestamp
-		if node_manager.revive_if_newer(&entry_ip, entry.address.port, entry.timestamp) {
-			info!("Revived dead node {} with newer addr timestamp", entry_ip);
-			continue;
-		}
-
-		// Otherwise try to insert as new outgoing node
-		debug!("Addr: {} is recently active, adding", entry.address.address);
-		node_manager.insert_outgoing(entry.address.address, entry.address.port);
-	}
-
-	// Relay eligible entries to other peers
-	// Only relay small batches from organic gossip (not getaddr responses)
-	let should_relay = node_manager.nodes.get(address).is_some_and(|n| !n.sent_getaddr);
-
-	if should_relay && msg.entries().len() <= ADDR_RELAY_MAX_ENTRIES {
-		// recently_active_indices already filters by is_recently_active, no re-check needed
-		let relay_entries: Vec<&AddrEntry> = recently_active_indices
-			.iter()
-			.map(|&i| {
-				// Indices are bounded by msg.entries().len() from the rate limiting loop
-				#[allow(clippy::indexing_slicing)]
-				&msg.entries()[i]
-			})
-			.collect();
-
-		relay_addr(node_manager, address, &relay_entries).await;
-	}
-
-	Ok(())
-}
-
-/// Handles an incoming getaddr request from a peer
-async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
-	// Rate limit getaddr responses to 1 per minute
-	{
-		let Some(mut node) = node_manager.nodes.get_mut(address) else {
-			return Ok(());
-		};
-
-		if let Some(last) = node.last_getaddr_response {
-			if last.elapsed() < Duration::from_secs(60) {
-				debug!("Rate limiting getaddr from {}", address);
-				return Ok(());
-			}
-		}
-
-		node.last_getaddr_response = Some(Instant::now());
-	}
-
-	let now = unix_now();
-
-	// Filter the node list so we share only recently active outgoing connections
-	// Incoming connections use ephemeral OS ports -- their stored port is not their real listening port
-	let filtered_nodes: Vec<NetworkAddress> = node_manager
-		.nodes
-		.iter()
-		.filter(|entry| {
-			let node = entry.value();
-			node.state.is_connected()
-				&& node.connection_type == ConnectionType::Outgoing
-				&& (now.saturating_sub(node.last_seen) < GETADDR_RECENT_WINDOW)
-		})
-		.take(1000) // Protocol limits to maximum of 1000 entries per addr message
-		.map(|entry| {
-			let node = entry.value();
-			NetworkAddress {
-				services: node.services,
-				address: *entry.key(),
-				port: node.port,
-			}
-		})
-		.collect();
-
-	if filtered_nodes.is_empty() {
-		debug!(
-			"No recently active outgoing nodes to share for GetAddr from {}",
-			address
-		);
-		return Ok(());
-	}
-
-	debug!("Sending list of {} nodes to {}", filtered_nodes.len(), address);
-
-	let message_addr = MessageAddr::new(filtered_nodes);
-	tcp_writer
-		.send_message("addr", &message_addr.to_bytes())
-		.await
-		.context("failed to send addr")
-}
-
-/// Handles an incoming inv message from a peer
-async fn handle_inv(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	let inv = MessageInv::from_bytes(payload).context("failed to parse inv message")?;
-
-	debug!(count = inv.items().len(), peer = %address, "received inv");
-
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		if node.inv_known.len() >= MAX_INV_KNOWN {
-			node.inv_known.clear();
-		}
-
-		for item in inv.items() {
-			node.inv_known.insert(item.hash);
-		}
-	}
-
-	// Request headers if any announced blocks are unknown to us
-	let has_new_blocks = {
-		let store = node_manager.header_store.read();
-		inv.items()
-			.iter()
-			.any(|item| item.inv_type == InvType::Block && store.get(&item.hash).is_none())
-	};
-
-	if has_new_blocks {
-		let locator = node_manager.header_store.read().build_locator();
-		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-		tcp_writer
-			.send_message("getheaders", &getheaders.to_bytes())
-			.await
-			.context("failed to send getheaders after block inv")?;
-		debug!(peer = %address, "requesting headers after block inv");
-	}
-
-	Ok(())
-}
-
-/// Handles an incoming getdata message from a peer
-///
-/// Responds with notfound for all items since we have no data to serve yet.
-/// Echoes the raw payload back as notfound -- the wire format is identical,
-/// and this preserves items with unknown inv types that `from_bytes` would drop
-async fn handle_getdata(
-	_node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	debug!(peer = %address, payload_len = payload.len(), "received getdata, responding with notfound");
-
-	// Echo the payload verbatim: inv/getdata/notfound share the same wire format,
-	// and we have nothing to serve, so every requested item is "not found"
-	tcp_writer
-		.send_message("notfound", payload)
-		.await
-		.context("failed to send notfound")
-}
-
-/// Handles an incoming notfound message from a peer
-fn handle_notfound(address: &IpAddr, payload: &[u8]) {
-	match MessageInv::from_bytes(payload) {
-		Ok(inv) => {
-			debug!(count = inv.items().len(), peer = %address, "received notfound");
-		}
-		Err(e) => {
-			warn!(peer = %address, error = %e, "failed to parse notfound message");
-		}
-	}
-}
-
-/// Handles an incoming sendheaders message (BIP 130)
-///
-/// Sets the peer's preference flag so we send future block
-/// announcements via headers instead of inv
-fn handle_sendheaders(node_manager: &NodeManager, address: &IpAddr) {
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		node.prefer_headers = true;
-		debug!("Peer {} prefers headers announcements", address);
-	}
-}
-
-/// Handles an incoming headers message from a peer
-///
-/// Validates chain continuity via batch insertion, then requests
-/// more headers if we received a full batch (2000)
-async fn handle_headers(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	let msg = MessageHeaders::from_bytes(payload).context("failed to parse headers message")?;
-	let count = msg.headers().len();
-
-	if count == 0 {
-		return Ok(());
-	}
-
-	let headers = msg.into_headers();
-
-	// Batch insert under a single write lock. Don't disconnect on failure --
-	// the peer may have sent orphan or fork headers that we can't connect yet.
-	// Log the error and move on instead of killing the connection
-	let insert_result = node_manager.header_store.write().add_headers(&headers);
-	let added = match insert_result {
-		Ok(n) => n,
-		Err(e) => {
-			warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
-			return Ok(());
-		}
-	};
-
-	info!(received = count, added, peer = %address, "processed headers");
-
-	// If we got a full batch, request more
-	if count == MAX_HEADERS_PER_MSG {
-		let locator = node_manager.header_store.read().build_locator();
-		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-		tcp_writer
-			.send_message("getheaders", &getheaders.to_bytes())
-			.await
-			.context("failed to send follow-up getheaders")?;
-		debug!(peer = %address, "requesting more headers");
-	}
-
-	Ok(())
-}
-
-/// Handles an incoming getheaders request from a peer
-///
-/// Finds the fork point using the locator hashes, then sends
-/// up to 2000 headers from our chain via the height index
-async fn handle_getheaders(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	let msg = MessageGetHeaders::from_bytes(payload).context("failed to parse getheaders")?;
-
-	// Scope the read lock so it drops before any await point
-	let response_headers = {
-		let store = node_manager.header_store.read();
-
-		// Find fork point: first locator hash that exists in our chain
-		let mut start_height: u32 = 0;
-		for hash in msg.locator_hashes() {
-			if *hash == store.genesis() {
-				start_height = 0;
-				break;
-			}
-			if let Some(stored) = store.get(hash) {
-				start_height = stored.height;
-				break;
-			}
-		}
-
-		store.get_headers_after(start_height, MAX_HEADERS_PER_MSG, msg.hash_stop())
-	};
-
-	if response_headers.is_empty() {
-		debug!(peer = %address, "no headers to send for getheaders");
-		return Ok(());
-	}
-
-	debug!(count = response_headers.len(), peer = %address, "sending headers response");
-
-	let response = MessageHeaders::new(response_headers);
-	tcp_writer
-		.send_message("headers", &response.to_bytes())
-		.await
-		.context("failed to send headers response")
-}
-
 #[cfg(test)]
 // Tests use unwrap/indexing for brevity since panics are the intended failure mode.
 // DashMap guard drop order doesn't matter in synchronous test functions
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
 mod tests {
+	use super::handler_addr::{compute_relay_score, refill_addr_tokens};
+	use super::handler_version::sanitize_user_agent;
 	use super::*;
 
 	/// Dummy genesis header for tests that don't care about header data
