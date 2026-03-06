@@ -25,10 +25,11 @@ cargo run -- --help                          # Show help
 - Headers-first chain synchronization (getheaders/headers, protocol version 70012)
 - sendheaders signal (BIP 130) for header-based block announcements
 - In-memory header chain with dual indexing (hash and height)
+- Persistent header storage via redb (pure Rust embedded DB, write-through)
 - Core blockchain types (block headers, transactions, inventory)
 - Inventory protocol (inv/getdata/notfound) with header-triggered sync
 - TUI and daemon modes
-- Persistent peer and ban storage across restarts
+- Persistent peer, ban, and header storage across restarts
 
 ## TUI mode
 
@@ -50,4 +51,5 @@ RUST_LOG=trace cargo run               # Everything
 
 ## Notable dependencies
 
+- **redb** -- Pure Rust embedded key-value database for persistent header storage. Copy-on-write B-trees, ACID transactions, zero C/C++ linkage
 - **siphasher** -- Keyed SipHash for deterministic addr relay peer selection. Provides stable, cross-platform hashing independent of Rust's `DefaultHasher` which can change between compiler versions

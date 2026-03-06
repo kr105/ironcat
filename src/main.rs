@@ -7,7 +7,7 @@ use ironcat::{
 	dns,
 	network::listening_start,
 	nodes::NodeManager,
-	storage,
+	storage::{self, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore},
 	tui_layer::{TuiLayer, TuiLogEntry},
 	types::{block::BlockHeader, hash::Hash256},
 	ui::tui::tui_start,
@@ -58,13 +58,26 @@ async fn main() -> Result<()> {
 	}
 }
 
+/// Opens the header persistence backend, returning None on failure
+fn open_header_backend(datadir: &std::path::Path) -> Option<Arc<dyn HeaderStoreBackend>> {
+	let db_path = datadir.join("headers.redb");
+	match RedbHeaderStore::open(&db_path) {
+		Ok(store) => Some(Arc::new(store)),
+		Err(e) => {
+			error!(error = %e, "failed to open header database, headers will not persist");
+			None
+		}
+	}
+}
+
 /// Core application loop shared between TUI and daemon modes
 async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
-	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER));
-
-	// Ensure data directory exists
+	// Ensure data directory exists before opening any databases
 	std::fs::create_dir_all(&args.datadir)
 		.with_context(|| format!("failed to create data directory {}", args.datadir.display()))?;
+
+	let header_backend = open_header_backend(&args.datadir);
+	let node_manager = Arc::new(NodeManager::with_header_backend(GENESIS_HEADER, header_backend));
 
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {

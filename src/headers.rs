@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{bail, Result};
-use tracing::{debug, warn};
+use anyhow::{bail, Context, Result};
+use tracing::{debug, error, info, warn};
 
-use crate::types::{block::BlockHeader, hash::Hash256};
+use crate::{
+	storage::header_store_backend::HeaderStoreBackend,
+	types::{block::BlockHeader, hash::Hash256},
+};
 
 /// Maximum number of hashes in a block locator vector
 const MAX_LOCATOR_HASHES: usize = 101;
@@ -27,18 +30,126 @@ pub struct StoredHeader {
 pub struct HeaderStore {
 	by_hash: HashMap<Hash256, StoredHeader>,
 	by_height: Vec<Hash256>,
+	backend: Option<Arc<dyn HeaderStoreBackend>>,
 }
 
 impl HeaderStore {
 	/// Creates a new header store initialized with the genesis block at height 0
 	///
 	/// The `HashMap` is pre-allocated for 500,000 entries to reduce rehashing
-	/// during initial block download
+	/// during initial block download. No persistence backend is used
 	pub fn new(genesis_header: BlockHeader) -> Self {
-		let genesis = genesis_header.block_hash();
+		Self::with_backend(genesis_header, None)
+	}
+
+	/// Creates a header store with an optional persistence backend
+	///
+	/// If a backend is provided and contains stored headers, the in-memory
+	/// state is populated from disk. The genesis block hash is verified on
+	/// reload -- a mismatch means wrong network, so we clear the database
+	/// and start fresh
+	pub fn with_backend(genesis_header: BlockHeader, backend: Option<Arc<dyn HeaderStoreBackend>>) -> Self {
+		let genesis_hash = genesis_header.block_hash();
+
+		if let Some(ref be) = backend {
+			match Self::try_load_from_backend(be.as_ref(), genesis_hash) {
+				Ok(Some((by_hash, by_height))) => {
+					#[allow(clippy::arithmetic_side_effects)] // by_height is non-empty (has genesis)
+					let tip_height = by_height.len() - 1;
+					info!(count = by_height.len(), tip_height, "loaded headers from disk");
+					return Self {
+						by_hash,
+						by_height,
+						backend,
+					};
+				}
+				Ok(None) => {
+					// Empty database or cleared after mismatch, persist genesis
+					if let Err(e) = be.persist_header(&genesis_header, 0) {
+						error!(error = %e, "failed to persist genesis header, disabling backend");
+						return Self::make_fresh(genesis_header, genesis_hash, None);
+					}
+				}
+				Err(e) => {
+					error!(error = %e, "failed to load headers from backend, disabling backend");
+					return Self::make_fresh(genesis_header, genesis_hash, None);
+				}
+			}
+		}
+
+		Self::make_fresh(genesis_header, genesis_hash, backend)
+	}
+
+	/// Attempts to load headers from the backend, validating genesis and chain continuity
+	///
+	/// Returns `Ok(Some(...))` on successful load, `Ok(None)` if the database
+	/// was empty (or was cleared due to genesis mismatch), and `Err` on
+	/// unrecoverable failure
+	#[allow(clippy::type_complexity)] // internal return type, alias would obscure intent
+	fn try_load_from_backend(
+		be: &dyn HeaderStoreBackend,
+		genesis_hash: Hash256,
+	) -> Result<Option<(HashMap<Hash256, StoredHeader>, Vec<Hash256>)>> {
+		let headers = be.load_all()?;
+
+		if headers.is_empty() {
+			return Ok(None);
+		}
+
+		// Verify genesis matches
+		#[allow(clippy::indexing_slicing)] // headers is non-empty (checked above)
+		let (ref first_header, first_height) = headers[0];
+		let first_hash = first_header.block_hash();
+
+		if first_height != 0 || first_hash != genesis_hash {
+			error!("genesis mismatch in header database, clearing and starting fresh");
+			be.clear()?;
+			return Ok(None);
+		}
+
+		// Build in-memory state and validate chain continuity
+		let mut by_hash = HashMap::with_capacity(500_000.max(headers.len()));
+		let mut by_height = Vec::with_capacity(headers.len());
+
+		let mut prev_hash = Hash256::ZERO; // genesis has prev_hash = ZERO
+
+		for (header, height) in &headers {
+			let hash = header.block_hash();
+
+			if header.prev_hash != prev_hash {
+				error!(
+					height,
+					expected_prev = %prev_hash,
+					got_prev = %header.prev_hash,
+					"chain continuity broken in header database, clearing and starting fresh"
+				);
+				be.clear()?;
+				return Ok(None);
+			}
+
+			by_hash.insert(
+				hash,
+				StoredHeader {
+					header: header.clone(),
+					height: *height,
+				},
+			);
+			by_height.push(hash);
+			prev_hash = hash;
+		}
+
+		Ok(Some((by_hash, by_height)))
+	}
+
+	/// Creates a fresh in-memory store with only the genesis header
+	fn make_fresh(
+		genesis_header: BlockHeader,
+		genesis_hash: Hash256,
+		backend: Option<Arc<dyn HeaderStoreBackend>>,
+	) -> Self {
 		let mut by_hash = HashMap::with_capacity(500_000);
 		by_hash.insert(
-			genesis,
+			genesis_hash,
 			StoredHeader {
 				header: genesis_header,
 				height: 0,
@@ -47,26 +158,21 @@ impl HeaderStore {
 
 		Self {
 			by_hash,
-			by_height: vec![genesis],
+			by_height: vec![genesis_hash],
+			backend,
 		}
 	}
 
-	/// Adds a single block header to the chain, returning its height
+	/// Validates a header chains to the given tip, returning the new height
 	///
-	/// The header's `prev_hash` must reference the current chain tip.
-	/// Duplicate headers (same block hash already stored) are rejected with an error.
-	/// Headers that reference a known block that is NOT the tip are rejected
-	/// (linear chain only, no forks)
-	pub fn add_header(&mut self, header: &BlockHeader) -> Result<u32> {
-		let hash = header.block_hash();
-
-		if self.by_hash.contains_key(&hash) {
-			warn!(block_hash = %hash, "rejecting duplicate header");
-			bail!("duplicate header {hash}");
-		}
-
-		let (tip_hash, tip_height) = self.tip();
-
+	/// Shared logic between `add_header` (real tip) and `add_headers` (shadow tip)
+	fn validate_chains_to_tip(
+		&self,
+		hash: Hash256,
+		header: &BlockHeader,
+		tip_hash: Hash256,
+		tip_height: u32,
+	) -> Result<u32> {
 		if header.prev_hash != tip_hash {
 			if self.by_hash.contains_key(&header.prev_hash) {
 				warn!(
@@ -85,10 +191,30 @@ impl HeaderStore {
 			bail!("orphan header {hash}: unknown prev_hash {}", header.prev_hash);
 		}
 
-		// Height is tip + 1; both are u32 and we won't realistically overflow
-		#[allow(clippy::arithmetic_side_effects)] // height won't exceed u32::MAX in practice
-		let height = tip_height + 1;
+		let height = tip_height.checked_add(1).context("chain height would overflow u32")?;
 
+		Ok(height)
+	}
+
+	/// Validates a single header against the current tip without modifying state
+	///
+	/// Returns `(hash, height)` on success
+	fn validate_header(&self, header: &BlockHeader) -> Result<(Hash256, u32)> {
+		let hash = header.block_hash();
+
+		if self.by_hash.contains_key(&hash) {
+			warn!(block_hash = %hash, "rejecting duplicate header");
+			bail!("duplicate header {hash}");
+		}
+
+		let (tip_hash, tip_height) = self.tip();
+		let height = self.validate_chains_to_tip(hash, header, tip_hash, tip_height)?;
+
+		Ok((hash, height))
+	}
+
+	/// Inserts a validated header into the in-memory maps
+	fn commit_to_memory(&mut self, hash: Hash256, header: &BlockHeader, height: u32) {
 		self.by_hash.insert(
 			hash,
 			StoredHeader {
@@ -97,8 +223,28 @@ impl HeaderStore {
 			},
 		);
 		self.by_height.push(hash);
-
 		debug!(block_hash = %hash, height, "stored header");
+	}
+
+	/// Adds a single block header to the chain, returning its height
+	///
+	/// The header's `prev_hash` must reference the current chain tip
+	/// Duplicate headers (same block hash already stored) are rejected
+	/// Headers that reference a known block that is NOT the tip are rejected
+	/// (linear chain only, no forks)
+	///
+	/// If a backend is configured, the header is persisted BEFORE being added
+	/// to in-memory state. A persist failure prevents the in-memory insert
+	pub fn add_header(&mut self, header: &BlockHeader) -> Result<u32> {
+		let (hash, height) = self.validate_header(header)?;
+
+		// Persist first, then commit to memory
+		if let Some(ref be) = self.backend {
+			be.persist_header(header, height)
+				.with_context(|| format!("failed to persist header at height {height}"))?;
+		}
+
+		self.commit_to_memory(hash, header, height);
 		Ok(height)
 	}
 
@@ -108,6 +254,9 @@ impl HeaderStore {
 	/// must be the hash of the previous header in the batch (or connect to the
 	/// current tip for the first non-duplicate). Duplicates at the start of the
 	/// batch are skipped. Returns the number of headers actually added
+	///
+	/// If a backend is configured, the entire batch is persisted in a single
+	/// transaction BEFORE being added to in-memory state
 	pub fn add_headers(&mut self, headers: &[BlockHeader]) -> Result<u32> {
 		if headers.is_empty() {
 			return Ok(0);
@@ -116,22 +265,26 @@ impl HeaderStore {
 		// Validate intra-batch continuity: each header must chain to the previous
 		// one in the message (matching reference client behavior)
 		for i in 1..headers.len() {
-			// Indexing safe: i starts at 1, so i-1 >= 0 and i < len
-			#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // i >= 1, so i-1 is safe
+			#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+			// i >= 1 so i-1 is safe; i < len by loop bound
 			let expected_prev = headers[i - 1].block_hash();
-			#[allow(clippy::indexing_slicing)]
-			if headers[i].prev_hash != expected_prev {
+			#[allow(clippy::indexing_slicing)] // i < headers.len() by loop bound
+			let current = &headers[i];
+			if current.prev_hash != expected_prev {
 				warn!(
 					index = i,
 					expected = %expected_prev,
-					got = %headers[i].prev_hash,
+					got = %current.prev_hash,
 					"headers batch has broken chain continuity"
 				);
 				bail!("header at index {i} does not chain to previous header in batch");
 			}
 		}
 
-		let mut added = 0u32;
+		// Phase 1: validate all headers, collect (hash, height) pairs
+		let mut validated = Vec::new();
+		// Temporarily track tip for multi-header validation without mutating state
+		let mut shadow_tip = self.tip();
 		for header in headers {
 			let hash = header.block_hash();
 			if self.by_hash.contains_key(&hash) {
@@ -139,12 +292,32 @@ impl HeaderStore {
 				continue;
 			}
 
-			self.add_header(header)?;
-			#[allow(clippy::arithmetic_side_effects)] // bounded by slice length
-			{
-				added += 1;
-			}
+			let (tip_hash, tip_height) = shadow_tip;
+			let height = self.validate_chains_to_tip(hash, header, tip_hash, tip_height)?;
+			validated.push((hash, header, height));
+			shadow_tip = (hash, height);
 		}
+
+		if validated.is_empty() {
+			return Ok(0);
+		}
+
+		// Phase 2: persist all to backend in single transaction
+		if let Some(ref be) = self.backend {
+			let batch: Vec<(BlockHeader, u32)> = validated
+				.iter()
+				.map(|(_, header, height)| ((*header).clone(), *height))
+				.collect();
+			be.persist_headers(&batch).context("failed to persist header batch")?;
+		}
+
+		// Phase 3: commit all to in-memory state
+		#[allow(clippy::cast_possible_truncation)] // validated.len() <= headers.len() <= u32::MAX
+		let added = validated.len() as u32;
+		for (hash, header, height) in validated {
+			self.commit_to_memory(hash, header, height);
+		}
+
 		Ok(added)
 	}
 
@@ -171,7 +344,11 @@ impl HeaderStore {
 	}
 
 	/// Returns the height of the current chain tip
-	pub const fn height(&self) -> u32 {
+	pub fn height(&self) -> u32 {
+		debug_assert!(
+			!self.by_height.is_empty(),
+			"by_height must always contain at least the genesis entry"
+		);
 		// Safe because by_height always contains at least the genesis entry
 		#[allow(clippy::arithmetic_side_effects)] // by_height is never empty
 		let h = self.by_height.len() - 1;
@@ -191,7 +368,7 @@ impl HeaderStore {
 
 	/// Builds a block locator vector from tip back to genesis
 	///
-	/// The first 10 hashes step back by 1, then the step doubles each iteration.
+	/// The first 10 hashes step back by 1, then the step doubles each iteration
 	/// Genesis is always the last entry. The result is capped at `MAX_LOCATOR_HASHES`
 	pub fn build_locator(&self) -> Vec<Hash256> {
 		let tip_height = self.height();
@@ -218,11 +395,7 @@ impl HeaderStore {
 				{
 					consecutive += 1;
 				}
-				// step is 1 during consecutive phase; subtraction is safe because height > 0
-				#[allow(clippy::arithmetic_side_effects)] // height > 0 checked above
-				{
-					height = height.saturating_sub(1);
-				}
+				height = height.saturating_sub(1);
 			} else {
 				// Once we pass the first 10, start doubling step and ensure we don't go below 0
 				height = height.saturating_sub(step);

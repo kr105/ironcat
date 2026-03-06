@@ -36,6 +36,7 @@ use crate::{
 		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
 		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
+	storage::header_store_backend::HeaderStoreBackend,
 	types::{block::BlockHeader, hash::Hash256},
 	utils::{is_routable, unix_now},
 };
@@ -478,7 +479,17 @@ pub struct NodeManager {
 
 impl NodeManager {
 	/// Creates a new `NodeManager` with an empty node set and random nonce and relay key
+	///
+	/// Headers are kept in-memory only (no persistence backend)
 	pub fn new(genesis_header: BlockHeader) -> Self {
+		Self::with_header_backend(genesis_header, None)
+	}
+
+	/// Creates a new `NodeManager` with an optional header persistence backend
+	///
+	/// If a backend is provided, headers are loaded from disk on startup and
+	/// written through on every insert. If `None`, behaves identically to `new()`
+	pub fn with_header_backend(genesis_header: BlockHeader, backend: Option<Arc<dyn HeaderStoreBackend>>) -> Self {
 		let mut rng = rand::thread_rng();
 		Self {
 			nodes: DashMap::new(),
@@ -487,7 +498,10 @@ impl NodeManager {
 			external_ip_votes: DashMap::new(),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
-			header_store: Arc::new(parking_lot::RwLock::new(HeaderStore::new(genesis_header))),
+			header_store: Arc::new(parking_lot::RwLock::new(HeaderStore::with_backend(
+				genesis_header,
+				backend,
+			))),
 		}
 	}
 
