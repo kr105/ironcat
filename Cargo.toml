@@ -1,6 +1,6 @@
 [package]
 name = "ironcat"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 
 [dependencies]
@@ -17,6 +17,7 @@ dirs = "6"
 sha2 = "0.10.9"
 parking_lot = "0.12"
 redb = "2.6"
+uint = "0.10.0"
 siphasher = "1.0" # Stable keyed hashing for deterministic addr relay peer selection
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
@@ -47,6 +48,7 @@ print_stderr = "warn"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+manual_div_ceil = "allow" # triggered inside uint crate macro expansion
 
 [dev-dependencies]
 tempfile = "3"

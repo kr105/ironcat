@@ -56,7 +56,8 @@ pub(super) async fn handle_headers(
 		}
 	};
 
-	info!(received = count, added, peer = %address, "processed headers");
+	let tip_height = node_manager.header_store.read().height();
+	info!(received = count, added, tip = tip_height, peer = %address, "processed headers");
 
 	// If we got a full batch, request more
 	if count == MAX_HEADERS_PER_MSG {

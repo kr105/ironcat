@@ -1,6 +1,6 @@
 # Catcoin Network Protocol
 
-Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, with different magic bytes and default port.
+Catcoin is a Litecoin fork. The wire protocol is nearly identical, with different magic bytes and default port.
 
 ## Constants
 
@@ -12,7 +12,7 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 | Max message size | 2,000,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.6/` |
+| User agent | `/Ironcat:0.0.7/` |
 
 ## Message Framing
 
@@ -114,7 +114,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.6/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.7/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -260,7 +260,23 @@ Repeated `count` times:
 [var] tx_count      - VarInt, always 0 for headers messages
 ```
 
-On receipt, Ironcat validates chain continuity (each header's prev_hash must connect to a known header) and stores valid headers via batch insertion. If exactly 2000 headers were received, a follow-up getheaders is sent to continue syncing.
+On receipt, Ironcat validates chain continuity (each header's prev_hash must connect to a known header) and difficulty targets (nBits must match the expected value from the active CIP algorithm). Valid headers are stored via batch insertion. If any header in the batch fails validation, the entire batch is rejected. If exactly 2000 headers were received, a follow-up getheaders is sent to continue syncing.
+
+#### Difficulty algorithms
+
+Headers are validated against the correct difficulty adjustment algorithm based on block height:
+
+| Height range | Algorithm | Description |
+|--------------|-----------|-------------|
+| 0 - 20288 | CIP01 | Original 2016-block retarget with 0.25x-4x clamping |
+| 20289 | -- | Hardcoded difficulty 16 reset (0x1c0ffff0) |
+| 20289 - 21345 | CIP02 | 36-block retarget with 0.25x-4x clamping |
+| 21346 - 27259 | CIP03 | Every-block retarget with tight +/-12% bounds |
+| 27260 - 46330 | CIP04 | PID controller with 8-block lookback and dead zone |
+| 46331 - 396999 | CIP05 | Time-gated DigiShield with CIP04 fallback |
+| 397000+ | CIP06 | LWMA-1 with 45-block weighted moving average |
+
+During batch validation, a `BatchLookup` overlay makes already-validated headers from the current batch visible to the difficulty calculation, even before they are committed to storage.
 
 ### sendheaders
 
@@ -270,7 +286,7 @@ On receipt, Ironcat sets the peer's `prefer_headers` flag.
 
 ### alert
 
-Ignored. Legacy Bitcoin alert system, deprecated.
+Ignored. Legacy alert system, deprecated.
 
 ## Handshake Sequence
 

@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::Level;
 
 use crate::{
+	difficulty::{self, ConsensusParams},
 	nodes::{NodeManager, NodeSnapshot, NodeStateLabel, NodeStats},
 	tui_layer::TuiLogEntry,
 };
@@ -120,47 +121,48 @@ fn run(
 	Ok(())
 }
 
-/// Renders the 4-quadrant dashboard layout
+/// Renders the dashboard layout: stats row, peers table, logs panel, help bar
 fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<TuiLogEntry>, tui_state: &TuiState) {
-	// Main vertical split: top stats row, bottom content row, help bar
+	// Vertical stack: stats | peers | logs | help
 	let main_chunks = Layout::default()
 		.direction(Direction::Vertical)
-		.constraints([Constraint::Length(8), Constraint::Min(10), Constraint::Length(1)])
+		.constraints([
+			Constraint::Length(9),      // Stats row
+			Constraint::Percentage(50), // Peers table
+			Constraint::Percentage(50), // Logs panel
+			Constraint::Length(1),      // Help bar
+		])
 		.split(frame.area());
 
 	let (stats, mut nodes) = node_manager.get_snapshot();
 	let chain_height = node_manager.chain_height();
+	let tip_bits = node_manager.chain_tip_bits();
 
-	// Top row: Network Stats | Chain Sync
-	#[allow(clippy::indexing_slicing)] // layout produces exactly 3 elements
+	// Top row: Network Stats | Chain Sync (side by side)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
 	let top_chunks = Layout::default()
 		.direction(Direction::Horizontal)
 		.constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
 		.split(main_chunks[0]);
 
-	// top_chunks has exactly 2 elements from the 2 constraints
 	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
 	draw_network_stats(frame, top_chunks[0], &stats);
 	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
-	draw_chain_sync(frame, top_chunks[1], chain_height, &nodes, tui_state);
-
-	// Bottom row: Peers Table | Logs
-	#[allow(clippy::indexing_slicing)] // layout produces exactly 3 elements
-	let bottom_chunks = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-		.split(main_chunks[1]);
+	draw_chain_sync(frame, top_chunks[1], chain_height, tip_bits, &nodes, tui_state);
 
 	nodes.sort_by(|a, b| b.height.cmp(&a.height));
 
-	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
-	draw_peers_table(frame, bottom_chunks[0], &nodes);
-	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
-	draw_logs(frame, bottom_chunks[1], log_buffer);
+	// Peers table (full width)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_peers_table(frame, main_chunks[1], &nodes);
+
+	// Logs panel (full width)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_logs(frame, main_chunks[2], log_buffer);
 
 	// Help bar
-	#[allow(clippy::indexing_slicing)] // layout produces exactly 3 elements
-	draw_help_bar(frame, main_chunks[2]);
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_help_bar(frame, main_chunks[3]);
 }
 
 /// Renders the Network Stats panel (top-left quadrant)
@@ -207,7 +209,14 @@ fn draw_network_stats(frame: &mut Frame, area: Rect, stats: &NodeStats) {
 }
 
 /// Renders the Chain Sync panel (top-right quadrant)
-fn draw_chain_sync(frame: &mut Frame, area: Rect, chain_height: u32, nodes: &[NodeSnapshot], tui_state: &TuiState) {
+fn draw_chain_sync(
+	frame: &mut Frame,
+	area: Rect,
+	chain_height: u32,
+	tip_bits: u32,
+	nodes: &[NodeSnapshot],
+	tui_state: &TuiState,
+) {
 	// Find best peer height among connected peers with reported height
 	let best_peer = nodes.iter().filter(|n| n.height > 0).max_by_key(|n| n.height);
 
@@ -253,6 +262,18 @@ fn draw_chain_sync(frame: &mut Frame, area: Rect, chain_height: u32, nodes: &[No
 			Span::styled(
 				format!("{:.1} headers/s", tui_state.headers_per_sec),
 				Style::default().fg(Color::White),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Diff:   ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				difficulty::format_difficulty(difficulty::compact_to_difficulty(tip_bits)),
+				Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+			),
+			Span::styled("  ", Style::default()),
+			Span::styled(
+				difficulty::active_algorithm(chain_height, &ConsensusParams::mainnet()),
+				Style::default().fg(Color::Cyan),
 			),
 		]),
 	];

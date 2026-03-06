@@ -30,6 +30,7 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+	difficulty::ConsensusParams,
 	dns::DEFAULT_PORT,
 	headers::HeaderStore,
 	network::{
@@ -481,15 +482,19 @@ impl NodeManager {
 	/// Creates a new `NodeManager` with an empty node set and random nonce and relay key
 	///
 	/// Headers are kept in-memory only (no persistence backend)
-	pub fn new(genesis_header: BlockHeader) -> Self {
-		Self::with_header_backend(genesis_header, None)
+	pub fn new(genesis_header: BlockHeader, params: ConsensusParams) -> Self {
+		Self::with_header_backend(genesis_header, params, None)
 	}
 
 	/// Creates a new `NodeManager` with an optional header persistence backend
 	///
 	/// If a backend is provided, headers are loaded from disk on startup and
 	/// written through on every insert. If `None`, behaves identically to `new()`
-	pub fn with_header_backend(genesis_header: BlockHeader, backend: Option<Arc<dyn HeaderStoreBackend>>) -> Self {
+	pub fn with_header_backend(
+		genesis_header: BlockHeader,
+		params: ConsensusParams,
+		backend: Option<Arc<dyn HeaderStoreBackend>>,
+	) -> Self {
 		let mut rng = rand::thread_rng();
 		Self {
 			nodes: DashMap::new(),
@@ -500,6 +505,7 @@ impl NodeManager {
 			incoming_cooldowns: DashMap::new(),
 			header_store: Arc::new(parking_lot::RwLock::new(HeaderStore::with_backend(
 				genesis_header,
+				params,
 				backend,
 			))),
 		}
@@ -655,6 +661,21 @@ impl NodeManager {
 		}
 	}
 
+	/// Attaches a header persistence backend, loading stored headers from disk
+	///
+	/// The heavy loading (read + hash validation) runs before acquiring the
+	/// write lock. Only the final pointer swap holds the lock, so the TUI
+	/// and other readers are not blocked during the load
+	pub fn attach_header_backend(&self, backend: Arc<dyn HeaderStoreBackend>) {
+		let genesis_hash = self.header_store.read().genesis();
+
+		// Slow: read all headers from redb and validate chain continuity
+		let result = HeaderStore::try_load_from_backend(backend.as_ref(), genesis_hash);
+
+		// Fast: swap pre-built maps into the store under write lock
+		self.header_store.write().apply_backend_load(result, backend);
+	}
+
 	/// Returns the number of nodes currently in Connected state
 	pub fn connected_count(&self) -> usize {
 		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
@@ -663,6 +684,11 @@ impl NodeManager {
 	/// Returns the current chain tip height from the header store
 	pub fn chain_height(&self) -> u32 {
 		self.header_store.read().height()
+	}
+
+	/// Returns the compact target (nBits) of the current chain tip
+	pub fn chain_tip_bits(&self) -> u32 {
+		self.header_store.read().tip_bits()
 	}
 
 	/// Returns stats and node snapshots in a single `DashMap` iteration
@@ -1550,7 +1576,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_counts() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -1560,7 +1586,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_requires_three_votes() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -1569,7 +1595,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_returns_majority() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip_a: IpAddr = "8.8.8.8".parse().unwrap();
 		let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
 		nm.record_external_ip_vote(ip_a);
@@ -1584,7 +1610,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_rejects_private() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let private_ip: IpAddr = "192.168.1.1".parse().unwrap();
 		nm.record_external_ip_vote(private_ip);
 		nm.record_external_ip_vote(private_ip);
@@ -1615,7 +1641,7 @@ mod tests {
 
 	#[test]
 	fn has_incoming_connected_detects_incoming() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 12345, ConnectionType::Incoming);
 
@@ -1625,7 +1651,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_dedup_prevents_duplicate_insert() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1640,7 +1666,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_clears_on_bucket_rotation() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1665,7 +1691,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_defaults_to_false() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1675,7 +1701,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_can_be_set() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1689,7 +1715,7 @@ mod tests {
 
 	#[test]
 	fn new_node_starts_with_initial_token_bucket() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1709,7 +1735,7 @@ mod tests {
 
 	#[test]
 	fn same_ip_different_port_deduplicates() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		assert!(nm.insert(ip, 9933, ConnectionType::Outgoing));
@@ -1719,7 +1745,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_disconnected() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1739,7 +1765,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_dead() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1756,7 +1782,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_connecting() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1770,7 +1796,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_new_node() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let result = nm.insert_incoming(ip, 54321);
@@ -1784,7 +1810,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_disconnected() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1806,7 +1832,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_dead() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1825,7 +1851,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_connecting() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1839,7 +1865,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_banned() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1860,7 +1886,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_banned() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1878,7 +1904,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_ignores_when_connected() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1902,7 +1928,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_incoming_rejects_when_connected() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1925,7 +1951,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_connected_peer() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1946,7 +1972,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_unconnected_loaded_peer() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1961,7 +1987,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_incoming() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Incoming);
 
@@ -1976,7 +2002,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_disconnected_peer_with_version() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -1998,7 +2024,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn reaper_clears_expired_bans() {
-		let nm = Arc::new(NodeManager::new(test_genesis()));
+		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2034,7 +2060,7 @@ mod tests {
 
 	#[test]
 	fn collect_bans_excludes_expired() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2079,7 +2105,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_peers_skips_unknown_version() {
-		let nm = Arc::new(NodeManager::new(test_genesis()));
+		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
 		let db = crate::storage::peers::PeerDb {
 			version: 999,
 			peers: vec![crate::storage::peers::SavedPeer {
@@ -2097,7 +2123,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_bans_skips_unknown_version() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let db = crate::storage::bans::BanDb {
 			version: 999,
 			bans: vec![crate::storage::bans::SavedBan {
@@ -2113,7 +2139,7 @@ mod tests {
 
 	#[test]
 	fn incoming_cooldown_rejects_rapid_reconnect() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		// First connection should succeed
@@ -2133,7 +2159,7 @@ mod tests {
 
 	#[test]
 	fn incoming_guard_decrements_on_drop() {
-		let nm = NodeManager::new(test_genesis());
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let guard = nm.insert_incoming(ip, 54321);

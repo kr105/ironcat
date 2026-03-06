@@ -3,6 +3,7 @@
 // Tests use unwrap for brevity since panics are the intended failure mode
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use ironcat::difficulty::ConsensusParams;
 use ironcat::storage::bans::{BanDb, SavedBan};
 use ironcat::storage::{checksummed_decode, checksummed_encode};
 use std::net::{IpAddr, Ipv4Addr};
@@ -110,7 +111,7 @@ fn collect_bans_from_node_manager() {
 		bits: 0,
 		nonce: 0,
 	};
-	let nm = NodeManager::new(genesis);
+	let nm = NodeManager::new(genesis, ConsensusParams::mainnet());
 	// Load a ban via the persistence API
 	let now = unix_now();
 	nm.load_saved_bans(&BanDb {

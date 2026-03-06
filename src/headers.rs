@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+	difficulty::{self, ChainLookup, ConsensusParams},
 	storage::header_store_backend::HeaderStoreBackend,
 	types::{block::BlockHeader, hash::Hash256},
 };
@@ -31,6 +32,43 @@ pub struct HeaderStore {
 	by_hash: HashMap<Hash256, StoredHeader>,
 	by_height: Vec<Hash256>,
 	backend: Option<Arc<dyn HeaderStoreBackend>>,
+	params: ConsensusParams,
+}
+
+impl ChainLookup for HeaderStore {
+	fn header_at(&self, height: u32) -> Option<(u32, u32)> {
+		let hash = self.by_height.get(height as usize)?;
+		let stored = self.by_hash.get(hash)?;
+		Some((stored.header.timestamp, stored.header.bits))
+	}
+}
+
+/// Overlays pending batch headers on top of the committed store
+///
+/// During batch validation, headers already validated in the current batch
+/// are not yet committed to the store. This struct makes them visible to
+/// difficulty algorithms via [`ChainLookup`]
+struct BatchLookup<'a> {
+	store: &'a HeaderStore,
+	/// Headers validated so far in the current batch, with sequential heights
+	pending: &'a [(Hash256, &'a BlockHeader, u32)],
+}
+
+impl ChainLookup for BatchLookup<'_> {
+	fn header_at(&self, height: u32) -> Option<(u32, u32)> {
+		// Check pending batch first (heights are sequential, so O(1) index lookup)
+		if let Some(&(_, _, first_height)) = self.pending.first() {
+			if height >= first_height {
+				#[allow(clippy::arithmetic_side_effects)] // height >= first_height checked above
+				let idx = (height - first_height) as usize;
+				if let Some(&(_, header, _)) = self.pending.get(idx) {
+					return Some((header.timestamp, header.bits));
+				}
+			}
+		}
+		// Fall back to committed store
+		self.store.header_at(height)
+	}
 }
 
 impl HeaderStore {
@@ -38,8 +76,8 @@ impl HeaderStore {
 	///
 	/// The `HashMap` is pre-allocated for 500,000 entries to reduce rehashing
 	/// during initial block download. No persistence backend is used
-	pub fn new(genesis_header: BlockHeader) -> Self {
-		Self::with_backend(genesis_header, None)
+	pub fn new(genesis_header: BlockHeader, params: ConsensusParams) -> Self {
+		Self::with_backend(genesis_header, params, None)
 	}
 
 	/// Creates a header store with an optional persistence backend
@@ -48,7 +86,11 @@ impl HeaderStore {
 	/// state is populated from disk. The genesis block hash is verified on
 	/// reload -- a mismatch means wrong network, so we clear the database
 	/// and start fresh
-	pub fn with_backend(genesis_header: BlockHeader, backend: Option<Arc<dyn HeaderStoreBackend>>) -> Self {
+	pub fn with_backend(
+		genesis_header: BlockHeader,
+		params: ConsensusParams,
+		backend: Option<Arc<dyn HeaderStoreBackend>>,
+	) -> Self {
 		let genesis_hash = genesis_header.block_hash();
 
 		if let Some(ref be) = backend {
@@ -61,23 +103,24 @@ impl HeaderStore {
 						by_hash,
 						by_height,
 						backend,
+						params,
 					};
 				}
 				Ok(None) => {
 					// Empty database or cleared after mismatch, persist genesis
 					if let Err(e) = be.persist_header(&genesis_header, 0) {
 						error!(error = %e, "failed to persist genesis header, disabling backend");
-						return Self::make_fresh(genesis_header, genesis_hash, None);
+						return Self::make_fresh(genesis_header, genesis_hash, params, None);
 					}
 				}
 				Err(e) => {
 					error!(error = %e, "failed to load headers from backend, disabling backend");
-					return Self::make_fresh(genesis_header, genesis_hash, None);
+					return Self::make_fresh(genesis_header, genesis_hash, params, None);
 				}
 			}
 		}
 
-		Self::make_fresh(genesis_header, genesis_hash, backend)
+		Self::make_fresh(genesis_header, genesis_hash, params, backend)
 	}
 
 	/// Attempts to load headers from the backend, validating genesis and chain continuity
@@ -86,7 +129,7 @@ impl HeaderStore {
 	/// was empty (or was cleared due to genesis mismatch), and `Err` on
 	/// unrecoverable failure
 	#[allow(clippy::type_complexity)] // internal return type, alias would obscure intent
-	fn try_load_from_backend(
+	pub(crate) fn try_load_from_backend(
 		be: &dyn HeaderStoreBackend,
 		genesis_hash: Hash256,
 	) -> Result<Option<(HashMap<Hash256, StoredHeader>, Vec<Hash256>)>> {
@@ -145,6 +188,7 @@ impl HeaderStore {
 	fn make_fresh(
 		genesis_header: BlockHeader,
 		genesis_hash: Hash256,
+		params: ConsensusParams,
 		backend: Option<Arc<dyn HeaderStoreBackend>>,
 	) -> Self {
 		let mut by_hash = HashMap::with_capacity(500_000);
@@ -160,6 +204,43 @@ impl HeaderStore {
 			by_hash,
 			by_height: vec![genesis_hash],
 			backend,
+			params,
+		}
+	}
+
+	/// Applies pre-loaded backend data and stores the backend reference
+	///
+	/// Called after [`try_load_from_backend`] has done the heavy lifting
+	/// outside of any lock. This method only does a fast pointer swap
+	#[allow(clippy::type_complexity)] // matches try_load_from_backend return type
+	pub(crate) fn apply_backend_load(
+		&mut self,
+		result: Result<Option<(HashMap<Hash256, StoredHeader>, Vec<Hash256>)>>,
+		backend: Arc<dyn HeaderStoreBackend>,
+	) {
+		match result {
+			Ok(Some((by_hash, by_height))) => {
+				#[allow(clippy::arithmetic_side_effects)] // by_height is non-empty (has genesis)
+				let tip_height = by_height.len() - 1;
+				info!(count = by_height.len(), tip_height, "loaded headers from disk");
+				self.by_hash = by_hash;
+				self.by_height = by_height;
+				self.backend = Some(backend);
+			}
+			Ok(None) => {
+				// Empty database or cleared after genesis mismatch, persist our genesis
+				let genesis_hash = self.genesis();
+				#[allow(clippy::indexing_slicing)] // genesis is always present
+				let genesis_header = &self.by_hash[&genesis_hash].header;
+				if let Err(e) = backend.persist_header(genesis_header, 0) {
+					error!(error = %e, "failed to persist genesis header, disabling backend");
+					return;
+				}
+				self.backend = Some(backend);
+			}
+			Err(e) => {
+				error!(error = %e, "failed to load headers from backend, disabling backend");
+			}
 		}
 	}
 
@@ -238,6 +319,21 @@ impl HeaderStore {
 	pub fn add_header(&mut self, header: &BlockHeader) -> Result<u32> {
 		let (hash, height) = self.validate_header(header)?;
 
+		// Validate difficulty target matches expected value
+		let expected_bits = difficulty::get_next_work_required(height, self as &Self, &self.params)?;
+		if header.bits != expected_bits {
+			warn!(
+				height,
+				expected = format_args!("{expected_bits:#010x}"),
+				got = format_args!("{:#010x}", header.bits),
+				"rejecting header with invalid difficulty"
+			);
+			bail!(
+				"invalid difficulty at height {height}: expected {expected_bits:#010x}, got {:#010x}",
+				header.bits
+			);
+		}
+
 		// Persist first, then commit to memory
 		if let Some(ref be) = self.backend {
 			be.persist_header(header, height)
@@ -294,6 +390,26 @@ impl HeaderStore {
 
 			let (tip_hash, tip_height) = shadow_tip;
 			let height = self.validate_chains_to_tip(hash, header, tip_hash, tip_height)?;
+
+			// Validate difficulty using overlay that sees both store and pending batch
+			let lookup = BatchLookup {
+				store: self,
+				pending: &validated,
+			};
+			let expected_bits = difficulty::get_next_work_required(height, &lookup, &self.params)?;
+			if header.bits != expected_bits {
+				warn!(
+					height,
+					expected = format_args!("{expected_bits:#010x}"),
+					got = format_args!("{:#010x}", header.bits),
+					"rejecting header with invalid difficulty"
+				);
+				bail!(
+					"invalid difficulty at height {height}: expected {expected_bits:#010x}, got {:#010x}",
+					header.bits
+				);
+			}
+
 			validated.push((hash, header, height));
 			shadow_tip = (hash, height);
 		}
@@ -330,6 +446,14 @@ impl HeaderStore {
 	pub fn hash_at_height(&self, height: u32) -> Option<Hash256> {
 		let idx = height as usize;
 		self.by_height.get(idx).copied()
+	}
+
+	/// Returns the compact target (nBits) of the current chain tip
+	pub fn tip_bits(&self) -> u32 {
+		let (tip_hash, _) = self.tip();
+		// tip hash always exists in by_hash
+		#[allow(clippy::indexing_slicing)] // tip hash is always present
+		self.by_hash[&tip_hash].header.bits
 	}
 
 	/// Returns the current chain tip as (hash, height)

@@ -23,6 +23,7 @@ cargo run -- --help                          # Show help
 - Periodic self-announcement when publicly reachable
 - Exponential backoff with jitter for disconnected peers
 - Headers-first chain synchronization (getheaders/headers, protocol version 70012)
+- Difficulty validation for all 6 CIP algorithms (CIP01-CIP06: original retarget, 36-block, tight bounds, PID controller, DigiShield, LWMA)
 - sendheaders signal (BIP 130) for header-based block announcements
 - In-memory header chain with dual indexing (hash and height)
 - Persistent header storage via redb (pure Rust embedded DB, write-through)

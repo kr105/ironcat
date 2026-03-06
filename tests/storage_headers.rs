@@ -10,6 +10,7 @@ use std::sync::{
 
 use anyhow::{bail, Result};
 use ironcat::{
+	difficulty::ConsensusParams,
 	headers::HeaderStore,
 	storage::{header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore},
 	types::{block::BlockHeader, hash::Hash256},
@@ -53,7 +54,7 @@ fn genesis_persisted_on_first_open() {
 	let dir = tempfile::tempdir().unwrap();
 	let backend = open_at(&dir.path().join("headers.redb"));
 
-	let _store = HeaderStore::with_backend(GENESIS_HEADER, Some(Arc::clone(&backend)));
+	let _store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(Arc::clone(&backend)));
 
 	assert_eq!(backend.count().unwrap(), 1);
 }
@@ -73,7 +74,7 @@ fn headers_survive_reopen() {
 	// First session: add 3 headers
 	{
 		let backend = open_at(&db_path);
-		let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 		store.add_header(&h1).unwrap();
 		store.add_header(&h2).unwrap();
 		store.add_header(&h3).unwrap();
@@ -83,7 +84,7 @@ fn headers_survive_reopen() {
 	// Second session: reopen and verify
 	{
 		let backend = open_at(&db_path);
-		let store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 		assert_eq!(store.height(), 3);
 
 		let (tip_hash, tip_height) = store.tip();
@@ -108,7 +109,8 @@ fn batch_add_persists_all() {
 	// First session: batch add
 	{
 		let backend = open_at(&db_path);
-		let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(Arc::clone(&backend)));
+		let mut store =
+			HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(Arc::clone(&backend)));
 		let added = store.add_headers(&[h1, h2, h3]).unwrap();
 		assert_eq!(added, 3);
 		assert_eq!(backend.count().unwrap(), 4); // genesis + 3
@@ -117,7 +119,7 @@ fn batch_add_persists_all() {
 	// Second session: verify all survived
 	{
 		let backend = open_at(&db_path);
-		let store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 		assert_eq!(store.height(), 3);
 	}
 }
@@ -130,7 +132,7 @@ fn genesis_verified_on_reopen() {
 	// First session: create with test genesis
 	{
 		let backend = open_at(&db_path);
-		let _store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let _store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 	}
 
 	// Second session: reopen with a DIFFERENT genesis -- should clear and start fresh
@@ -145,7 +147,11 @@ fn genesis_verified_on_reopen() {
 
 	{
 		let backend = open_at(&db_path);
-		let store = HeaderStore::with_backend(different_genesis.clone(), Some(Arc::clone(&backend)));
+		let store = HeaderStore::with_backend(
+			different_genesis.clone(),
+			ConsensusParams::mainnet(),
+			Some(Arc::clone(&backend)),
+		);
 		assert_eq!(store.height(), 0);
 		assert_eq!(store.genesis(), different_genesis.block_hash());
 		// Database should have been cleared and new genesis persisted
@@ -157,7 +163,7 @@ fn genesis_verified_on_reopen() {
 fn redb_backend_count_accurate() {
 	let dir = tempfile::tempdir().unwrap();
 	let backend = open_at(&dir.path().join("headers.redb"));
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(Arc::clone(&backend)));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(Arc::clone(&backend)));
 
 	assert_eq!(backend.count().unwrap(), 1);
 
@@ -174,7 +180,7 @@ fn redb_backend_count_accurate() {
 fn load_all_returns_sorted_by_height() {
 	let dir = tempfile::tempdir().unwrap();
 	let backend = open_at(&dir.path().join("headers.redb"));
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(Arc::clone(&backend)));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(Arc::clone(&backend)));
 
 	let h1 = make_header(genesis_hash(), 100);
 	let h2 = make_header(h1.block_hash(), 200);
@@ -209,14 +215,14 @@ fn locator_works_after_reload() {
 
 	{
 		let backend = open_at(&db_path);
-		let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 		store.add_headers(&headers).unwrap();
 		locator_before = store.build_locator();
 	}
 
 	{
 		let backend = open_at(&db_path);
-		let store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+		let store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 		let locator_after = store.build_locator();
 		assert_eq!(locator_before, locator_after);
 	}
@@ -269,7 +275,7 @@ impl HeaderStoreBackend for FailingBackend {
 fn genesis_persist_failure_disables_backend() {
 	let backend: Arc<dyn HeaderStoreBackend> = Arc::new(FailingBackend::new(true));
 	// Genesis persist will fail, backend should be disabled, store still works in-memory
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend));
 	assert_eq!(store.height(), 0);
 
 	// Since backend was disabled after genesis persist failure,
@@ -282,7 +288,7 @@ fn genesis_persist_failure_disables_backend() {
 fn persist_failure_on_add_header_blocks_insert() {
 	let backend = Arc::new(FailingBackend::new(false));
 	let backend_trait: Arc<dyn HeaderStoreBackend> = Arc::clone(&backend) as Arc<dyn HeaderStoreBackend>;
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend_trait));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend_trait));
 
 	// First header succeeds
 	let h1 = make_header(genesis_hash(), 100);
@@ -302,7 +308,7 @@ fn persist_failure_on_add_header_blocks_insert() {
 fn batch_persist_failure_blocks_all_inserts() {
 	let backend = Arc::new(FailingBackend::new(false));
 	let backend_trait: Arc<dyn HeaderStoreBackend> = Arc::clone(&backend) as Arc<dyn HeaderStoreBackend>;
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(backend_trait));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(backend_trait));
 
 	// Make persist fail
 	backend.should_fail.store(true, Ordering::Relaxed);
@@ -319,7 +325,7 @@ fn batch_persist_failure_blocks_all_inserts() {
 fn redb_clear_wipes_all_data() {
 	let dir = tempfile::tempdir().unwrap();
 	let backend = open_at(&dir.path().join("headers.redb"));
-	let mut store = HeaderStore::with_backend(GENESIS_HEADER, Some(Arc::clone(&backend)));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::mainnet(), Some(Arc::clone(&backend)));
 
 	let h1 = make_header(genesis_hash(), 100);
 	store.add_header(&h1).unwrap();

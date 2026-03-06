@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ironcat::{
 	cli::Args,
+	difficulty::ConsensusParams,
 	dns,
 	network::listening_start,
 	nodes::NodeManager,
@@ -71,13 +72,33 @@ fn open_header_backend(datadir: &std::path::Path) -> Option<Arc<dyn HeaderStoreB
 }
 
 /// Core application loop shared between TUI and daemon modes
+#[allow(clippy::too_many_lines)] // sequential startup steps, splitting would obscure flow
 async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
 	// Ensure data directory exists before opening any databases
 	std::fs::create_dir_all(&args.datadir)
 		.with_context(|| format!("failed to create data directory {}", args.datadir.display()))?;
 
+	// Create NodeManager without backend first so the TUI can start immediately
+	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER, ConsensusParams::mainnet()));
+
+	// Spawn TUI before any heavy I/O so loading progress is visible
+	let ui_handle = tui_rx.map(|log_rx| {
+		let nm = Arc::clone(&node_manager);
+		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
+	});
+
+	// Load headers from backend (slow: reads + hashes all stored headers)
+	// Runs on the blocking pool so the TUI can redraw concurrently.
+	// Only the final HashMap swap briefly acquires the write lock
 	let header_backend = open_header_backend(&args.datadir);
-	let node_manager = Arc::new(NodeManager::with_header_backend(GENESIS_HEADER, header_backend));
+	if let Some(backend) = header_backend {
+		let nm = Arc::clone(&node_manager);
+		tokio::task::spawn_blocking(move || {
+			nm.attach_header_backend(backend);
+		})
+		.await
+		.context("header loading task panicked")?;
+	}
 
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
@@ -97,12 +118,6 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		} else {
 			0
 		};
-
-	// Spawn TUI if in TUI mode
-	let ui_handle = tui_rx.map(|log_rx| {
-		let nm = Arc::clone(&node_manager);
-		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
-	});
 
 	// Spawn listener
 	let nm = Arc::clone(&node_manager);
