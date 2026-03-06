@@ -18,6 +18,7 @@ sha2 = "0.10.9"
 parking_lot = "0.12"
 redb = "2.6"
 uint = "0.10.0"
+scrypt = { version = "0.11.0", default-features = false } # Scrypt PoW hash (N=1024,r=1,p=1)
 siphasher = "1.0" # Stable keyed hashing for deterministic addr relay peer selection
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
@@ -49,6 +50,15 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 manual_div_ceil = "allow" # triggered inside uint crate macro expansion
+
+# Optimize crypto-heavy deps even in debug builds so PoW validation
+# during header sync doesn't crawl (scrypt is ~15x slower at opt-level 0)
+[profile.dev.package.sha2]
+opt-level = 3
+
+[[bench]]
+name = "pow_bench"
+harness = false
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,6 +6,7 @@ pub mod dns;
 pub mod headers;
 pub mod network;
 pub mod nodes;
+pub mod pow;
 pub mod storage;
 pub mod tui_layer;
 pub mod types;

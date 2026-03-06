@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
 	difficulty::{self, ChainLookup, ConsensusParams},
+	pow,
 	storage::header_store_backend::HeaderStoreBackend,
 	types::{block::BlockHeader, hash::Hash256},
 };
@@ -294,6 +295,41 @@ impl HeaderStore {
 		Ok((hash, height))
 	}
 
+	/// Validates proof-of-work and checkpoint hash for a header
+	///
+	/// `PoW` is skipped for heights at or below the last checkpoint (assumed valid).
+	/// At exact checkpoint heights, the block hash must match the checkpoint value
+	fn validate_pow_and_checkpoint(
+		&self,
+		hash: Hash256,
+		header: &BlockHeader,
+		height: u32,
+	) -> Result<()> {
+		let last_cp = self.params.last_checkpoint_height();
+
+		// At exact checkpoint heights, verify the hash matches
+		if let Some(expected) = self.params.checkpoint_hash_at(height) {
+			let expected_hash = Hash256::from_bytes(expected);
+			if hash != expected_hash {
+				warn!(
+					height,
+					expected = %expected_hash,
+					got = %hash,
+					"block hash does not match checkpoint"
+				);
+				bail!("checkpoint mismatch at height {height}: expected {expected_hash}, got {hash}");
+			}
+		}
+
+		// PoW validation: skip for heights at or below last checkpoint
+		if height > last_cp && !pow::check_proof_of_work(header) {
+			warn!(height, block_hash = %hash, "header fails proof-of-work validation");
+			bail!("header at height {height} fails proof-of-work check");
+		}
+
+		Ok(())
+	}
+
 	/// Inserts a validated header into the in-memory maps
 	fn commit_to_memory(&mut self, hash: Hash256, header: &BlockHeader, height: u32) {
 		self.by_hash.insert(
@@ -334,6 +370,8 @@ impl HeaderStore {
 			);
 		}
 
+		self.validate_pow_and_checkpoint(hash, header, height)?;
+
 		// Persist first, then commit to memory
 		if let Some(ref be) = self.backend {
 			be.persist_header(header, height)
@@ -354,8 +392,66 @@ impl HeaderStore {
 	/// If a backend is configured, the entire batch is persisted in a single
 	/// transaction BEFORE being added to in-memory state
 	pub fn add_headers(&mut self, headers: &[BlockHeader]) -> Result<u32> {
-		if headers.is_empty() {
+		let validated = self.validate_batch(headers)?;
+
+		if validated.is_empty() {
 			return Ok(0);
+		}
+
+		// Persist first, then commit to memory (safe API: no side effects on failure)
+		if let Some(ref be) = self.backend {
+			let batch: Vec<(BlockHeader, u32)> = validated
+				.iter()
+				.map(|(_, header, height)| ((*header).clone(), *height))
+				.collect();
+			be.persist_headers(&batch).context("failed to persist header batch")?;
+		}
+
+		#[allow(clippy::cast_possible_truncation)] // validated.len() <= headers.len() <= u32::MAX
+		let added = validated.len() as u32;
+		for (hash, header, height) in validated {
+			self.commit_to_memory(hash, header, height);
+		}
+
+		Ok(added)
+	}
+
+	/// Validates and commits headers to in-memory state, returning the batch
+	/// for external persistence
+	///
+	/// Unlike `add_headers`, this commits to memory immediately without persisting.
+	/// The caller is responsible for calling `persist_batch` afterward. This
+	/// allows releasing locks between commit and persist for better concurrency
+	pub fn validate_and_commit(
+		&mut self,
+		headers: &[BlockHeader],
+	) -> Result<Vec<(BlockHeader, u32)>> {
+		let validated = self.validate_batch(headers)?;
+
+		if validated.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let batch: Vec<(BlockHeader, u32)> = validated
+			.iter()
+			.map(|(_, header, height)| ((*header).clone(), *height))
+			.collect();
+		for (hash, header, height) in validated {
+			self.commit_to_memory(hash, header, height);
+		}
+
+		Ok(batch)
+	}
+
+	/// Validates a batch of headers without modifying state
+	///
+	/// Returns the validated (hash, header, height) tuples ready for commit
+	fn validate_batch<'a>(
+		&self,
+		headers: &'a [BlockHeader],
+	) -> Result<Vec<(Hash256, &'a BlockHeader, u32)>> {
+		if headers.is_empty() {
+			return Ok(Vec::new());
 		}
 
 		// Validate intra-batch continuity: each header must chain to the previous
@@ -377,7 +473,6 @@ impl HeaderStore {
 			}
 		}
 
-		// Phase 1: validate all headers, collect (hash, height) pairs
 		let mut validated = Vec::new();
 		// Temporarily track tip for multi-header validation without mutating state
 		let mut shadow_tip = self.tip();
@@ -410,31 +505,24 @@ impl HeaderStore {
 				);
 			}
 
+			self.validate_pow_and_checkpoint(hash, header, height)?;
+
 			validated.push((hash, header, height));
 			shadow_tip = (hash, height);
 		}
 
-		if validated.is_empty() {
-			return Ok(0);
-		}
+		Ok(validated)
+	}
 
-		// Phase 2: persist all to backend in single transaction
+	/// Persists a batch of headers to the backend (if configured)
+	///
+	/// This only requires `&self` so it can be called with a read lock,
+	/// allowing other readers to proceed concurrently
+	pub fn persist_batch(&self, batch: &[(BlockHeader, u32)]) -> Result<()> {
 		if let Some(ref be) = self.backend {
-			let batch: Vec<(BlockHeader, u32)> = validated
-				.iter()
-				.map(|(_, header, height)| ((*header).clone(), *height))
-				.collect();
-			be.persist_headers(&batch).context("failed to persist header batch")?;
+			be.persist_headers(batch).context("failed to persist header batch")?;
 		}
-
-		// Phase 3: commit all to in-memory state
-		#[allow(clippy::cast_possible_truncation)] // validated.len() <= headers.len() <= u32::MAX
-		let added = validated.len() as u32;
-		for (hash, header, height) in validated {
-			self.commit_to_memory(hash, header, height);
-		}
-
-		Ok(added)
+		Ok(())
 	}
 
 	/// Looks up a stored header by its block hash

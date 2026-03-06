@@ -67,7 +67,7 @@ fn catcoin_genesis_hash_matches_reference() {
 
 #[test]
 fn new_store_has_genesis_as_tip() {
-	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let (tip_hash, tip_height) = store.tip();
 	assert_eq!(tip_hash, genesis_hash());
 	assert_eq!(tip_height, 0);
@@ -75,19 +75,19 @@ fn new_store_has_genesis_as_tip() {
 
 #[test]
 fn new_store_height_is_zero() {
-	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	assert_eq!(store.height(), 0);
 }
 
 #[test]
 fn new_store_genesis_returns_genesis_hash() {
-	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	assert_eq!(store.genesis(), genesis_hash());
 }
 
 #[test]
 fn add_header_extends_tip() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let header = make_header(genesis_hash(), 1);
 	let height = store.add_header(&header).unwrap();
 	assert_eq!(height, 1);
@@ -100,7 +100,7 @@ fn add_header_extends_tip() {
 
 #[test]
 fn add_header_rejects_orphan() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let bogus_prev = Hash256::from_bytes([0xAA; 32]);
 	let header = make_header(bogus_prev, 1);
 	let result = store.add_header(&header);
@@ -109,7 +109,7 @@ fn add_header_rejects_orphan() {
 
 #[test]
 fn add_header_rejects_fork_off_non_tip() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 
 	let h1 = make_header(genesis_hash(), 1);
 	let h1_hash = h1.block_hash();
@@ -128,7 +128,7 @@ fn add_header_rejects_fork_off_non_tip() {
 
 #[test]
 fn batch_rejects_broken_continuity() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 
 	let h1 = make_header(genesis_hash(), 1);
 	// h2 should chain to h1 but instead chains to something else
@@ -146,7 +146,7 @@ fn batch_rejects_broken_continuity() {
 
 #[test]
 fn add_header_rejects_duplicate() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let header = make_header(genesis_hash(), 1);
 	store.add_header(&header).unwrap();
 	let result = store.add_header(&header);
@@ -155,7 +155,7 @@ fn add_header_rejects_duplicate() {
 
 #[test]
 fn get_returns_stored_header() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let header = make_header(genesis_hash(), 1);
 	let hash = header.block_hash();
 	store.add_header(&header).unwrap();
@@ -167,14 +167,14 @@ fn get_returns_stored_header() {
 
 #[test]
 fn get_returns_none_for_unknown_hash() {
-	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let unknown = Hash256::from_bytes([0xFF; 32]);
 	assert!(store.get(&unknown).is_none());
 }
 
 #[test]
 fn hash_at_height_returns_correct_hash() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let h1 = make_header(genesis_hash(), 1);
 	let h1_hash = h1.block_hash();
 	store.add_header(&h1).unwrap();
@@ -186,7 +186,7 @@ fn hash_at_height_returns_correct_hash() {
 
 #[test]
 fn chain_of_three_headers() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 
 	let h1 = make_header(genesis_hash(), 1);
 	let h1_hash = h1.block_hash();
@@ -210,7 +210,7 @@ fn chain_of_three_headers() {
 
 #[test]
 fn batch_add_headers_works() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 
 	let h1 = make_header(genesis_hash(), 10);
 	let h1_hash = h1.block_hash();
@@ -225,7 +225,7 @@ fn batch_add_headers_works() {
 
 #[test]
 fn batch_add_headers_skips_duplicates() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 
 	let h1 = make_header(genesis_hash(), 10);
 	let h1_hash = h1.block_hash();
@@ -243,7 +243,7 @@ fn batch_add_headers_skips_duplicates() {
 
 /// Builds a chain of `n` headers on top of genesis, returning the store
 fn build_chain(n: u32) -> HeaderStore {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let mut prev = genesis_hash();
 	for i in 0..n {
 		let h = make_header(prev, i);
@@ -257,7 +257,7 @@ fn build_chain(n: u32) -> HeaderStore {
 
 #[test]
 fn locator_genesis_only() {
-	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let locator = store.build_locator();
 	assert_eq!(locator.len(), 1);
 	assert_eq!(locator[0], genesis_hash());
@@ -347,7 +347,7 @@ fn get_headers_after_at_tip_returns_empty() {
 
 #[test]
 fn add_header_rejects_wrong_difficulty() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	// Header with wrong bits (should be 0x1e0ffff0 at height 1)
 	let bad = BlockHeader {
 		version: 1,
@@ -368,7 +368,7 @@ fn add_header_rejects_wrong_difficulty() {
 
 #[test]
 fn add_header_accepts_correct_difficulty() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	// bits = 0x1e0ffff0 matches genesis (no retarget until block 2016)
 	let good = make_header(genesis_hash(), 1);
 	assert!(store.add_header(&good).is_ok());
@@ -376,7 +376,7 @@ fn add_header_accepts_correct_difficulty() {
 
 #[test]
 fn batch_rejects_wrong_difficulty() {
-	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	let mut store = HeaderStore::new(GENESIS_HEADER, ConsensusParams::testing());
 	let h1 = make_header(genesis_hash(), 1);
 	let h2 = BlockHeader {
 		version: 1,
@@ -395,4 +395,74 @@ fn batch_rejects_wrong_difficulty() {
 	);
 	// First header should NOT have been committed since batch is all-or-nothing
 	assert_eq!(store.height(), 0);
+}
+
+// --- proof-of-work validation tests ---
+
+/// Real Catcoin mainnet genesis block header (valid scrypt `PoW`)
+const REAL_GENESIS: BlockHeader = BlockHeader {
+	version: 1,
+	prev_hash: Hash256::ZERO,
+	merkle_root: Hash256::from_bytes([
+		0xf7, 0x9c, 0xf2, 0xa0, 0x69, 0xbe, 0xae, 0xfd, 0x31, 0x40, 0x21, 0xe0, 0x86, 0xfb,
+		0x13, 0x8d, 0x1c, 0x43, 0xb8, 0x5e, 0x33, 0x17, 0xb1, 0xaa, 0xf2, 0xcd, 0xd9, 0xb5,
+		0x3d, 0xa3, 0x07, 0x40,
+	]),
+	timestamp: 1_387_838_302,
+	bits: 0x1e0f_fff0,
+	nonce: 588_050,
+};
+
+#[test]
+fn pow_rejects_fake_header_without_checkpoint() {
+	// Use mainnet params (no checkpoints), so PoW is enforced
+	let mut store = HeaderStore::new(REAL_GENESIS, ConsensusParams::mainnet());
+	// Fake header with correct difficulty but invalid scrypt hash
+	let fake = BlockHeader {
+		version: 1,
+		prev_hash: REAL_GENESIS.block_hash(),
+		merkle_root: Hash256::ZERO,
+		timestamp: 1_400_000_000,
+		bits: 0x1e0f_fff0,
+		nonce: 1, // not a valid PoW nonce
+	};
+	let result = store.add_header(&fake);
+	assert!(result.is_err());
+	let msg = result.unwrap_err().to_string();
+	assert!(
+		msg.contains("proof-of-work"),
+		"expected PoW failure, got: {msg}"
+	);
+}
+
+#[test]
+fn pow_skipped_below_checkpoint() {
+	// Checkpoint at height 1000 -- all headers below skip PoW
+	let params = ConsensusParams {
+		checkpoints: &[(1000, [0u8; 32])],
+		..ConsensusParams::mainnet()
+	};
+	let mut store = HeaderStore::new(GENESIS_HEADER, params);
+	// Fake header with no valid PoW -- should be accepted because height 1 < 1000
+	let fake = make_header(genesis_hash(), 1);
+	assert!(store.add_header(&fake).is_ok());
+}
+
+#[test]
+fn checkpoint_hash_mismatch_rejected() {
+	// Checkpoint at height 1 with a specific hash
+	let params = ConsensusParams {
+		checkpoints: &[(1, [0xAA; 32])],
+		..ConsensusParams::mainnet()
+	};
+	let mut store = HeaderStore::new(GENESIS_HEADER, params);
+	// Header at checkpoint height 1 but with wrong hash
+	let header = make_header(genesis_hash(), 1);
+	let result = store.add_header(&header);
+	assert!(result.is_err());
+	let msg = result.unwrap_err().to_string();
+	assert!(
+		msg.contains("checkpoint mismatch"),
+		"expected checkpoint error, got: {msg}"
+	);
 }

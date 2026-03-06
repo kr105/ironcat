@@ -35,7 +35,7 @@ pub(super) async fn handle_inv(
 		}
 	}
 
-	// Request headers if any announced blocks are unknown to us
+	// Check announced blocks against our header store
 	let has_new_blocks = {
 		let store = node_manager.header_store.read();
 		inv.items()
@@ -44,6 +44,15 @@ pub(super) async fn handle_inv(
 	};
 
 	if has_new_blocks {
+		// Peer announcing unknown blocks means they're at least at our tip + 1
+		#[allow(clippy::cast_possible_wrap)] // chain height fits in i32 for the foreseeable chain
+		let estimated = node_manager.chain_height().saturating_add(1) as i32;
+		if let Some(mut node) = node_manager.nodes.get_mut(address) {
+			if estimated > node.height {
+				node.height = estimated;
+			}
+		}
+
 		let locator = node_manager.header_store.read().build_locator();
 		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
 		tcp_writer

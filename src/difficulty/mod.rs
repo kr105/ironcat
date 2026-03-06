@@ -73,6 +73,13 @@ pub struct ConsensusParams {
 	pub cip05_height: u32,
 	/// Whether min-difficulty blocks are allowed (false on mainnet, true on testnet)
 	pub allow_min_difficulty: bool,
+	/// Known-good block hashes at specific heights, sorted by height
+	///
+	/// Proof-of-work validation is skipped for headers at or below the last
+	/// checkpoint height. At exact checkpoint heights, the block hash is
+	/// verified against the checkpoint value. Adding checkpoints dramatically
+	/// speeds up IBD by avoiding expensive scrypt computation for historical blocks
+	pub checkpoints: &'static [(u32, [u8; 32])],
 }
 
 impl ConsensusParams {
@@ -90,7 +97,33 @@ impl ConsensusParams {
 			cip04_height: 46_331,
 			cip05_height: 397_000,
 			allow_min_difficulty: false,
+			checkpoints: &[],
 		}
+	}
+
+	/// Returns consensus parameters for tests using fake headers
+	///
+	/// Sets a checkpoint at `u32::MAX` so proof-of-work validation is skipped
+	/// for all heights. Use this when tests build chains with synthetic headers
+	/// that don't have valid scrypt hashes
+	pub fn testing() -> Self {
+		Self {
+			checkpoints: &[(u32::MAX, [0u8; 32])],
+			..Self::mainnet()
+		}
+	}
+
+	/// Returns the height of the last checkpoint, or 0 if no checkpoints exist
+	pub fn last_checkpoint_height(&self) -> u32 {
+		self.checkpoints.last().map_or(0, |&(h, _)| h)
+	}
+
+	/// Returns the expected block hash at a checkpoint height, if one exists
+	pub fn checkpoint_hash_at(&self, height: u32) -> Option<[u8; 32]> {
+		self.checkpoints
+			.iter()
+			.find(|&&(h, _)| h == height)
+			.map(|&(_, hash)| hash)
 	}
 
 	/// Number of blocks per CIP01 retarget interval

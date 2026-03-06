@@ -3,8 +3,10 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::NodeManager;
 use crate::network::{
@@ -44,30 +46,75 @@ pub(super) async fn handle_headers(
 
 	let headers = msg.into_headers();
 
-	// Batch insert under a single write lock. Don't disconnect on failure --
-	// the peer may have sent orphan or fork headers that we can't connect yet.
-	// Log the error and move on instead of killing the connection
-	let insert_result = node_manager.header_store.write().add_headers(&headers);
-	let added = match insert_result {
-		Ok(n) => n,
-		Err(e) => {
-			warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
-			return Ok(());
-		}
+	// Validate and commit under write lock (fast, in-memory only).
+	// Persist to redb outside the lock to avoid blocking readers during disk I/O.
+	// Don't disconnect on failure -- the peer may have sent orphan or fork headers
+	// that we can't connect yet
+	let start = Instant::now();
+	let (batch, locator) = {
+		let mut store = node_manager.header_store.write();
+		let result = store.validate_and_commit(&headers);
+		let elapsed_ms = start.elapsed().as_millis();
+		let batch = match result {
+			Ok(b) => b,
+			Err(e) => {
+				warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
+				return Ok(());
+			}
+		};
+
+		// Build locator while we still hold the lock (avoids a second acquire)
+		let locator = if count == MAX_HEADERS_PER_MSG {
+			Some(store.build_locator())
+		} else {
+			None
+		};
+
+		let tip_height = store.height();
+		drop(store);
+
+		info!(
+			received = count,
+			added = batch.len(),
+			tip = tip_height,
+			elapsed_ms = elapsed_ms,
+			peer = %address,
+			"processed headers"
+		);
+
+		(batch, locator)
 	};
 
-	let tip_height = node_manager.header_store.read().height();
-	info!(received = count, added, tip = tip_height, peer = %address, "processed headers");
+	if !batch.is_empty() {
+		node_manager.refresh_chain_cache();
+	}
 
-	// If we got a full batch, request more
-	if count == MAX_HEADERS_PER_MSG {
-		let locator = node_manager.header_store.read().build_locator();
+	// Sender sent us headers, so they have at least what we have
+	#[allow(clippy::cast_possible_wrap)] // chain height fits in i32 for the foreseeable chain
+	let tip = node_manager.chain_height() as i32;
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		if tip > node.height {
+			node.height = tip;
+		}
+	}
+
+	// Request more headers before persisting so the next batch arrives
+	// while we're writing to disk
+	if let Some(locator) = locator {
 		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
 		tcp_writer
 			.send_message("getheaders", &getheaders.to_bytes())
 			.await
 			.context("failed to send follow-up getheaders")?;
 		debug!(peer = %address, "requesting more headers");
+	}
+
+	// Persist to redb outside the write lock -- headers are cheap to re-fetch on crash
+	if !batch.is_empty() {
+		let persist_result = node_manager.header_store.read().persist_batch(&batch);
+		if let Err(e) = persist_result {
+			error!(peer = %address, error = %e, "failed to persist headers to disk");
+		}
 	}
 
 	Ok(())

@@ -16,7 +16,7 @@ use std::{
 	fmt,
 	net::IpAddr,
 	sync::{
-		atomic::{AtomicUsize, Ordering},
+		atomic::{AtomicU32, AtomicUsize, Ordering},
 		Arc,
 	},
 	time::Duration,
@@ -476,6 +476,12 @@ pub struct NodeManager {
 
 	/// In-memory block header chain
 	pub header_store: Arc<parking_lot::RwLock<HeaderStore>>,
+
+	/// Cached chain tip height for lock-free TUI reads
+	cached_height: AtomicU32,
+
+	/// Cached chain tip nBits for lock-free TUI reads
+	cached_tip_bits: AtomicU32,
 }
 
 impl NodeManager {
@@ -496,6 +502,9 @@ impl NodeManager {
 		backend: Option<Arc<dyn HeaderStoreBackend>>,
 	) -> Self {
 		let mut rng = rand::thread_rng();
+		let store = HeaderStore::with_backend(genesis_header, params, backend);
+		let initial_height = store.height();
+		let initial_bits = store.tip_bits();
 		Self {
 			nodes: DashMap::new(),
 			my_nonce: rng.next_u64(),
@@ -503,11 +512,9 @@ impl NodeManager {
 			external_ip_votes: DashMap::new(),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
-			header_store: Arc::new(parking_lot::RwLock::new(HeaderStore::with_backend(
-				genesis_header,
-				params,
-				backend,
-			))),
+			header_store: Arc::new(parking_lot::RwLock::new(store)),
+			cached_height: AtomicU32::new(initial_height),
+			cached_tip_bits: AtomicU32::new(initial_bits),
 		}
 	}
 
@@ -674,6 +681,7 @@ impl NodeManager {
 
 		// Fast: swap pre-built maps into the store under write lock
 		self.header_store.write().apply_backend_load(result, backend);
+		self.refresh_chain_cache();
 	}
 
 	/// Returns the number of nodes currently in Connected state
@@ -681,14 +689,23 @@ impl NodeManager {
 		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
 	}
 
-	/// Returns the current chain tip height from the header store
+	/// Returns the current chain tip height (lock-free, from atomic cache)
 	pub fn chain_height(&self) -> u32 {
-		self.header_store.read().height()
+		self.cached_height.load(Ordering::Relaxed)
 	}
 
-	/// Returns the compact target (nBits) of the current chain tip
+	/// Returns the compact target (nBits) of the current chain tip (lock-free, from atomic cache)
 	pub fn chain_tip_bits(&self) -> u32 {
-		self.header_store.read().tip_bits()
+		self.cached_tip_bits.load(Ordering::Relaxed)
+	}
+
+	/// Refreshes the cached height and `tip_bits` from the header store
+	///
+	/// Must be called after any write to `header_store` that changes the tip
+	pub fn refresh_chain_cache(&self) {
+		let store = self.header_store.read();
+		self.cached_height.store(store.height(), Ordering::Relaxed);
+		self.cached_tip_bits.store(store.tip_bits(), Ordering::Relaxed);
 	}
 
 	/// Returns stats and node snapshots in a single `DashMap` iteration
