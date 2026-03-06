@@ -7,8 +7,10 @@ use ironcat::{
 	difficulty::ConsensusParams,
 	dns,
 	network::listening_start,
-	nodes::NodeManager,
-	storage::{self, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore},
+	nodes::{block_download::BlockDownloadManager, NodeManager},
+	storage::{
+		self, block_store::BlockStore, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore,
+	},
 	tui_layer::{TuiLayer, TuiLogEntry},
 	types::{block::BlockHeader, hash::Hash256},
 	ui::tui::tui_start,
@@ -43,7 +45,11 @@ async fn main() -> Result<()> {
 	if args.daemon {
 		tracing_subscriber::registry()
 			.with(env_filter)
-			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+			.with(
+				tracing_subscriber::fmt::layer()
+					.with_writer(std::io::stderr)
+					.with_timer(tracing_subscriber::fmt::time::uptime()),
+			)
 			.init();
 
 		info!("ironcat v{} - Starting in daemon mode", env!("CARGO_PKG_VERSION"));
@@ -99,6 +105,13 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		.await
 		.context("header loading task panicked")?;
 	}
+
+	// Open block store for raw block data
+	let block_store = Arc::new(BlockStore::open(&args.datadir).context("failed to open block store")?);
+
+	// Create channel for forwarding received blocks to the download manager
+	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
+	node_manager.set_block_sender(block_tx);
 
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
@@ -171,6 +184,14 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
 	}
 
+	// Spawn block download manager
+	let nm = Arc::clone(&node_manager);
+	let bs = Arc::clone(&block_store);
+	let download_handle = tokio::spawn(async move {
+		let mut manager = BlockDownloadManager::new(nm, bs, block_rx);
+		manager.run().await;
+	});
+
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
 			info!("Received Ctrl+C, shutting down");
@@ -186,6 +207,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = persistence_handle => {
 			info!("Persistence task ended, shutting down");
+		}
+		_ = download_handle => {
+			info!("Download manager ended, shutting down");
 		}
 		() = async {
 			match ui_handle {

@@ -27,10 +27,12 @@ cargo run -- --help                          # Show help
 - sendheaders signal (BIP 130) for header-based block announcements
 - In-memory header chain with dual indexing (hash and height)
 - Persistent header storage via redb (pure Rust embedded DB, write-through)
-- Core blockchain types (block headers, transactions, inventory)
+- Block download via sliding-window manager (getdata/block, merkle root validation)
+- Flat-file block storage (blk*.dat) with redb index for O(1) lookup
+- Core blockchain types (block headers, transactions, blocks, inventory)
 - Inventory protocol (inv/getdata/notfound) with header-triggered sync
-- TUI and daemon modes
-- Persistent peer, ban, and header storage across restarts
+- TUI and daemon modes with block download progress display
+- Persistent peer, ban, header, and block storage across restarts
 
 ## TUI mode
 

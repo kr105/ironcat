@@ -34,7 +34,11 @@ fn layer_includes_structured_fields() {
 	});
 
 	let entry = rx.try_recv().unwrap();
-	assert!(entry.text.contains("processed items"), "missing message: {}", entry.text);
+	assert!(
+		entry.text.contains("processed items"),
+		"missing message: {}",
+		entry.text
+	);
 	assert!(entry.text.contains("count=42"), "missing count field: {}", entry.text);
 	assert!(entry.text.contains("name=alice"), "missing name field: {}", entry.text);
 }

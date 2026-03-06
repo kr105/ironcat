@@ -299,12 +299,7 @@ impl HeaderStore {
 	///
 	/// `PoW` is skipped for heights at or below the last checkpoint (assumed valid).
 	/// At exact checkpoint heights, the block hash must match the checkpoint value
-	fn validate_pow_and_checkpoint(
-		&self,
-		hash: Hash256,
-		header: &BlockHeader,
-		height: u32,
-	) -> Result<()> {
+	fn validate_pow_and_checkpoint(&self, hash: Hash256, header: &BlockHeader, height: u32) -> Result<()> {
 		let last_cp = self.params.last_checkpoint_height();
 
 		// At exact checkpoint heights, verify the hash matches
@@ -422,10 +417,7 @@ impl HeaderStore {
 	/// Unlike `add_headers`, this commits to memory immediately without persisting.
 	/// The caller is responsible for calling `persist_batch` afterward. This
 	/// allows releasing locks between commit and persist for better concurrency
-	pub fn validate_and_commit(
-		&mut self,
-		headers: &[BlockHeader],
-	) -> Result<Vec<(BlockHeader, u32)>> {
+	pub fn validate_and_commit(&mut self, headers: &[BlockHeader]) -> Result<Vec<(BlockHeader, u32)>> {
 		let validated = self.validate_batch(headers)?;
 
 		if validated.is_empty() {
@@ -446,10 +438,7 @@ impl HeaderStore {
 	/// Validates a batch of headers without modifying state
 	///
 	/// Returns the validated (hash, header, height) tuples ready for commit
-	fn validate_batch<'a>(
-		&self,
-		headers: &'a [BlockHeader],
-	) -> Result<Vec<(Hash256, &'a BlockHeader, u32)>> {
+	fn validate_batch<'a>(&self, headers: &'a [BlockHeader]) -> Result<Vec<(Hash256, &'a BlockHeader, u32)>> {
 		if headers.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -534,6 +523,32 @@ impl HeaderStore {
 	pub fn hash_at_height(&self, height: u32) -> Option<Hash256> {
 		let idx = height as usize;
 		self.by_height.get(idx).copied()
+	}
+
+	/// Returns block hashes for a range of heights in a single call
+	///
+	/// Avoids per-height `RwLock` acquisition by extracting a batch of
+	/// (height, hash) pairs while holding the lock once. Heights beyond
+	/// the current tip are silently skipped
+	pub fn hashes_in_range(&self, start: u32, end: u32) -> Vec<(u32, Hash256)> {
+		let start_idx = start as usize;
+		let end_idx = (end as usize).min(self.by_height.len());
+		if start_idx >= end_idx {
+			return Vec::new();
+		}
+		// start_idx..end_idx is bounded by by_height.len() via the min() above
+		#[allow(clippy::indexing_slicing)]
+		let slice = &self.by_height[start_idx..end_idx];
+		slice
+			.iter()
+			.enumerate()
+			.map(|(i, &hash)| {
+				// i bounded by slice len which fits in u32 (chain heights are u32)
+				#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+				let height = start + i as u32;
+				(height, hash)
+			})
+			.collect()
 	}
 
 	/// Returns the compact target (nBits) of the current chain tip

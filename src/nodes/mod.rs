@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod block_download;
 mod handler_addr;
+mod handler_block;
 mod handler_headers;
 mod handler_inv;
 mod handler_ping;
@@ -122,6 +124,9 @@ const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
 
 /// How long a connection can sit idle before being dropped (2x `PING_INTERVAL`)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// Sender half of the block forwarding channel
+type BlockSender = tokio::sync::mpsc::Sender<(Hash256, Vec<u8>)>;
 
 /// Reason why a node was banned (bans expire after `BAN_DURATION_SECS`)
 #[derive(Debug)]
@@ -482,6 +487,12 @@ pub struct NodeManager {
 
 	/// Cached chain tip nBits for lock-free TUI reads
 	cached_tip_bits: AtomicU32,
+
+	/// Channel sender for forwarding raw block payloads to the download manager
+	block_sender: parking_lot::Mutex<Option<BlockSender>>,
+
+	/// Cached best contiguous block height for lock-free TUI reads
+	cached_block_height: AtomicU32,
 }
 
 impl NodeManager {
@@ -515,7 +526,24 @@ impl NodeManager {
 			header_store: Arc::new(parking_lot::RwLock::new(store)),
 			cached_height: AtomicU32::new(initial_height),
 			cached_tip_bits: AtomicU32::new(initial_bits),
+			block_sender: parking_lot::Mutex::new(None),
+			cached_block_height: AtomicU32::new(0),
 		}
+	}
+
+	/// Attaches the block channel for forwarding received blocks to the download manager
+	pub fn set_block_sender(&self, sender: BlockSender) {
+		*self.block_sender.lock() = Some(sender);
+	}
+
+	/// Returns the best contiguous block height for TUI display
+	pub fn block_height(&self) -> u32 {
+		self.cached_block_height.load(Ordering::Relaxed)
+	}
+
+	/// Updates the cached block height from the download manager
+	pub fn set_block_height(&self, height: u32) {
+		self.cached_block_height.store(height, Ordering::Relaxed);
 	}
 
 	/// Inserts a new node into the manager if it doesn't already exist
@@ -935,6 +963,22 @@ impl NodeManager {
 		}
 
 		info!("Graceful shutdown complete");
+	}
+
+	/// Returns writers for all currently connected peers
+	///
+	/// Collects results without holding `DashMap` locks across the iteration
+	pub fn get_connected_writers(&self) -> Vec<(IpAddr, SharedTcpWriter)> {
+		self.nodes
+			.iter()
+			.filter_map(|entry| {
+				if let NodeState::Connected { ref writer } = entry.value().state {
+					Some((*entry.key(), Arc::clone(writer)))
+				} else {
+					None
+				}
+			})
+			.collect()
 	}
 
 	/// Records a peer's report of our external IP address
@@ -1443,6 +1487,7 @@ async fn parse_incoming_message(
 			handler_headers::handle_sendheaders(node_manager, address);
 			Ok(())
 		}
+		NetworkCommand::Block => handler_block::handle_block(node_manager, address, &message.payload),
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())

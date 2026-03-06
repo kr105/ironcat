@@ -374,6 +374,7 @@ pub enum NetworkCommand {
 	GetHeaders,
 	Headers,
 	SendHeaders,
+	Block,
 	Unknown(String),
 }
 
@@ -395,6 +396,7 @@ impl NetworkCommand {
 			"getheaders" => Self::GetHeaders,
 			"headers" => Self::Headers,
 			"sendheaders" => Self::SendHeaders,
+			"block" => Self::Block,
 			_ => Self::Unknown(s.to_string()),
 		}
 	}

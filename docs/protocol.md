@@ -212,7 +212,7 @@ On receipt, Ironcat records the hashes in the peer's `inv_known` set (cleared wh
 
 Requests specific data from a peer. Same wire format as inv.
 
-On receipt, Ironcat responds with notfound for all requested items (no blocks or transactions to serve yet).
+On receipt, Ironcat responds with notfound for all requested items (block serving is not yet implemented). Ironcat sends getdata with `MSG_BLOCK` items to request blocks during block download.
 
 ### notfound
 
@@ -283,6 +283,25 @@ During batch validation, a `BatchLookup` overlay makes already-validated headers
 Empty payload. Sent after handshake to signal that the sender prefers to receive new block announcements as headers messages instead of inv messages (BIP 130, protocol version >= 70012).
 
 On receipt, Ironcat sets the peer's `prefer_headers` flag.
+
+### block
+
+A full block: header followed by all transactions.
+
+```
+[80] header         - Block header
+[var] tx_count      - VarInt, number of transactions
+```
+
+Repeated `tx_count` times:
+
+```
+[...] transaction   - Serialized transaction (version + vin[] + vout[] + locktime)
+```
+
+On receipt, Ironcat extracts the block hash from the header and forwards the raw payload to the download manager via an internal channel. The download manager validates the merkle root (computed from transaction IDs must match `header.merkle_root`) and writes the raw block to flat file storage. No script execution or UTXO validation is performed.
+
+Blocks with duplicate trailing transactions are rejected (CVE-2012-2459 merkle tree malleability protection).
 
 ### alert
 

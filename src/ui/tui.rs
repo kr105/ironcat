@@ -147,8 +147,17 @@ fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<Tui
 
 	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
 	draw_network_stats(frame, top_chunks[0], &stats);
+	let block_height = node_manager.block_height();
 	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
-	draw_chain_sync(frame, top_chunks[1], chain_height, tip_bits, &nodes, tui_state);
+	draw_chain_sync(
+		frame,
+		top_chunks[1],
+		chain_height,
+		tip_bits,
+		block_height,
+		&nodes,
+		tui_state,
+	);
 
 	nodes.sort_by(|a, b| b.height.cmp(&a.height));
 
@@ -214,6 +223,7 @@ fn draw_chain_sync(
 	area: Rect,
 	chain_height: u32,
 	tip_bits: u32,
+	block_height: u32,
 	nodes: &[NodeSnapshot],
 	tui_state: &TuiState,
 ) {
@@ -242,6 +252,17 @@ fn draw_chain_sync(
 			Span::styled(
 				format_number(chain_height),
 				Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Blocks: ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format!("{} / {}", format_number(block_height), format_number(chain_height)),
+				Style::default().fg(if block_height >= chain_height {
+					Color::Green
+				} else {
+					Color::Yellow
+				}),
 			),
 		]),
 		Line::from(vec![
