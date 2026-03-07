@@ -16,3 +16,7 @@ No peers.dat equivalent. Every restart rediscovers peers from scratch via DNS an
 ## Max Outgoing Connections
 
 No limit on simultaneous outgoing connections. Should cap at 8-16 to avoid resource exhaustion.
+
+## Block Header Sync (getheaders/headers)
+
+inv/getdata/notfound are implemented with stub handlers. Next step is requesting block headers from peers via getheaders and processing the headers response to build a chain of `BlockHeader`s.

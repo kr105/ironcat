@@ -13,10 +13,24 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::Level;
 
-use crate::{nodes::NodeManager, tui_layer::TuiLogEntry};
+use crate::{
+	difficulty::{self, ConsensusParams},
+	nodes::{NodeManager, NodeSnapshot, NodeStateLabel, NodeStats},
+	tui_layer::TuiLogEntry,
+};
 
 /// Interval between stats-driven redraws when no log events arrive
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Mutable state tracked across TUI redraws for rate calculations
+struct TuiState {
+	/// Chain height at the previous redraw
+	prev_height: u32,
+	/// Timestamp of the previous redraw
+	prev_time: std::time::Instant,
+	/// Computed headers-per-second rate
+	headers_per_sec: f64,
+}
 
 /// Initializes and runs the TUI application
 ///
@@ -47,9 +61,14 @@ fn run(
 ) -> Result<()> {
 	let mut log_buffer = VecDeque::new();
 	let mut last_draw = std::time::Instant::now();
+	let mut tui_state = TuiState {
+		prev_height: node_manager.chain_height(),
+		prev_time: std::time::Instant::now(),
+		headers_per_sec: 0.0,
+	};
 
 	// Initial draw so the screen isn't blank
-	terminal.draw(|f| draw(f, node_manager, &log_buffer))?;
+	terminal.draw(|f| draw(f, node_manager, &log_buffer, &tui_state))?;
 
 	loop {
 		let mut needs_redraw = false;
@@ -69,7 +88,21 @@ fn run(
 		}
 
 		if needs_redraw {
-			terminal.draw(|f| draw(f, node_manager, &log_buffer))?;
+			// Update headers/s rate
+			let current_height = node_manager.chain_height();
+			let elapsed = tui_state.prev_time.elapsed().as_secs_f64();
+			if elapsed > 0.5 {
+				#[allow(clippy::cast_precision_loss)] // height delta fits comfortably in f64
+				let delta = f64::from(current_height.saturating_sub(tui_state.prev_height));
+				#[allow(clippy::float_arithmetic)] // rate calculation requires division
+				{
+					tui_state.headers_per_sec = delta / elapsed;
+				}
+				tui_state.prev_height = current_height;
+				tui_state.prev_time = std::time::Instant::now();
+			}
+
+			terminal.draw(|f| draw(f, node_manager, &log_buffer, &tui_state))?;
 			last_draw = std::time::Instant::now();
 		}
 
@@ -83,35 +116,297 @@ fn run(
 					break;
 				}
 			}
-			// Any key event triggers a redraw on next iteration
 		}
 	}
 	Ok(())
 }
 
-/// Renders the TUI layout and content
-fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<TuiLogEntry>) {
-	// Layout returns exactly the number of constraints provided (2)
-	let layout = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
+/// Renders the dashboard layout: stats row, peers table, logs panel, help bar
+fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<TuiLogEntry>, tui_state: &TuiState) {
+	// Vertical stack: stats | peers | logs | help
+	let main_chunks = Layout::default()
+		.direction(Direction::Vertical)
+		.constraints([
+			Constraint::Length(9),      // Stats row
+			Constraint::Percentage(50), // Peers table
+			Constraint::Percentage(50), // Logs panel
+			Constraint::Length(1),      // Help bar
+		])
 		.split(frame.area());
 
-	// Render left panel
-	#[allow(clippy::indexing_slicing)]
-	draw_left_panel(frame, layout[0], node_manager);
+	let (stats, mut nodes) = node_manager.get_snapshot();
+	let chain_height = node_manager.chain_height();
+	let tip_bits = node_manager.chain_tip_bits();
 
-	// Render log panel
-	let log_block = Block::default().borders(Borders::ALL).title("Logs");
-	// Layout has 2 elements, index [1] is safe
-	#[allow(clippy::indexing_slicing)]
-	let inner_area = log_block.inner(layout[1]);
-	#[allow(clippy::indexing_slicing)]
-	frame.render_widget(log_block, layout[1]);
+	// Top row: Network Stats | Chain Sync (side by side)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	let top_chunks = Layout::default()
+		.direction(Direction::Horizontal)
+		.constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+		.split(main_chunks[0]);
 
-	// Calculate visible lines to create the scrolling effect
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
+	draw_network_stats(frame, top_chunks[0], &stats);
+	let block_height = node_manager.block_height();
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 2 elements
+	draw_chain_sync(
+		frame,
+		top_chunks[1],
+		chain_height,
+		tip_bits,
+		block_height,
+		&nodes,
+		tui_state,
+	);
+
+	nodes.sort_by(|a, b| b.height.cmp(&a.height));
+
+	// Peers table (full width)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_peers_table(frame, main_chunks[1], &nodes);
+
+	// Logs panel (full width)
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_logs(frame, main_chunks[2], log_buffer);
+
+	// Help bar
+	#[allow(clippy::indexing_slicing)] // layout produces exactly 4 elements
+	draw_help_bar(frame, main_chunks[3]);
+}
+
+/// Renders the Network Stats panel (top-left quadrant)
+fn draw_network_stats(frame: &mut Frame, area: Rect, stats: &NodeStats) {
+	let text = vec![
+		Line::from(vec![
+			Span::styled("Peers: ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format!("{}", stats.connected),
+				Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+			),
+			Span::styled(
+				format!("  ({} in / {} out)", stats.incoming, stats.outgoing),
+				Style::default().fg(Color::DarkGray),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Handshaking: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.handshaking), Style::default().fg(Color::Yellow)),
+			Span::styled("  Connecting: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.connecting), Style::default().fg(Color::Yellow)),
+		]),
+		Line::from(vec![
+			Span::styled("Disconnected: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.disconnected), Style::default().fg(Color::DarkGray)),
+			Span::styled("  Dead: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.dead), Style::default().fg(Color::DarkGray)),
+		]),
+		Line::from(vec![
+			Span::styled("Banned: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.banned), Style::default().fg(Color::Red)),
+			Span::styled("  Total: ", Style::default().fg(Color::Gray)),
+			Span::styled(format!("{}", stats.total), Style::default().fg(Color::White)),
+		]),
+	];
+
+	let paragraph = Paragraph::new(text).block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("Network")
+			.border_style(Style::default().fg(Color::Cyan)),
+	);
+	frame.render_widget(paragraph, area);
+}
+
+/// Renders the Chain Sync panel (top-right quadrant)
+fn draw_chain_sync(
+	frame: &mut Frame,
+	area: Rect,
+	chain_height: u32,
+	tip_bits: u32,
+	block_height: u32,
+	nodes: &[NodeSnapshot],
+	tui_state: &TuiState,
+) {
+	// Find best peer height among connected peers with reported height
+	let best_peer = nodes.iter().filter(|n| n.height > 0).max_by_key(|n| n.height);
+
+	let best_height = best_peer.map_or(0, |n| n.height);
+	let best_addr = best_peer.map(|n| format!("{}", n.address));
+
+	// Calculate sync progress ratio
+	#[allow(clippy::cast_precision_loss, clippy::float_arithmetic)] // heights fit in f64, division needed for ratio
+	let progress = if best_height > 0 {
+		f64::from(chain_height) / f64::from(best_height)
+	} else {
+		0.0
+	}
+	.min(1.0);
+
+	let best_label = best_addr
+		.as_ref()
+		.map_or_else(|| "unknown".to_string(), |addr| format!("{best_height} ({addr})"));
+
+	let text = vec![
+		Line::from(vec![
+			Span::styled("Local:  ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format_number(chain_height),
+				Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Blocks: ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format!("{} / {}", format_number(block_height), format_number(chain_height)),
+				Style::default().fg(if block_height >= chain_height {
+					Color::Green
+				} else {
+					Color::Yellow
+				}),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Best:   ", Style::default().fg(Color::Gray)),
+			Span::styled(best_label, Style::default().fg(Color::White)),
+		]),
+		Line::from(vec![
+			Span::styled("Sync:   ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format_progress_bar(progress, 20),
+				Style::default().fg(if progress >= 1.0 { Color::Green } else { Color::Yellow }),
+			),
+			#[allow(clippy::float_arithmetic)] // percentage display requires multiplication
+			Span::styled(format!(" {:.1}%", progress * 100.0), Style::default().fg(Color::White)),
+		]),
+		Line::from(vec![
+			Span::styled("Rate:   ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format!("{:.1} headers/s", tui_state.headers_per_sec),
+				Style::default().fg(Color::White),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Diff:   ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				difficulty::format_difficulty(difficulty::compact_to_difficulty(tip_bits)),
+				Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+			),
+			Span::styled("  ", Style::default()),
+			Span::styled(
+				difficulty::active_algorithm(chain_height, &ConsensusParams::mainnet()),
+				Style::default().fg(Color::Cyan),
+			),
+		]),
+	];
+
+	let paragraph = Paragraph::new(text).block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("Chain Sync")
+			.border_style(Style::default().fg(Color::Cyan)),
+	);
+	frame.render_widget(paragraph, area);
+}
+
+/// Formats a number with comma separators (e.g. 1,234,567)
+fn format_number(n: u32) -> String {
+	let s = n.to_string();
+	let mut result = String::with_capacity(s.len().saturating_add(s.len() / 3));
+	for (i, c) in s.chars().rev().enumerate() {
+		if i > 0 && i % 3 == 0 {
+			result.push(',');
+		}
+		result.push(c);
+	}
+	result.chars().rev().collect()
+}
+
+/// Builds an ASCII progress bar like "████████░░░░"
+fn format_progress_bar(ratio: f64, width: usize) -> String {
+	#[allow(
+		clippy::cast_sign_loss,
+		clippy::cast_possible_truncation,
+		clippy::cast_precision_loss,
+		clippy::float_arithmetic
+	)] // ratio is 0.0..=1.0, width is small, multiplication needed for bar sizing
+	let filled = (ratio * width as f64) as usize;
+	let empty = width.saturating_sub(filled);
+	let mut bar = String::with_capacity(width);
+	for _ in 0..filled {
+		bar.push('\u{2588}'); // full block
+	}
+	for _ in 0..empty {
+		bar.push('\u{2591}'); // light shade
+	}
+	bar
+}
+
+/// Renders the Peers table (bottom-left quadrant)
+fn draw_peers_table(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
+	let header = Row::new(vec![
+		Cell::from("Endpoint"),
+		Cell::from("Height"),
+		Cell::from("St"),
+		Cell::from("Ty"),
+		Cell::from("Ver"),
+		Cell::from("User Agent"),
+	])
+	.style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+	let rows: Vec<Row> = nodes
+		.iter()
+		.map(|node| {
+			let state_color = match node.state_label {
+				NodeStateLabel::Connected => Color::Green,
+				NodeStateLabel::Handshaking | NodeStateLabel::Connecting => Color::Yellow,
+				NodeStateLabel::Disconnected(_) | NodeStateLabel::Dead => Color::DarkGray,
+				NodeStateLabel::Banned => Color::Red,
+			};
+
+			Row::new(vec![
+				Cell::from(format!("{}:{}", node.address, node.port)),
+				Cell::from(node.height.to_string()),
+				Cell::from(node.state_label.short().to_string()).style(Style::default().fg(state_color)),
+				Cell::from(node.connection_type.to_string()),
+				Cell::from(node.version.to_string()),
+				Cell::from(node.user_agent.clone()),
+			])
+		})
+		.collect();
+
+	let table = Table::new(
+		rows,
+		vec![
+			Constraint::Min(22),        // Endpoint (IP:port)
+			Constraint::Length(7),      // Height
+			Constraint::Length(2),      // State (2-char)
+			Constraint::Length(3),      // Type (In/Out)
+			Constraint::Length(5),      // Version
+			Constraint::Percentage(30), // User Agent (fill remaining)
+		],
+	)
+	.header(header)
+	.block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("Peers")
+			.border_style(Style::default().fg(Color::Cyan)),
+	);
+
+	frame.render_widget(table, area);
+}
+
+/// Renders the Logs panel (bottom-right quadrant)
+fn draw_logs(frame: &mut Frame, area: Rect, log_buffer: &VecDeque<TuiLogEntry>) {
+	let log_block = Block::default()
+		.borders(Borders::ALL)
+		.title("Logs")
+		.border_style(Style::default().fg(Color::Cyan));
+
+	let inner_area = log_block.inner(area);
+	frame.render_widget(log_block, area);
+
 	let visible_lines = inner_area.height as usize;
-
 	let log_text = create_log_text(log_buffer, visible_lines);
 
 	let log_paragraph = Paragraph::new(log_text).wrap(Wrap { trim: true });
@@ -147,61 +442,11 @@ fn create_log_text(log_buffer: &VecDeque<TuiLogEntry>, visible_lines: usize) -> 
 	text
 }
 
-fn draw_left_panel(frame: &mut Frame, area: Rect, node_manager: &NodeManager) {
-	// Layout returns exactly the number of constraints provided (2)
-	let chunks = Layout::default()
-		.direction(Direction::Vertical)
-		.constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-		.split(area);
-
-	// Single iteration for both stats and node list
-	let (stats, mut nodes) = node_manager.get_snapshot();
-
-	// Top half: Stats display
-	let stats_text = format!(
-		"Total Nodes: {}\nConnected Nodes: {}\nDisconnected Nodes: {}",
-		stats.total, stats.connected, stats.disconnected
-	);
-	let stats_paragraph = Paragraph::new(stats_text).block(Block::default().borders(Borders::ALL).title("Node Stats"));
-	// chunks has 2 elements from the 2 constraints above
-	#[allow(clippy::indexing_slicing)]
-	frame.render_widget(stats_paragraph, chunks[0]);
-
-	// Bottom half: Nodes table sorted by height
-	nodes.sort_by(|a, b| b.height.cmp(&a.height));
-
-	let header = Row::new(vec![
-		Cell::from("Endpoint"),
-		Cell::from("Height"),
-		Cell::from("State"),
-		Cell::from("Type"),
+/// Renders the help bar at the bottom
+fn draw_help_bar(frame: &mut Frame, area: Rect) {
+	let help = Line::from(vec![
+		Span::styled(" q", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+		Span::styled(":quit", Style::default().fg(Color::DarkGray)),
 	]);
-
-	let rows: Vec<Row> = nodes
-		.iter()
-		.map(|node| {
-			Row::new(vec![
-				Cell::from(format!("{}:{}", node.address, node.port)),
-				Cell::from(node.height.to_string()),
-				Cell::from(node.state_label.to_string()),
-				Cell::from(node.connection_type.to_string()),
-			])
-		})
-		.collect();
-
-	let table = Table::new(
-		rows,
-		vec![
-			Constraint::Percentage(50), // "Endpoint" column width
-			Constraint::Percentage(15), // "Height" column width
-			Constraint::Percentage(15), // "State" column width
-			Constraint::Percentage(15), // "Type" column width
-		],
-	)
-	.header(header)
-	.block(Block::default().borders(Borders::ALL).title("Connected Nodes"));
-
-	// chunks has 2 elements from the 2 constraints above
-	#[allow(clippy::indexing_slicing)]
-	frame.render_widget(table, chunks[1]);
+	frame.render_widget(Paragraph::new(help), area);
 }

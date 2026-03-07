@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{anyhow, Context, Result};
+pub mod block_download;
+mod handler_addr;
+mod handler_block;
+mod handler_headers;
+mod handler_inv;
+mod handler_ping;
+mod handler_verack;
+mod handler_version;
+
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use rand::RngCore;
-use siphasher::sip::SipHasher13;
 use std::{
 	collections::HashSet,
 	ffi::CStr,
 	fmt,
 	net::IpAddr,
 	sync::{
-		atomic::{AtomicUsize, Ordering},
+		atomic::{AtomicU32, AtomicUsize, Ordering},
 		Arc,
 	},
 	time::Duration,
@@ -24,13 +32,16 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
+	difficulty::ConsensusParams,
 	dns::DEFAULT_PORT,
+	headers::HeaderStore,
 	network::{
-		message_addr::{AddrEntry, MessageAddr},
-		message_version::MessageVersion,
-		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
+		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
 	},
-	utils::{is_recently_active, is_routable, unix_now, vec_to_u64_le},
+	storage::header_store_backend::HeaderStoreBackend,
+	types::{block::BlockHeader, hash::Hash256},
+	utils::{is_routable, unix_now},
 };
 
 /// Base delay for exponential backoff in seconds
@@ -96,6 +107,12 @@ const MAX_EXTERNAL_IP_VOTES: usize = 100;
 /// Maximum entries in a peer's `addr_known` set within a 24h bucket
 const MAX_ADDR_KNOWN: usize = 5000;
 
+/// Maximum entries in a peer's `inv_known` set before clearing
+const MAX_INV_KNOWN: usize = 50_000;
+
+/// Minimum protocol version that supports sendheaders (BIP 130)
+const SENDHEADERS_VERSION: u32 = 70012;
+
 /// Maximum concurrent incoming connections
 const MAX_INCOMING_CONNECTIONS: usize = 125;
 
@@ -107,6 +124,9 @@ const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
 
 /// How long a connection can sit idle before being dropped (2x `PING_INTERVAL`)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// Sender half of the block forwarding channel
+type BlockSender = tokio::sync::mpsc::Sender<(Hash256, Vec<u8>)>;
 
 /// Reason why a node was banned (bans expire after `BAN_DURATION_SECS`)
 #[derive(Debug)]
@@ -215,8 +235,20 @@ pub struct NodeStats {
 	pub total: usize,
 	/// Number of nodes in Connected state
 	pub connected: usize,
-	/// Number of nodes not in Connected state
+	/// Connected incoming peers
+	pub incoming: usize,
+	/// Connected outgoing peers
+	pub outgoing: usize,
+	/// Nodes in Handshaking state
+	pub handshaking: usize,
+	/// Nodes in Connecting state
+	pub connecting: usize,
+	/// Nodes in Disconnected state
 	pub disconnected: usize,
+	/// Nodes in Dead state
+	pub dead: usize,
+	/// Nodes in Banned state
+	pub banned: usize,
 }
 
 /// Direction of a node connection
@@ -279,6 +311,18 @@ impl NodeStateLabel {
 			NodeState::Banned { .. } => Self::Banned,
 		}
 	}
+
+	/// Returns a short 2-char label for compact table display
+	pub const fn short(&self) -> &'static str {
+		match self {
+			Self::Connecting => "Cn",
+			Self::Handshaking => "Hs",
+			Self::Connected => "Co",
+			Self::Disconnected(_) => "Dc",
+			Self::Dead => "De",
+			Self::Banned => "Ba",
+		}
+	}
 }
 
 /// Lightweight snapshot of node data for display purposes
@@ -296,9 +340,14 @@ pub struct NodeSnapshot {
 	pub connection_type: ConnectionType,
 	/// Human-readable state label for display
 	pub state_label: NodeStateLabel,
+	/// Protocol version reported by peer
+	pub version: u32,
+	/// User agent string from version message
+	pub user_agent: String,
 }
 
 /// Represents a node in the Catcoin network
+#[allow(clippy::struct_excessive_bools)] // each bool is a distinct protocol flag, not a state machine
 pub struct Node {
 	/// Port number for this node's listening socket
 	pub port: u16,
@@ -356,6 +405,12 @@ pub struct Node {
 
 	/// Nonce of the last ping we sent to this peer, for pong validation
 	pub last_ping_nonce: Option<u64>,
+
+	/// Inventory hashes known to this peer (announced via inv)
+	pub inv_known: HashSet<Hash256>,
+
+	/// Whether this peer prefers block announcements via headers (BIP 130)
+	pub prefer_headers: bool,
 }
 
 impl Node {
@@ -381,6 +436,8 @@ impl Node {
 			last_getaddr_response: None,
 			pending_external_ip: None,
 			last_ping_nonce: None,
+			inv_known: HashSet::new(),
+			prefer_headers: false,
 		}
 	}
 }
@@ -421,18 +478,44 @@ pub struct NodeManager {
 
 	/// Per-IP cooldown for incoming connections to prevent reconnect spam
 	incoming_cooldowns: DashMap<IpAddr, Instant>,
-}
 
-impl Default for NodeManager {
-	fn default() -> Self {
-		Self::new()
-	}
+	/// In-memory block header chain
+	pub header_store: Arc<parking_lot::RwLock<HeaderStore>>,
+
+	/// Cached chain tip height for lock-free TUI reads
+	cached_height: AtomicU32,
+
+	/// Cached chain tip nBits for lock-free TUI reads
+	cached_tip_bits: AtomicU32,
+
+	/// Channel sender for forwarding raw block payloads to the download manager
+	block_sender: parking_lot::Mutex<Option<BlockSender>>,
+
+	/// Cached best contiguous block height for lock-free TUI reads
+	cached_block_height: AtomicU32,
 }
 
 impl NodeManager {
 	/// Creates a new `NodeManager` with an empty node set and random nonce and relay key
-	pub fn new() -> Self {
+	///
+	/// Headers are kept in-memory only (no persistence backend)
+	pub fn new(genesis_header: BlockHeader, params: ConsensusParams) -> Self {
+		Self::with_header_backend(genesis_header, params, None)
+	}
+
+	/// Creates a new `NodeManager` with an optional header persistence backend
+	///
+	/// If a backend is provided, headers are loaded from disk on startup and
+	/// written through on every insert. If `None`, behaves identically to `new()`
+	pub fn with_header_backend(
+		genesis_header: BlockHeader,
+		params: ConsensusParams,
+		backend: Option<Arc<dyn HeaderStoreBackend>>,
+	) -> Self {
 		let mut rng = rand::thread_rng();
+		let store = HeaderStore::with_backend(genesis_header, params, backend);
+		let initial_height = store.height();
+		let initial_bits = store.tip_bits();
 		Self {
 			nodes: DashMap::new(),
 			my_nonce: rng.next_u64(),
@@ -440,7 +523,27 @@ impl NodeManager {
 			external_ip_votes: DashMap::new(),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
+			header_store: Arc::new(parking_lot::RwLock::new(store)),
+			cached_height: AtomicU32::new(initial_height),
+			cached_tip_bits: AtomicU32::new(initial_bits),
+			block_sender: parking_lot::Mutex::new(None),
+			cached_block_height: AtomicU32::new(0),
 		}
+	}
+
+	/// Attaches the block channel for forwarding received blocks to the download manager
+	pub fn set_block_sender(&self, sender: BlockSender) {
+		*self.block_sender.lock() = Some(sender);
+	}
+
+	/// Returns the best contiguous block height for TUI display
+	pub fn block_height(&self) -> u32 {
+		self.cached_block_height.load(Ordering::Relaxed)
+	}
+
+	/// Updates the cached block height from the download manager
+	pub fn set_block_height(&self, height: u32) {
+		self.cached_block_height.store(height, Ordering::Relaxed);
 	}
 
 	/// Inserts a new node into the manager if it doesn't already exist
@@ -549,6 +652,10 @@ impl NodeManager {
 	/// Updates the connection state of a node
 	pub fn set_state(&self, address: &IpAddr, state: NodeState) {
 		if let Some(mut node) = self.nodes.get_mut(address) {
+			// Clear per-session state when the connection ends
+			if matches!(state, NodeState::Disconnected { .. } | NodeState::Dead) {
+				node.inv_known.clear();
+			}
 			node.state = state;
 		}
 	}
@@ -589,9 +696,44 @@ impl NodeManager {
 		}
 	}
 
+	/// Attaches a header persistence backend, loading stored headers from disk
+	///
+	/// The heavy loading (read + hash validation) runs before acquiring the
+	/// write lock. Only the final pointer swap holds the lock, so the TUI
+	/// and other readers are not blocked during the load
+	pub fn attach_header_backend(&self, backend: Arc<dyn HeaderStoreBackend>) {
+		let genesis_hash = self.header_store.read().genesis();
+
+		// Slow: read all headers from redb and validate chain continuity
+		let result = HeaderStore::try_load_from_backend(backend.as_ref(), genesis_hash);
+
+		// Fast: swap pre-built maps into the store under write lock
+		self.header_store.write().apply_backend_load(result, backend);
+		self.refresh_chain_cache();
+	}
+
 	/// Returns the number of nodes currently in Connected state
 	pub fn connected_count(&self) -> usize {
 		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
+	}
+
+	/// Returns the current chain tip height (lock-free, from atomic cache)
+	pub fn chain_height(&self) -> u32 {
+		self.cached_height.load(Ordering::Relaxed)
+	}
+
+	/// Returns the compact target (nBits) of the current chain tip (lock-free, from atomic cache)
+	pub fn chain_tip_bits(&self) -> u32 {
+		self.cached_tip_bits.load(Ordering::Relaxed)
+	}
+
+	/// Refreshes the cached height and `tip_bits` from the header store
+	///
+	/// Must be called after any write to `header_store` that changes the tip
+	pub fn refresh_chain_cache(&self) {
+		let store = self.header_store.read();
+		self.cached_height.store(store.height(), Ordering::Relaxed);
+		self.cached_tip_bits.store(store.tip_bits(), Ordering::Relaxed);
 	}
 
 	/// Returns stats and node snapshots in a single `DashMap` iteration
@@ -599,13 +741,46 @@ impl NodeManager {
 	/// Only acquires shard locks once for both stats and snapshot data
 	pub fn get_snapshot(&self) -> (NodeStats, Vec<NodeSnapshot>) {
 		let mut connected: usize = 0;
+		let mut incoming: usize = 0;
+		let mut outgoing: usize = 0;
+		let mut handshaking: usize = 0;
+		let mut connecting: usize = 0;
+		let mut disconnected: usize = 0;
+		let mut dead: usize = 0;
+		let mut banned: usize = 0;
+
 		let snapshots: Vec<NodeSnapshot> = self
 			.nodes
 			.iter()
 			.map(|entry| {
 				let node = entry.value();
-				if node.state.is_connected() {
-					connected = connected.saturating_add(1);
+				match &node.state {
+					NodeState::Connected { .. } => {
+						connected = connected.saturating_add(1);
+						match node.connection_type {
+							ConnectionType::Incoming => {
+								incoming = incoming.saturating_add(1);
+							}
+							ConnectionType::Outgoing => {
+								outgoing = outgoing.saturating_add(1);
+							}
+						}
+					}
+					NodeState::Handshaking { .. } => {
+						handshaking = handshaking.saturating_add(1);
+					}
+					NodeState::Connecting { .. } => {
+						connecting = connecting.saturating_add(1);
+					}
+					NodeState::Disconnected { .. } => {
+						disconnected = disconnected.saturating_add(1);
+					}
+					NodeState::Dead => {
+						dead = dead.saturating_add(1);
+					}
+					NodeState::Banned { .. } => {
+						banned = banned.saturating_add(1);
+					}
 				}
 				NodeSnapshot {
 					address: *entry.key(),
@@ -613,18 +788,25 @@ impl NodeManager {
 					height: node.height,
 					connection_type: node.connection_type,
 					state_label: NodeStateLabel::from_state(&node.state),
+					version: node.version,
+					user_agent: node.user_agent.clone(),
 				}
 			})
 			.collect();
 
 		let total = snapshots.len();
-		let disconnected = total.saturating_sub(connected);
 
 		(
 			NodeStats {
 				total,
 				connected,
+				incoming,
+				outgoing,
+				handshaking,
+				connecting,
 				disconnected,
+				dead,
+				banned,
 			},
 			snapshots,
 		)
@@ -697,6 +879,7 @@ impl NodeManager {
 				warn!("Node {} stuck in stale state, scheduling retry", address);
 				if let Some(mut node) = self.nodes.get_mut(&address) {
 					if matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. }) {
+						node.inv_known.clear();
 						node.state = NodeState::Disconnected {
 							retry_at: Instant::now(),
 							attempt: 0,
@@ -780,6 +963,22 @@ impl NodeManager {
 		}
 
 		info!("Graceful shutdown complete");
+	}
+
+	/// Returns writers for all currently connected peers
+	///
+	/// Collects results without holding `DashMap` locks across the iteration
+	pub fn get_connected_writers(&self) -> Vec<(IpAddr, SharedTcpWriter)> {
+		self.nodes
+			.iter()
+			.filter_map(|entry| {
+				if let NodeState::Connected { ref writer } = entry.value().state {
+					Some((*entry.key(), Arc::clone(writer)))
+				} else {
+					None
+				}
+			})
+			.collect()
 	}
 
 	/// Records a peer's report of our external IP address
@@ -1255,19 +1454,40 @@ async fn parse_incoming_message(
 	}
 
 	match command {
-		NetworkCommand::Version => handle_version(node_manager, address, tcp_writer, &message.payload).await,
-		NetworkCommand::Verack => handle_verack(node_manager, address, tcp_writer).await,
-		NetworkCommand::Ping => handle_ping(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::Version => {
+			handler_version::handle_version(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::Verack => handler_verack::handle_verack(node_manager, address, tcp_writer).await,
+		NetworkCommand::Ping => handler_ping::handle_ping(node_manager, address, tcp_writer, &message.payload).await,
 		NetworkCommand::Pong => {
-			handle_pong(node_manager, address, &message.payload);
+			handler_ping::handle_pong(node_manager, address, &message.payload);
 			Ok(())
 		}
-		NetworkCommand::Addr => handle_addr(node_manager, address, &message.payload).await,
+		NetworkCommand::Addr => handler_addr::handle_addr(node_manager, address, &message.payload).await,
 		NetworkCommand::Alert => {
 			debug!("Received alert from {}, ignoring", address);
 			Ok(())
 		}
-		NetworkCommand::GetAddr => handle_getaddr(node_manager, address, tcp_writer).await,
+		NetworkCommand::GetAddr => handler_addr::handle_getaddr(node_manager, address, tcp_writer).await,
+		NetworkCommand::Inv => handler_inv::handle_inv(node_manager, address, tcp_writer, &message.payload).await,
+		NetworkCommand::GetData => {
+			handler_inv::handle_getdata(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::NotFound => {
+			handler_inv::handle_notfound(address, &message.payload);
+			Ok(())
+		}
+		NetworkCommand::Headers => {
+			handler_headers::handle_headers(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::GetHeaders => {
+			handler_headers::handle_getheaders(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::SendHeaders => {
+			handler_headers::handle_sendheaders(node_manager, address);
+			Ok(())
+		}
+		NetworkCommand::Block => handler_block::handle_block(node_manager, address, &message.payload),
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())
@@ -1275,555 +1495,26 @@ async fn parse_incoming_message(
 	}
 }
 
-/// Handles an incoming version message from a peer
-async fn handle_version(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	let version = MessageVersion::from_bytes(payload).context("failed to parse version message")?;
-
-	// Phase 1: Validate under lock, then release
-	let (is_incoming, port) = {
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
-
-		// Nodes can send only one version command
-		if node.version_received {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Node {} sent version command twice, banning", address);
-			return Err(anyhow!("Node {address} sent version command twice"));
-		}
-
-		if version.nonce == node_manager.my_nonce {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Self-connection detected to {}, banning", address);
-			return Err(anyhow!("Node {address} is myself"));
-		}
-
-		(node.connection_type == ConnectionType::Incoming, node.port)
-		// RefMut dropped here
-	};
-
-	// Phase 2: Async sends without holding any lock
-	if is_incoming {
-		let network_address = NetworkAddress::new(*address, port);
-		let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
-		tcp_writer
-			.send_message("version", &version_message.to_bytes())
-			.await
-			.context("failed to send version reply for inbound connection")?;
-	}
-
-	// Validate start_height
-	if version.start_height < 0 {
-		if let Some(mut node) = node_manager.nodes.get_mut(address) {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::Misbehavior,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-		}
-		warn!(
-			"Node {} sent negative start_height {}, banning",
-			address, version.start_height
-		);
-		return Err(anyhow!("Node {address} sent negative start_height"));
-	}
-
-	// Warn on extreme clock skew but don't ban (clock drift is common)
-	// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
-	// i64 subtraction of two timestamps can't overflow in practice (both near current epoch)
-	#[allow(clippy::cast_possible_wrap, clippy::arithmetic_side_effects)]
-	let time_diff = (version.timestamp - unix_now() as i64).unsigned_abs();
-	if time_diff > 4200 {
-		warn!("Node {} clock skew is {}s (threshold 4200s)", address, time_diff);
-	}
-
-	// Phase 3: Re-acquire lock to write fields
-	// Verify state hasn't changed between phases (another task could have banned the node)
-	{
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager during version handling"))?;
-
-		if !matches!(node.state, NodeState::Handshaking { .. }) {
-			return Err(anyhow!(
-				"node {address} state changed during version handling (now {})",
-				node.state
-			));
-		}
-
-		node.services = version.services;
-		node.timestamp = version.timestamp;
-		node.user_agent = sanitize_user_agent(&version.user_agent);
-		node.height = version.start_height;
-		node.version = version.version;
-		node.version_received = true;
-		node.relay = version.relay;
-		node.pending_external_ip = Some(version.addr_recv.address);
-	}
-
-	// Verack sent after all locks released
-	tcp_writer
-		.send_message("verack", &[])
-		.await
-		.context("failed to send verack")
-}
-
-/// Handles an incoming verack message from a peer
-async fn handle_verack(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
-	let pending_ip = {
-		let mut node = node_manager
-			.nodes
-			.get_mut(address)
-			.ok_or_else(|| anyhow!("node {address} disappeared from manager"))?;
-
-		// Verack before version is a protocol violation
-		if !node.version_received {
-			let now = unix_now();
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: now,
-				expires: ban_expires_at(now),
-			};
-			warn!("Node {} sent verack before version, banning", address);
-			return Err(anyhow!("Node {address} sent verack before version"));
-		}
-
-		info!(
-			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			address, node.version, node.height, node.user_agent
-		);
-
-		node.state = NodeState::Connected {
-			writer: Arc::clone(tcp_writer),
-		};
-		node.sent_getaddr = true;
-
-		node.pending_external_ip.take()
-		// RefMut dropped here
-	};
-
-	// Record external IP vote only after handshake completes
-	if let Some(ip) = pending_ip {
-		node_manager.record_external_ip_vote(ip);
-	}
-
-	tcp_writer
-		.send_message("getaddr", &[])
-		.await
-		.context("failed to send getaddr")?;
-
-	Ok(())
-}
-
-/// Handles an incoming ping message from a peer
-async fn handle_ping(
-	node_manager: &Arc<NodeManager>,
-	address: &IpAddr,
-	tcp_writer: &SharedTcpWriter,
-	payload: &[u8],
-) -> Result<()> {
-	// Pre-BIP31 nodes send 0-byte pings; just acknowledge silently
-	if payload.is_empty() {
-		debug!("Received pre-BIP31 ping (no nonce) from {}", address);
-		return Ok(());
-	}
-
-	if payload.len() != 8 {
-		warn!("Received malformed ping command from {}", address);
-
-		let now = unix_now();
-		node_manager.set_state(
-			address,
-			NodeState::Banned {
-				reason: BanReason::Misbehavior,
-				created: now,
-				expires: ban_expires_at(now),
-			},
-		);
-
-		return Err(anyhow!("Received malformed ping command from {address}"));
-	}
-
-	let nonce = vec_to_u64_le(payload).context("failed to parse ping nonce")?;
-	debug!("Received ping command from {} with nonce {}", address, nonce);
-
-	tcp_writer
-		.send_message("pong", &nonce.to_le_bytes())
-		.await
-		.context("failed to send pong")
-}
-
-/// Handles an incoming pong message from a peer
-///
-/// Validates that the nonce matches the last ping we sent
-fn handle_pong(node_manager: &NodeManager, address: &IpAddr, payload: &[u8]) {
-	if payload.len() != 8 {
-		warn!(
-			"Received malformed pong from {} ({} bytes, expected 8)",
-			address,
-			payload.len()
-		);
-		return;
-	}
-
-	let Ok(nonce) = vec_to_u64_le(payload) else {
-		warn!("Failed to parse pong nonce from {}", address);
-		return;
-	};
-
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		match node.last_ping_nonce.take() {
-			Some(expected) if expected == nonce => {
-				debug!("Valid pong from {}", address);
-			}
-			Some(expected) => {
-				warn!(
-					"Pong nonce mismatch from {}: expected {}, got {}",
-					address, expected, nonce
-				);
-			}
-			None => {
-				debug!("Received unsolicited pong from {}", address);
-			}
-		}
-	}
-}
-
-/// Strips non-printable and non-ASCII characters from a user agent string
-///
-/// Prevents terminal escape sequence injection via malicious user agents.
-/// Trims leading/trailing whitespace to prevent display confusion
-fn sanitize_user_agent(s: &str) -> String {
-	s.chars()
-		.filter(|c| c.is_ascii_graphic() || *c == ' ')
-		.take(MAX_USER_AGENT_DISPLAY)
-		.collect::<String>()
-		.trim()
-		.to_string()
-}
-
-/// Computes a deterministic score for relay peer selection
-///
-/// Uses `SipHash-1-3` keyed by `relay_key` to produce a stable ranking of peers
-/// for a given address within a 24-hour time bucket. Same inputs always produce same output
-fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
-	use std::hash::{Hash, Hasher};
-	let mut hasher = SipHasher13::new_with_keys(relay_key, 0);
-	addr_hash.hash(&mut hasher);
-	time_bucket.hash(&mut hasher);
-	peer_hash.hash(&mut hasher);
-	hasher.finish()
-}
-
-/// Relays addr entries to the top-scoring outgoing peers
-///
-/// For each recently-active entry, selects the best peers by deterministic
-/// hash score and sends a single-entry addr message to each
-async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, entries: &[&AddrEntry]) {
-	if entries.is_empty() {
-		return;
-	}
-
-	// unix_now() returns seconds; 86400 seconds per day
-	#[allow(clippy::arithmetic_side_effects)]
-	let time_bucket = unix_now() / (24 * 60 * 60);
-
-	// Collect connected outgoing peers (excluding source), releasing DashMap lock
-	let peers: Vec<(IpAddr, SharedTcpWriter)> = node_manager
-		.nodes
-		.iter()
-		.filter_map(|entry| {
-			let node = entry.value();
-			if *entry.key() == *source_address {
-				return None;
-			}
-			if node.connection_type != ConnectionType::Outgoing {
-				return None;
-			}
-			if let NodeState::Connected { ref writer } = node.state {
-				Some((*entry.key(), Arc::clone(writer)))
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	if peers.is_empty() {
-		return;
-	}
-
-	for entry in entries {
-		// Hash the IP for a stable addr identifier
-		let addr_hash = {
-			use std::hash::{Hash, Hasher};
-			let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
-			entry.address.address.hash(&mut hasher);
-			hasher.finish()
-		};
-
-		// Serialize once per entry, reuse for all peers
-		let relay_entry = AddrEntry {
-			timestamp: entry.timestamp,
-			address: NetworkAddress {
-				services: entry.address.services,
-				address: entry.address.address,
-				port: entry.address.port,
-			},
-		};
-		let msg = MessageAddr::from_entries(vec![relay_entry]);
-		let payload = msg.to_bytes();
-
-		// Score each peer and sort descending
-		let mut scored: Vec<(usize, u64)> = peers
-			.iter()
-			.enumerate()
-			.map(|(idx, (ip, _))| {
-				let peer_hash = {
-					use std::hash::{Hash, Hasher};
-					let mut hasher = SipHasher13::new_with_keys(node_manager.relay_key, 0);
-					ip.hash(&mut hasher);
-					hasher.finish()
-				};
-				(
-					idx,
-					compute_relay_score(node_manager.relay_key, addr_hash, time_bucket, peer_hash),
-				)
-			})
-			.collect();
-
-		scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-		// Relay to top ADDR_RELAY_PEER_COUNT peers
-		for &(idx, _) in scored.iter().take(ADDR_RELAY_PEER_COUNT) {
-			// idx is bounded by peers.len() from the enumerate above
-			#[allow(clippy::indexing_slicing)]
-			let (ref peer_ip, ref writer) = peers[idx];
-
-			// Check and update addr_known under DashMap lock
-			// Clear the set when the 24h time bucket rotates to prevent unbounded growth
-			let already_known = if let Some(mut node) = node_manager.nodes.get_mut(peer_ip) {
-				if node.addr_known_bucket != time_bucket {
-					node.addr_known.clear();
-					node.addr_known_bucket = time_bucket;
-				}
-				// Cap addr_known to prevent unbounded growth within a 24h bucket
-				if node.addr_known.len() >= MAX_ADDR_KNOWN {
-					true
-				} else {
-					!node.addr_known.insert(entry.address.address)
-				}
-			} else {
-				continue;
-			};
-
-			if already_known {
-				continue;
-			}
-
-			if let Err(e) = writer.send_message("addr", &payload).await {
-				debug!("Failed to relay addr to {}: {}", peer_ip, e);
-			}
-		}
-	}
-}
-
-/// Refills a peer's addr token bucket based on elapsed time
-///
-/// Returns the updated token count, capped at `ADDR_TOKEN_CAPACITY`
-fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
-	// Both operands are finite and bounded; result is capped by min()
-	#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
-	elapsed
-		.as_secs_f64()
-		.mul_add(ADDR_TOKEN_RATE, tokens)
-		.min(ADDR_TOKEN_CAPACITY)
-}
-
-/// Handles an incoming addr message containing peer addresses
-async fn handle_addr(node_manager: &Arc<NodeManager>, address: &IpAddr, payload: &[u8]) -> Result<()> {
-	let msg = MessageAddr::from_bytes(payload).context("failed to parse addr message")?;
-
-	debug!(
-		"Received addr message with {} addresses from {}",
-		msg.entries().len(),
-		address
-	);
-
-	// Rate limiting: refill tokens, check freshness before deducting
-	let mut recently_active_indices: Vec<usize> = Vec::new();
-	{
-		let Some(mut node) = node_manager.nodes.get_mut(address) else {
-			return Ok(());
-		};
-
-		let now_instant = Instant::now();
-		let elapsed = now_instant.duration_since(node.last_token_refill);
-		node.addr_tokens = refill_addr_tokens(node.addr_tokens, elapsed);
-		node.last_token_refill = now_instant;
-
-		for (i, entry) in msg.entries().iter().enumerate() {
-			// Check freshness before consuming a token so stale entries don't drain budget
-			if !is_recently_active(entry.timestamp) {
-				debug!(
-					"Addr: {} filtered out (timestamp={}, not recently active)",
-					entry.address.address, entry.timestamp
-				);
-				continue;
-			}
-
-			if node.addr_tokens >= 1.0 {
-				// Finite f64 subtraction; both operands are bounded by ADDR_TOKEN_CAPACITY
-				#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
-				{
-					node.addr_tokens -= 1.0;
-				}
-				recently_active_indices.push(i);
-			} else {
-				debug!(
-					"Rate limited addr entry {} from {} (tokens exhausted)",
-					entry.address.address, address
-				);
-			}
-		}
-	}
-
-	if recently_active_indices.is_empty() {
-		return Ok(());
-	}
-
-	for &i in &recently_active_indices {
-		// msg.entries() is bounded by 1000 (validated in from_bytes), i < entries.len()
-		#[allow(clippy::indexing_slicing)]
-		let entry = &msg.entries()[i];
-		let entry_ip = entry.address.address;
-
-		// Reject non-routable IPs to prevent internal network probing
-		if !is_routable(entry_ip) {
-			debug!("Addr: {} filtered out (not routable)", entry_ip);
-			continue;
-		}
-
-		// Reject port 0 which has undefined connect behavior
-		if entry.address.port == 0 {
-			debug!("Addr: {} filtered out (port 0)", entry_ip);
-			continue;
-		}
-
-		// Try to revive Dead nodes with a newer timestamp
-		if node_manager.revive_if_newer(&entry_ip, entry.address.port, entry.timestamp) {
-			info!("Revived dead node {} with newer addr timestamp", entry_ip);
-			continue;
-		}
-
-		// Otherwise try to insert as new outgoing node
-		debug!("Addr: {} is recently active, adding", entry.address.address);
-		node_manager.insert_outgoing(entry.address.address, entry.address.port);
-	}
-
-	// Relay eligible entries to other peers
-	// Only relay small batches from organic gossip (not getaddr responses)
-	let should_relay = node_manager.nodes.get(address).is_some_and(|n| !n.sent_getaddr);
-
-	if should_relay && msg.entries().len() <= ADDR_RELAY_MAX_ENTRIES {
-		// recently_active_indices already filters by is_recently_active, no re-check needed
-		let relay_entries: Vec<&AddrEntry> = recently_active_indices
-			.iter()
-			.map(|&i| {
-				// Indices are bounded by msg.entries().len() from the rate limiting loop
-				#[allow(clippy::indexing_slicing)]
-				&msg.entries()[i]
-			})
-			.collect();
-
-		relay_addr(node_manager, address, &relay_entries).await;
-	}
-
-	Ok(())
-}
-
-/// Handles an incoming getaddr request from a peer
-async fn handle_getaddr(node_manager: &Arc<NodeManager>, address: &IpAddr, tcp_writer: &SharedTcpWriter) -> Result<()> {
-	// Rate limit getaddr responses to 1 per minute
-	{
-		let Some(mut node) = node_manager.nodes.get_mut(address) else {
-			return Ok(());
-		};
-
-		if let Some(last) = node.last_getaddr_response {
-			if last.elapsed() < Duration::from_secs(60) {
-				debug!("Rate limiting getaddr from {}", address);
-				return Ok(());
-			}
-		}
-
-		node.last_getaddr_response = Some(Instant::now());
-	}
-
-	let now = unix_now();
-
-	// Filter the node list so we share only recently active outgoing connections
-	// Incoming connections use ephemeral OS ports -- their stored port is not their real listening port
-	let filtered_nodes: Vec<NetworkAddress> = node_manager
-		.nodes
-		.iter()
-		.filter(|entry| {
-			let node = entry.value();
-			node.state.is_connected()
-				&& node.connection_type == ConnectionType::Outgoing
-				&& (now.saturating_sub(node.last_seen) < GETADDR_RECENT_WINDOW)
-		})
-		.take(1000) // Protocol limits to maximum of 1000 entries per addr message
-		.map(|entry| {
-			let node = entry.value();
-			NetworkAddress {
-				services: node.services,
-				address: *entry.key(),
-				port: node.port,
-			}
-		})
-		.collect();
-
-	if filtered_nodes.is_empty() {
-		debug!(
-			"No recently active outgoing nodes to share for GetAddr from {}",
-			address
-		);
-		return Ok(());
-	}
-
-	debug!("Sending list of {} nodes to {}", filtered_nodes.len(), address);
-
-	let message_addr = MessageAddr::new(filtered_nodes);
-	tcp_writer
-		.send_message("addr", &message_addr.to_bytes())
-		.await
-		.context("failed to send addr")
-}
-
 #[cfg(test)]
 // Tests use unwrap/indexing for brevity since panics are the intended failure mode.
 // DashMap guard drop order doesn't matter in synchronous test functions
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
 mod tests {
+	use super::handler_addr::{compute_relay_score, refill_addr_tokens};
+	use super::handler_version::sanitize_user_agent;
 	use super::*;
+
+	/// Dummy genesis header for tests that don't care about header data
+	const fn test_genesis() -> BlockHeader {
+		BlockHeader {
+			version: 1,
+			prev_hash: Hash256::ZERO,
+			merkle_root: Hash256::ZERO,
+			timestamp: 0,
+			bits: 0,
+			nonce: 0,
+		}
+	}
 
 	#[test]
 	fn connectable_when_retry_time_passed() {
@@ -1947,7 +1638,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_counts() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -1957,7 +1648,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_requires_three_votes() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "8.8.8.8".parse().unwrap();
 		nm.record_external_ip_vote(ip);
 		nm.record_external_ip_vote(ip);
@@ -1966,7 +1657,7 @@ mod tests {
 
 	#[test]
 	fn get_external_ip_returns_majority() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip_a: IpAddr = "8.8.8.8".parse().unwrap();
 		let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
 		nm.record_external_ip_vote(ip_a);
@@ -1981,7 +1672,7 @@ mod tests {
 
 	#[test]
 	fn record_external_ip_vote_rejects_private() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let private_ip: IpAddr = "192.168.1.1".parse().unwrap();
 		nm.record_external_ip_vote(private_ip);
 		nm.record_external_ip_vote(private_ip);
@@ -2012,7 +1703,7 @@ mod tests {
 
 	#[test]
 	fn has_incoming_connected_detects_incoming() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 12345, ConnectionType::Incoming);
 
@@ -2022,7 +1713,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_dedup_prevents_duplicate_insert() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2037,7 +1728,7 @@ mod tests {
 
 	#[test]
 	fn addr_known_clears_on_bucket_rotation() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2062,7 +1753,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_defaults_to_false() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2072,7 +1763,7 @@ mod tests {
 
 	#[test]
 	fn sent_getaddr_can_be_set() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2086,7 +1777,7 @@ mod tests {
 
 	#[test]
 	fn new_node_starts_with_initial_token_bucket() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2106,7 +1797,7 @@ mod tests {
 
 	#[test]
 	fn same_ip_different_port_deduplicates() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		assert!(nm.insert(ip, 9933, ConnectionType::Outgoing));
@@ -2116,7 +1807,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_disconnected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2136,7 +1827,7 @@ mod tests {
 
 	#[test]
 	fn insert_updates_port_when_dead() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2153,7 +1844,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_connecting() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2167,7 +1858,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_new_node() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let result = nm.insert_incoming(ip, 54321);
@@ -2181,7 +1872,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_disconnected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2203,7 +1894,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_replaces_dead() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2222,7 +1913,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_connecting() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2236,7 +1927,7 @@ mod tests {
 
 	#[test]
 	fn insert_ignores_when_banned() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2257,7 +1948,7 @@ mod tests {
 
 	#[test]
 	fn insert_incoming_rejects_when_banned() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2275,7 +1966,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_ignores_when_connected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2299,7 +1990,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_incoming_rejects_when_connected() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2322,7 +2013,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_connected_peer() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2343,7 +2034,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_unconnected_loaded_peer() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2358,7 +2049,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_excludes_incoming() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Incoming);
 
@@ -2373,7 +2064,7 @@ mod tests {
 
 	#[test]
 	fn collect_peers_includes_disconnected_peer_with_version() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2395,7 +2086,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn reaper_clears_expired_bans() {
-		let nm = Arc::new(NodeManager::new());
+		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2431,7 +2122,7 @@ mod tests {
 
 	#[test]
 	fn collect_bans_excludes_expired() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "1.2.3.4".parse().unwrap();
 		nm.insert(ip, 9933, ConnectionType::Outgoing);
 
@@ -2476,7 +2167,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_peers_skips_unknown_version() {
-		let nm = Arc::new(NodeManager::new());
+		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
 		let db = crate::storage::peers::PeerDb {
 			version: 999,
 			peers: vec![crate::storage::peers::SavedPeer {
@@ -2494,7 +2185,7 @@ mod tests {
 
 	#[test]
 	fn load_saved_bans_skips_unknown_version() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let db = crate::storage::bans::BanDb {
 			version: 999,
 			bans: vec![crate::storage::bans::SavedBan {
@@ -2510,7 +2201,7 @@ mod tests {
 
 	#[test]
 	fn incoming_cooldown_rejects_rapid_reconnect() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		// First connection should succeed
@@ -2530,7 +2221,7 @@ mod tests {
 
 	#[test]
 	fn incoming_guard_decrements_on_drop() {
-		let nm = NodeManager::new();
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
 		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
 		let guard = nm.insert_incoming(ip, 54321);

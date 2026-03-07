@@ -4,17 +4,37 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ironcat::{
 	cli::Args,
+	difficulty::ConsensusParams,
 	dns,
 	network::listening_start,
-	nodes::NodeManager,
-	storage,
+	nodes::{block_download::BlockDownloadManager, NodeManager},
+	storage::{
+		self, block_store::BlockStore, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore,
+	},
 	tui_layer::{TuiLayer, TuiLogEntry},
+	types::{block::BlockHeader, hash::Hash256},
 	ui::tui::tui_start,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Catcoin mainnet genesis block header
+///
+/// From chainparams.cpp: CreateGenesisBlock(1387838302, 588050, 0x1e0ffff0, 1, 50 * COIN)
+/// Hash: bc3b4ec43c4ebb2fef49e6240812549e61ffa623d9418608aa90eaad26c96296
+const GENESIS_HEADER: BlockHeader = BlockHeader {
+	version: 1,
+	prev_hash: Hash256::ZERO,
+	merkle_root: Hash256::from_bytes([
+		0xf7, 0x9c, 0xf2, 0xa0, 0x69, 0xbe, 0xae, 0xfd, 0x31, 0x40, 0x21, 0xe0, 0x86, 0xfb, 0x13, 0x8d, 0x1c, 0x43,
+		0xb8, 0x5e, 0x33, 0x17, 0xb1, 0xaa, 0xf2, 0xcd, 0xd9, 0xb5, 0x3d, 0xa3, 0x07, 0x40,
+	]),
+	timestamp: 1_387_838_302,
+	bits: 0x1e0f_fff0,
+	nonce: 588_050,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,7 +45,11 @@ async fn main() -> Result<()> {
 	if args.daemon {
 		tracing_subscriber::registry()
 			.with(env_filter)
-			.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+			.with(
+				tracing_subscriber::fmt::layer()
+					.with_writer(std::io::stderr)
+					.with_timer(tracing_subscriber::fmt::time::uptime()),
+			)
 			.init();
 
 		info!("ironcat v{} - Starting in daemon mode", env!("CARGO_PKG_VERSION"));
@@ -41,13 +65,53 @@ async fn main() -> Result<()> {
 	}
 }
 
-/// Core application loop shared between TUI and daemon modes
-async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
-	let node_manager = Arc::new(NodeManager::new());
+/// Opens the header persistence backend, returning None on failure
+fn open_header_backend(datadir: &std::path::Path) -> Option<Arc<dyn HeaderStoreBackend>> {
+	let db_path = datadir.join("headers.redb");
+	match RedbHeaderStore::open(&db_path) {
+		Ok(store) => Some(Arc::new(store)),
+		Err(e) => {
+			error!(error = %e, "failed to open header database, headers will not persist");
+			None
+		}
+	}
+}
 
-	// Ensure data directory exists
+/// Core application loop shared between TUI and daemon modes
+#[allow(clippy::too_many_lines)] // sequential startup steps, splitting would obscure flow
+async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> Result<()> {
+	// Ensure data directory exists before opening any databases
 	std::fs::create_dir_all(&args.datadir)
 		.with_context(|| format!("failed to create data directory {}", args.datadir.display()))?;
+
+	// Create NodeManager without backend first so the TUI can start immediately
+	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER, ConsensusParams::mainnet()));
+
+	// Spawn TUI before any heavy I/O so loading progress is visible
+	let ui_handle = tui_rx.map(|log_rx| {
+		let nm = Arc::clone(&node_manager);
+		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
+	});
+
+	// Load headers from backend (slow: reads + hashes all stored headers)
+	// Runs on the blocking pool so the TUI can redraw concurrently.
+	// Only the final HashMap swap briefly acquires the write lock
+	let header_backend = open_header_backend(&args.datadir);
+	if let Some(backend) = header_backend {
+		let nm = Arc::clone(&node_manager);
+		tokio::task::spawn_blocking(move || {
+			nm.attach_header_backend(backend);
+		})
+		.await
+		.context("header loading task panicked")?;
+	}
+
+	// Open block store for raw block data
+	let block_store = Arc::new(BlockStore::open(&args.datadir).context("failed to open block store")?);
+
+	// Create channel for forwarding received blocks to the download manager
+	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
+	node_manager.set_block_sender(block_tx);
 
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
@@ -67,12 +131,6 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		} else {
 			0
 		};
-
-	// Spawn TUI if in TUI mode
-	let ui_handle = tui_rx.map(|log_rx| {
-		let nm = Arc::clone(&node_manager);
-		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
-	});
 
 	// Spawn listener
 	let nm = Arc::clone(&node_manager);
@@ -126,6 +184,27 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
 	}
 
+	// Spawn block download manager on blocking pool because the constructor
+	// loads all indexed hashes from redb (can take several seconds depending on block count)
+	let nm = Arc::clone(&node_manager);
+	let bs = Arc::clone(&block_store);
+	let download_handle = tokio::spawn(async move {
+		let mut manager = match tokio::task::spawn_blocking({
+			let nm = Arc::clone(&nm);
+			let bs = Arc::clone(&bs);
+			move || BlockDownloadManager::new(nm, bs, block_rx)
+		})
+		.await
+		{
+			Ok(m) => m,
+			Err(e) => {
+				error!("block download manager init panicked: {e}");
+				return;
+			}
+		};
+		manager.run().await;
+	});
+
 	tokio::select! {
 		_ = tokio::signal::ctrl_c() => {
 			info!("Received Ctrl+C, shutting down");
@@ -141,6 +220,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = persistence_handle => {
 			info!("Persistence task ended, shutting down");
+		}
+		_ = download_handle => {
+			info!("Download manager ended, shutting down");
 		}
 		() = async {
 			match ui_handle {

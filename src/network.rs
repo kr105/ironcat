@@ -24,10 +24,13 @@ use crate::{
 };
 
 pub mod message_addr;
+pub mod message_getheaders;
+pub mod message_headers;
+pub mod message_inv;
 pub mod message_version;
 
-/// Maximum allowed size for a network message (500KB -- largest implemented message is addr at ~30KB)
-pub const MAX_MESSAGE_SIZE: usize = 500_000;
+/// Maximum allowed size for a network message (2MB -- inv with 50K items is ~1.8MB, blocks up to 1MB)
+pub const MAX_MESSAGE_SIZE: usize = 2_000_000;
 
 /// Length of the command field in the network message
 const COMMAND_LENGTH: usize = 12;
@@ -205,7 +208,7 @@ impl Message {
 			));
 		}
 
-		// Payload is validated <= MAX_MESSAGE_SIZE (500KB), fits in u32
+		// Payload is validated <= MAX_MESSAGE_SIZE (2MB), fits in u32
 		#[allow(clippy::cast_possible_truncation)]
 		let mut msg = Self {
 			magic: NET_MAGIC,
@@ -365,6 +368,13 @@ pub enum NetworkCommand {
 	Alert,
 	GetAddr,
 	Addr,
+	Inv,
+	GetData,
+	NotFound,
+	GetHeaders,
+	Headers,
+	SendHeaders,
+	Block,
 	Unknown(String),
 }
 
@@ -380,6 +390,13 @@ impl NetworkCommand {
 			"alert" => Self::Alert,
 			"getaddr" => Self::GetAddr,
 			"addr" => Self::Addr,
+			"inv" => Self::Inv,
+			"getdata" => Self::GetData,
+			"notfound" => Self::NotFound,
+			"getheaders" => Self::GetHeaders,
+			"headers" => Self::Headers,
+			"sendheaders" => Self::SendHeaders,
+			"block" => Self::Block,
 			_ => Self::Unknown(s.to_string()),
 		}
 	}

@@ -1,6 +1,6 @@
 # Catcoin Network Protocol
 
-Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, with different magic bytes and default port.
+Catcoin is a Litecoin fork. The wire protocol is nearly identical, with different magic bytes and default port.
 
 ## Constants
 
@@ -8,11 +8,11 @@ Catcoin is a Bitcoin fork. The wire protocol is nearly identical to Bitcoin's, w
 |------|-------|
 | Network magic | `0xFC 0xC1 0xB7 0xDC` |
 | Default port | 9933 |
-| Protocol version | 70003 |
-| Max message size | 500,000 bytes |
+| Protocol version | 70012 |
+| Max message size | 2,000,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.6/` |
+| User agent | `/Ironcat:0.0.7/` |
 
 ## Message Framing
 
@@ -44,6 +44,34 @@ Variable-length integer encoding:
 ### VarStr
 
 Variable-length string: VarInt(length) followed by `length` bytes of UTF-8 data.
+
+### Hash256 (32 bytes)
+
+A 256-bit hash stored in wire order (the raw byte output of SHA-256). All block hashes, transaction IDs, and merkle roots use this type.
+
+Display convention: bytes are reversed from wire order for human-readable output (block explorer format). For example, the Catcoin genesis block hash displays as `bc3b4ec4...9296` but the first wire byte is `0x96`.
+
+`double_sha256(data)` computes `SHA256(SHA256(data))`, used for message checksums, block identity hashes, and transaction IDs.
+
+### InvItem (36 bytes)
+
+Used in inv, getdata, and notfound messages to identify a piece of data.
+
+```
+[4] type            - Inventory type (u32 LE)
+[32] hash           - Hash256 identifying the data
+```
+
+Inventory types:
+
+| Value | Name | Description |
+|-------|------|-------------|
+| 1 | MSG_TX | Transaction |
+| 2 | MSG_BLOCK | Block |
+| 3 | MSG_FILTERED_BLOCK | Filtered block (BIP37) |
+| 4 | MSG_CMPCT_BLOCK | Compact block (BIP152) |
+
+The witness flag (bit 30) and MWEB flag (bit 29) are stripped before matching. Unknown types are silently skipped.
 
 ### NetworkAddress (26 bytes)
 
@@ -80,13 +108,13 @@ Ironcat advertises `NODE_NETWORK_LIMITED` (1024). Unknown bits from remote peers
 Sent as the first message after TCP connect. Both sides must exchange version messages before the handshake completes.
 
 ```
-[4] version         - Protocol version (u32 LE), we send 70003
+[4] version         - Protocol version (u32 LE), we send 70012
 [8] services        - Our service flags (u64 LE)
 [8] timestamp       - Unix timestamp (i64 LE)
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.6/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.7/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -164,9 +192,120 @@ Every 6 hours, Ironcat announces its own address to all connected peers, but onl
 - At least 1 incoming peer is connected (proves our port is publicly reachable)
 - At least 3 peers agree on our external IP with > 50% of total votes (consensus from `addr_recv` in version messages, applied only after verack; non-routable IPs are rejected)
 
+### inv
+
+Announces available data (transactions, blocks) to a peer.
+
+```
+[var] count         - VarInt, number of InvItems (max 50,000)
+```
+
+Repeated `count` times:
+
+```
+[36] item           - InvItem (4 bytes type + 32 bytes hash)
+```
+
+On receipt, Ironcat records the hashes in the peer's `inv_known` set (cleared when it reaches 50,000 entries). If any announced blocks are not in the header store, a getheaders request is sent to sync headers.
+
+### getdata
+
+Requests specific data from a peer. Same wire format as inv.
+
+On receipt, Ironcat responds with notfound for all requested items (block serving is not yet implemented). Ironcat sends getdata with `MSG_BLOCK` items to request blocks during block download.
+
+### notfound
+
+Indicates that requested data is not available. Same wire format as inv. Sent in response to getdata when the peer does not have the requested items.
+
+On receipt, Ironcat logs the message at debug level. No further action is taken.
+
+### getheaders
+
+Requests block headers starting from a block locator.
+
+```
+[4] version         - Protocol version (u32 LE), currently 70012
+[var] hash_count    - VarInt, number of locator hashes (max 101)
+```
+
+Repeated `hash_count` times:
+
+```
+[32] hash           - Block hash (Hash256)
+```
+
+Followed by:
+
+```
+[32] hash_stop      - Hash of the last desired header, or all zeros for "send to tip"
+```
+
+The block locator is an exponentially-spaced list of block hashes from the sender's tip back to genesis: 10 consecutive hashes from the tip, then step sizes doubling (2, 4, 8, ...), always ending with genesis. Maximum 101 hashes.
+
+On receipt, Ironcat finds the first locator hash that exists in its chain, then responds with a headers message containing up to 2000 headers starting after that point. Uses the height index for O(k) response construction.
+
+### headers
+
+Response to getheaders, or unsolicited if peer sent sendheaders.
+
+```
+[var] count         - VarInt, number of headers (max 2000)
+```
+
+Repeated `count` times:
+
+```
+[80] header         - Block header (version + prev_hash + merkle_root + timestamp + bits + nonce)
+[var] tx_count      - VarInt, always 0 for headers messages
+```
+
+On receipt, Ironcat validates chain continuity (each header's prev_hash must connect to a known header) and difficulty targets (nBits must match the expected value from the active CIP algorithm). Valid headers are stored via batch insertion. If any header in the batch fails validation, the entire batch is rejected. If exactly 2000 headers were received, a follow-up getheaders is sent to continue syncing.
+
+#### Difficulty algorithms
+
+Headers are validated against the correct difficulty adjustment algorithm based on block height:
+
+| Height range | Algorithm | Description |
+|--------------|-----------|-------------|
+| 0 - 20288 | CIP01 | Original 2016-block retarget with 0.25x-4x clamping |
+| 20289 | -- | Hardcoded difficulty 16 reset (0x1c0ffff0) |
+| 20289 - 21345 | CIP02 | 36-block retarget with 0.25x-4x clamping |
+| 21346 - 27259 | CIP03 | Every-block retarget with tight +/-12% bounds |
+| 27260 - 46330 | CIP04 | PID controller with 8-block lookback and dead zone |
+| 46331 - 396999 | CIP05 | Time-gated DigiShield with CIP04 fallback |
+| 397000+ | CIP06 | LWMA-1 with 45-block weighted moving average |
+
+During batch validation, a `BatchLookup` overlay makes already-validated headers from the current batch visible to the difficulty calculation, even before they are committed to storage.
+
+### sendheaders
+
+Empty payload. Sent after handshake to signal that the sender prefers to receive new block announcements as headers messages instead of inv messages (BIP 130, protocol version >= 70012).
+
+On receipt, Ironcat sets the peer's `prefer_headers` flag.
+
+### block
+
+A full block: header followed by all transactions.
+
+```
+[80] header         - Block header
+[var] tx_count      - VarInt, number of transactions
+```
+
+Repeated `tx_count` times:
+
+```
+[...] transaction   - Serialized transaction (version + vin[] + vout[] + locktime)
+```
+
+On receipt, Ironcat extracts the block hash from the header and forwards the raw payload to the download manager via an internal channel. The download manager validates the merkle root (computed from transaction IDs must match `header.merkle_root`) and writes the raw block to flat file storage. No script execution or UTXO validation is performed.
+
+Blocks with duplicate trailing transactions are rejected (CVE-2012-2459 merkle tree malleability protection).
+
 ### alert
 
-Ignored. Legacy Bitcoin alert system, deprecated.
+Ignored. Legacy alert system, deprecated.
 
 ## Handshake Sequence
 
@@ -174,11 +313,13 @@ Ignored. Legacy Bitcoin alert system, deprecated.
 
 ```
 Us              Peer
-|-- version  -->  |
-|<-- version  --|
-|-- verack   -->  |
-|<-- verack   --|
-|-- getaddr  --> |
+|-- version      -->  |
+|<-- version      --|
+|-- verack       -->  |
+|<-- verack       --|
+|-- getaddr      -->  |
+|-- sendheaders  -->  |  (if peer version >= 70012)
+|-- getheaders   -->  |
 ```
 
 1. We connect and immediately send our version
@@ -187,22 +328,28 @@ Us              Peer
 4. Peer sends verack (acknowledging our version)
 5. On verack receipt (with version already received), state transitions to Connected
 6. We send getaddr to discover more peers
+7. If peer version >= 70012, we send sendheaders (BIP 130)
+8. We send getheaders with our block locator to begin header sync
 
 ### Incoming connection (peer initiates)
 
 ```
 Peer            Us
-|-- version  -->  |
-|<-- version  --|
-|<-- verack   --|
-|-- verack   -->  |
-|<-- getaddr  --|
+|-- version      -->  |
+|<-- version      --|
+|<-- verack       --|
+|-- verack       -->  |
+|<-- getaddr      --|
+|<-- sendheaders  --|  (if peer version >= 70012)
+|<-- getheaders   --|
 ```
 
 1. Peer connects and sends their version
 2. We respond with our version + verack
 3. Peer sends verack
 4. State transitions to Connected, we send getaddr
+5. If peer version >= 70012, we send sendheaders (BIP 130)
+6. We send getheaders with our block locator to begin header sync
 
 ### Handshake rules
 

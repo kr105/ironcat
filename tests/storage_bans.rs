@@ -3,6 +3,7 @@
 // Tests use unwrap for brevity since panics are the intended failure mode
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use ironcat::difficulty::ConsensusParams;
 use ironcat::storage::bans::{BanDb, SavedBan};
 use ironcat::storage::{checksummed_decode, checksummed_encode};
 use std::net::{IpAddr, Ipv4Addr};
@@ -97,11 +98,20 @@ fn filter_expired_bans() {
 }
 
 use ironcat::nodes::NodeManager;
+use ironcat::types::{block::BlockHeader, hash::Hash256};
 use ironcat::utils::unix_now;
 
 #[test]
 fn collect_bans_from_node_manager() {
-	let nm = NodeManager::new();
+	let genesis = BlockHeader {
+		version: 1,
+		prev_hash: Hash256::ZERO,
+		merkle_root: Hash256::ZERO,
+		timestamp: 0,
+		bits: 0,
+		nonce: 0,
+	};
+	let nm = NodeManager::new(genesis, ConsensusParams::mainnet());
 	// Load a ban via the persistence API
 	let now = unix_now();
 	nm.load_saved_bans(&BanDb {

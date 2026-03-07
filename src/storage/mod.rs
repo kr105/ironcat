@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod bans;
+pub mod block_store;
+pub mod header_store_backend;
+pub mod header_store_redb;
 pub mod peers;
 
 use anyhow::{bail, Context, Result};
