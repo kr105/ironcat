@@ -4,6 +4,7 @@
 
 #![allow(
 	clippy::print_stdout,
+	clippy::expect_used,
 	clippy::float_arithmetic,
 	clippy::cast_precision_loss,
 	clippy::similar_names,
@@ -57,7 +58,9 @@ fn main() {
 
 	println!("=== scrypt(1024,1,1) PoW hash benchmark ===\n");
 
-	bench_impl("scrypt crate (reference)", iterations, pow_hash_crate);
+	bench_impl("scrypt crate (reference)", iterations, |h| {
+		pow_hash_crate(h).expect("scrypt params are compile-time constants")
+	});
 	println!();
 	bench_impl("native (thread-local scratchpad)", iterations, pow_hash);
 

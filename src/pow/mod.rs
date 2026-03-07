@@ -41,16 +41,16 @@ pub fn pow_hash(header: &BlockHeader) -> [u8; 32] {
 /// Computes the scrypt `PoW` hash using the `scrypt` crate (reference implementation)
 ///
 /// Used for verification and benchmarking against the native implementation
-#[allow(clippy::expect_used, clippy::missing_panics_doc)] // scrypt params and output length are compile-time constants
-pub fn pow_hash_crate(header: &BlockHeader) -> [u8; 32] {
+pub fn pow_hash_crate(header: &BlockHeader) -> anyhow::Result<[u8; 32]> {
 	let serialized = header.to_bytes();
 	let params = scrypt::Params::new(10, 1, 1, 32) // N=1024, r=1, p=1
-		.expect("scrypt params are compile-time constants");
+		.map_err(|e| anyhow::anyhow!("invalid scrypt params: {e}"))?;
 
 	let mut output = [0u8; 32];
-	scrypt::scrypt(&serialized, &serialized, &params, &mut output).expect("output length matches params");
+	scrypt::scrypt(&serialized, &serialized, &params, &mut output)
+		.map_err(|e| anyhow::anyhow!("scrypt output failed: {e}"))?;
 
-	output
+	Ok(output)
 }
 
 /// Checks whether a block header satisfies its claimed proof-of-work target
@@ -125,7 +125,7 @@ mod tests {
 	#[test]
 	fn native_matches_crate_implementation() {
 		let native = pow_hash(&GENESIS_HEADER);
-		let crate_impl = pow_hash_crate(&GENESIS_HEADER);
+		let crate_impl = pow_hash_crate(&GENESIS_HEADER).unwrap();
 		assert_eq!(native, crate_impl, "native scrypt must match crate output");
 	}
 }

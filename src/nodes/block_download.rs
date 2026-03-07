@@ -245,7 +245,10 @@ impl BlockDownloadManager {
 				};
 
 				// Find the writer index for batching
-				let widx = writers.iter().position(|(ip, _)| *ip == peer_ip).unwrap_or(0);
+				let Some(widx) = writers.iter().position(|(ip, _)| *ip == peer_ip) else {
+					warn!(peer = %peer_ip, "pick_peer returned IP not in writers list");
+					continue;
+				};
 
 				peer_requests.entry(widx).or_default().push(InvItem {
 					inv_type: InvType::Block,
@@ -291,7 +294,17 @@ impl BlockDownloadManager {
 				.context("failed to send batched getdata")
 			{
 				warn!(peer = %peer_ip, count, error = %e, "failed to send batched getdata");
-				// Remove entries for this failed peer
+				// Roll back peer_counts for entries we won't commit
+				let removed = new_entries.iter().filter(|(_h, _e, w)| *w == *widx).count();
+				if let Some(pc) = self.peer_counts.get_mut(&peer_ip) {
+					#[allow(clippy::cast_possible_truncation)] // removed count bounded by WINDOW_SIZE
+					{
+						*pc = pc.saturating_sub(removed as u32);
+					}
+					if *pc == 0 {
+						self.peer_counts.remove(&peer_ip);
+					}
+				}
 				new_entries.retain(|(_h, _e, w)| *w != *widx);
 				continue;
 			}
