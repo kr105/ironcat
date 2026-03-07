@@ -102,6 +102,10 @@ impl BlockDownloadManager {
 			}
 		};
 
+		// Initialize cached block height so the TUI shows progress immediately
+		#[allow(clippy::cast_possible_truncation)] // stored blocks won't exceed u32
+		node_manager.set_block_height(stored_hashes.len() as u32);
+
 		Self {
 			node_manager,
 			block_store,

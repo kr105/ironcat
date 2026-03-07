@@ -184,11 +184,24 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		node_manager.insert_outgoing(args.seed.ip(), args.seed.port());
 	}
 
-	// Spawn block download manager
+	// Spawn block download manager on blocking pool because the constructor
+	// loads all indexed hashes from redb (can take several seconds depending on block count)
 	let nm = Arc::clone(&node_manager);
 	let bs = Arc::clone(&block_store);
 	let download_handle = tokio::spawn(async move {
-		let mut manager = BlockDownloadManager::new(nm, bs, block_rx);
+		let mut manager = match tokio::task::spawn_blocking({
+			let nm = Arc::clone(&nm);
+			let bs = Arc::clone(&bs);
+			move || BlockDownloadManager::new(nm, bs, block_rx)
+		})
+		.await
+		{
+			Ok(m) => m,
+			Err(e) => {
+				error!("block download manager init panicked: {e}");
+				return;
+			}
+		};
 		manager.run().await;
 	});
 
