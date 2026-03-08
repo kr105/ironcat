@@ -12,3 +12,4 @@ pub mod tui_layer;
 pub mod types;
 pub mod ui;
 pub mod utils;
+pub mod validation;

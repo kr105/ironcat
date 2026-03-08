@@ -270,4 +270,16 @@ impl Transaction {
 	pub fn txid(&self) -> Hash256 {
 		double_sha256(&self.to_bytes())
 	}
+
+	/// Returns true if this is a coinbase transaction
+	///
+	/// A coinbase has exactly one input whose `prev_output` is the null
+	/// outpoint (zero hash, index 0xFFFFFFFF)
+	pub fn is_coinbase(&self) -> bool {
+		self.vin.len() == 1
+			&& self
+				.vin
+				.first()
+				.is_some_and(|input| input.prev_output == OutPoint::COINBASE)
+	}
 }

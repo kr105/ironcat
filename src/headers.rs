@@ -437,7 +437,10 @@ impl HeaderStore {
 
 	/// Validates a batch of headers without modifying state
 	///
-	/// Returns the validated (hash, header, height) tuples ready for commit
+	/// Two-phase validation: phase 1 checks chain continuity, difficulty, and
+	/// checkpoint hashes sequentially. Phase 2 validates scrypt proof-of-work
+	/// in parallel using rayon, since each scrypt call is independent and
+	/// CPU-expensive (~2ms per header)
 	fn validate_batch<'a>(&self, headers: &'a [BlockHeader]) -> Result<Vec<(Hash256, &'a BlockHeader, u32)>> {
 		if headers.is_empty() {
 			return Ok(Vec::new());
@@ -462,8 +465,9 @@ impl HeaderStore {
 			}
 		}
 
+		// Phase 1: Sequential validation (chain linkage, difficulty, checkpoints)
+		let last_cp = self.params.last_checkpoint_height();
 		let mut validated = Vec::new();
-		// Temporarily track tip for multi-header validation without mutating state
 		let mut shadow_tip = self.tip();
 		for header in headers {
 			let hash = header.block_hash();
@@ -494,10 +498,39 @@ impl HeaderStore {
 				);
 			}
 
-			self.validate_pow_and_checkpoint(hash, header, height)?;
+			// Checkpoint hash verification (fast, stays in sequential phase)
+			if let Some(expected) = self.params.checkpoint_hash_at(height) {
+				let expected_hash = Hash256::from_bytes(expected);
+				if hash != expected_hash {
+					warn!(
+						height,
+						expected = %expected_hash,
+						got = %hash,
+						"block hash does not match checkpoint"
+					);
+					bail!("checkpoint mismatch at height {height}: expected {expected_hash}, got {hash}");
+				}
+			}
 
 			validated.push((hash, header, height));
 			shadow_tip = (hash, height);
+		}
+
+		// Phase 2: Parallel PoW validation (scrypt, expensive)
+		// Only run for headers above the last checkpoint height
+		let needs_pow = validated.iter().any(|&(_, _, h)| h > last_cp);
+		if needs_pow {
+			use rayon::prelude::*;
+
+			let pow_failure = validated
+				.par_iter()
+				.filter(|(_, _, height)| *height > last_cp)
+				.find_any(|(_, header, _)| !pow::check_proof_of_work(header));
+
+			if let Some(&(hash, _, height)) = pow_failure {
+				warn!(height, block_hash = %hash, "header fails proof-of-work validation");
+				bail!("header at height {height} fails proof-of-work check");
+			}
 		}
 
 		Ok(validated)

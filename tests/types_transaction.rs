@@ -155,3 +155,70 @@ fn transaction_empty_inputs() {
 	assert!(decoded.vin.is_empty());
 	assert_eq!(decoded.vout.len(), 1);
 }
+
+#[test]
+fn is_coinbase_true_for_coinbase_tx() {
+	let tx = Transaction {
+		version: 1,
+		vin: vec![TxIn {
+			prev_output: OutPoint::COINBASE,
+			script_sig: vec![0x04, 0xff, 0xff, 0x00, 0x1d],
+			sequence: 0xFFFF_FFFF,
+		}],
+		vout: vec![TxOut {
+			value: 50_0000_0000,
+			script_pubkey: vec![0x76, 0xa9],
+		}],
+		locktime: 0,
+	};
+	assert!(tx.is_coinbase());
+}
+
+#[test]
+fn is_coinbase_false_for_regular_tx() {
+	let tx = Transaction {
+		version: 1,
+		vin: vec![TxIn {
+			prev_output: OutPoint {
+				txid: Hash256::from_bytes([0xAA; 32]),
+				index: 0,
+			},
+			script_sig: vec![0x48],
+			sequence: 0xFFFF_FFFF,
+		}],
+		vout: vec![TxOut {
+			value: 1_0000_0000,
+			script_pubkey: vec![0x76],
+		}],
+		locktime: 0,
+	};
+	assert!(!tx.is_coinbase());
+}
+
+#[test]
+fn is_coinbase_false_for_multiple_inputs() {
+	let tx = Transaction {
+		version: 1,
+		vin: vec![
+			TxIn {
+				prev_output: OutPoint::COINBASE,
+				script_sig: vec![0x04],
+				sequence: 0xFFFF_FFFF,
+			},
+			TxIn {
+				prev_output: OutPoint {
+					txid: Hash256::from_bytes([0xBB; 32]),
+					index: 0,
+				},
+				script_sig: vec![0x48],
+				sequence: 0xFFFF_FFFF,
+			},
+		],
+		vout: vec![TxOut {
+			value: 1_0000_0000,
+			script_pubkey: vec![0x76],
+		}],
+		locktime: 0,
+	};
+	assert!(!tx.is_coinbase());
+}

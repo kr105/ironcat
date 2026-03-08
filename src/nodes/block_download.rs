@@ -34,6 +34,9 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 /// Flush block store to disk every N stored blocks
 const FLUSH_INTERVAL: usize = 500;
 
+/// Log block download progress every N stored blocks
+const PROGRESS_LOG_INTERVAL: usize = 500;
+
 /// How many heights to fetch from the header store per batch during
 /// `fill_window` scanning. Larger means fewer `RwLock` acquires when
 /// skipping past already-stored blocks
@@ -69,6 +72,8 @@ pub struct BlockDownloadManager {
 	was_caught_up: bool,
 	/// Blocks stored since last flush
 	blocks_since_flush: usize,
+	/// Blocks stored since last progress log
+	blocks_since_progress_log: usize,
 }
 
 /// Tracks a single in-flight block request
@@ -116,6 +121,7 @@ impl BlockDownloadManager {
 			stored_hashes,
 			was_caught_up: false,
 			blocks_since_flush: 0,
+			blocks_since_progress_log: 0,
 		}
 	}
 
@@ -343,7 +349,7 @@ impl BlockDownloadManager {
 		None
 	}
 
-	/// Processes a received block: validates merkle root and stores to disk
+	/// Processes a received block: validates structure, context, and stores to disk
 	fn handle_received_block(&mut self, hash: Hash256, raw_bytes: &[u8]) {
 		let Some(entry) = self.in_flight.remove(&hash) else {
 			debug!(block = %hash, "received block not in flight, ignoring");
@@ -358,16 +364,67 @@ impl BlockDownloadManager {
 			}
 		}
 
-		// Validate merkle root
-		if let Err(e) = Block::from_bytes_and_validate(raw_bytes) {
+		// Parse and validate merkle root
+		let block = match Block::from_bytes_and_validate(raw_bytes) {
+			Ok(block) => block,
+			Err(e) => {
+				warn!(
+					block = %hash,
+					height = entry.height,
+					peer = %entry.peer,
+					error = %e,
+					"block parsing/merkle validation failed"
+				);
+				return;
+			}
+		};
+
+		// Structural validation (coinbase, weight, tx checks)
+		if let Err(e) = crate::validation::block::check_block(&block) {
 			warn!(
 				block = %hash,
 				height = entry.height,
 				peer = %entry.peer,
 				error = %e,
-				"block validation failed"
+				"block structural validation failed"
 			);
 			return;
+		}
+
+		// Contextual validation (timestamp, BIP34, subsidy)
+		if entry.height > 0 {
+			let mtp = {
+				let headers = self.node_manager.header_store.read();
+				#[allow(clippy::arithmetic_side_effects)] // entry.height > 0 checked above
+				crate::validation::compute_median_time_past(&*headers, entry.height - 1)
+			};
+
+			let Some(mtp) = mtp else {
+				warn!(
+					block = %hash,
+					height = entry.height,
+					"could not compute MTP for contextual validation, skipping block"
+				);
+				return;
+			};
+
+			// Use system time as adjusted time (peer-based offset is a future refinement)
+			#[allow(clippy::cast_possible_truncation)] // Unix timestamp fits u32 until 2106
+			let adjusted_time = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_secs() as u32;
+
+			if let Err(e) = crate::validation::check_block_context(&block, entry.height, mtp, adjusted_time) {
+				warn!(
+					block = %hash,
+					height = entry.height,
+					peer = %entry.peer,
+					error = %e,
+					"block contextual validation failed"
+				);
+				return;
+			}
 		}
 
 		if let Err(e) = self.block_store.store_block_unchecked(&hash, raw_bytes) {
@@ -392,7 +449,21 @@ impl BlockDownloadManager {
 
 		// Report actual stored count (not next_height which is the next height to request)
 		#[allow(clippy::cast_possible_truncation)] // stored blocks won't exceed u32
-		self.node_manager.set_block_height(self.stored_hashes.len() as u32);
+		let stored_count = self.stored_hashes.len() as u32;
+		self.node_manager.set_block_height(stored_count);
+
+		self.blocks_since_progress_log = self.blocks_since_progress_log.saturating_add(1);
+		if self.blocks_since_progress_log >= PROGRESS_LOG_INTERVAL {
+			let chain_height = self.node_manager.chain_height();
+			info!(
+				stored = stored_count,
+				chain_height,
+				in_flight = self.in_flight.len(),
+				"block download progress"
+			);
+			self.blocks_since_progress_log = 0;
+		}
+
 		debug!(block = %hash, height = entry.height, "block stored");
 	}
 
