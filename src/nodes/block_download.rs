@@ -368,7 +368,7 @@ impl BlockDownloadManager {
 			.enumerate()
 			.map(|(i, (ip, _))| {
 				let used = peer_used.get(ip).copied().unwrap_or(0);
-			let free = PER_PEER_LIMIT.saturating_sub(used);
+				let free = PER_PEER_LIMIT.saturating_sub(used);
 				(i, *ip, free)
 			})
 			.filter(|(_, _, free)| *free > 0)
@@ -426,6 +426,8 @@ impl BlockDownloadManager {
 		}
 
 		// --- Phase 3: Send getdata messages (one per peer) ---
+		let mut failed_min_height: Option<u32> = None;
+
 		for (widx, items) in &peer_requests {
 			// widx comes from enumerate() on writers above
 			#[allow(clippy::indexing_slicing)]
@@ -439,6 +441,11 @@ impl BlockDownloadManager {
 				.context("failed to send batched getdata")
 			{
 				warn!(peer = %peer_ip, count, error = %e, "failed to send batched getdata");
+				// Track minimum height of dropped entries so we can re-request them
+				for entry in new_entries.iter().filter(|(_, _, w)| *w == *widx) {
+					let h = entry.1.height;
+					failed_min_height = Some(failed_min_height.map_or(h, |m: u32| m.min(h)));
+				}
 				new_entries.retain(|(_h, _e, w)| *w != *widx);
 				continue;
 			}
@@ -450,9 +457,18 @@ impl BlockDownloadManager {
 		for (hash, entry, _widx) in new_entries {
 			self.in_flight.insert(hash, entry);
 		}
+
+		// Re-request blocks whose getdata send failed
+		if let Some(min_height) = failed_min_height {
+			self.schedule_redownload(min_height);
+		}
 	}
 
 	/// Processes a received block: validates structure, context, and stores to disk
+	///
+	/// On any validation or connection failure the block is scheduled for
+	/// re-download from a different peer via `schedule_redownload`
+	#[allow(clippy::too_many_lines)] // sequential validation stages with error handling at each step
 	fn handle_received_block(&mut self, hash: Hash256, raw_bytes: &[u8]) {
 		let Some(entry) = self.in_flight.remove(&hash) else {
 			debug!(block = %hash, "received block not in flight, ignoring");
@@ -468,8 +484,9 @@ impl BlockDownloadManager {
 					height = entry.height,
 					peer = %entry.peer,
 					error = %e,
-					"block parsing/merkle validation failed"
+					"block parsing/merkle validation failed, will re-request"
 				);
+				self.schedule_redownload(entry.height);
 				return;
 			}
 		};
@@ -481,8 +498,9 @@ impl BlockDownloadManager {
 				height = entry.height,
 				peer = %entry.peer,
 				error = %e,
-				"block structural validation failed"
+				"block structural validation failed, will re-request"
 			);
+			self.schedule_redownload(entry.height);
 			return;
 		}
 
@@ -498,8 +516,9 @@ impl BlockDownloadManager {
 				warn!(
 					block = %hash,
 					height = entry.height,
-					"could not compute MTP for contextual validation, skipping block"
+					"could not compute MTP for contextual validation, will re-request"
 				);
+				self.schedule_redownload(entry.height);
 				return;
 			};
 
@@ -511,7 +530,8 @@ impl BlockDownloadManager {
 					secs
 				}
 				Err(e) => {
-					warn!(error = %e, "system clock is before Unix epoch, skipping contextual validation");
+					warn!(error = %e, "system clock is before Unix epoch, will re-request");
+					self.schedule_redownload(entry.height);
 					return;
 				}
 			};
@@ -522,8 +542,9 @@ impl BlockDownloadManager {
 					height = entry.height,
 					peer = %entry.peer,
 					error = %e,
-					"block contextual validation failed"
+					"block contextual validation failed, will re-request"
 				);
+				self.schedule_redownload(entry.height);
 				return;
 			}
 		}
@@ -531,8 +552,11 @@ impl BlockDownloadManager {
 		// Connect block to chainstate if it's at the expected height
 		match entry.height.cmp(&self.next_connect_height) {
 			std::cmp::Ordering::Equal => {
-				self.connect_and_store(hash, &block, raw_bytes, entry.height);
-				self.drain_pending();
+				if self.connect_and_store(hash, &block, raw_bytes, entry.height) {
+					self.drain_pending();
+				} else {
+					self.schedule_redownload(entry.height);
+				}
 			}
 			std::cmp::Ordering::Greater => {
 				// Out of order: buffer for later if we haven't hit the cap
@@ -543,6 +567,7 @@ impl BlockDownloadManager {
 						pending = self.pending_blocks.len(),
 						"pending buffer full, discarding out-of-order block"
 					);
+					self.schedule_redownload(entry.height);
 				} else {
 					self.pending_blocks
 						.insert(entry.height, (hash, block, raw_bytes.to_vec()));
@@ -560,6 +585,15 @@ impl BlockDownloadManager {
 				self.store_block_data(&hash, raw_bytes, entry.height);
 			}
 		}
+	}
+
+	/// Resets `next_height` so `fill_window` will re-request a failed block
+	///
+	/// The block was removed from `in_flight` but never stored. Without
+	/// this, `next_height` has already advanced past it and the block
+	/// would never be requested again
+	fn schedule_redownload(&mut self, height: u32) {
+		self.next_height = self.next_height.min(height);
 	}
 
 	/// Connects a block to the chainstate and stores it to disk
@@ -596,6 +630,7 @@ impl BlockDownloadManager {
 			let (hash, block, raw_bytes) = entry;
 			// Stop draining on failure -- subsequent blocks depend on this one
 			if !self.connect_and_store(hash, &block, &raw_bytes, self.next_connect_height) {
+				self.schedule_redownload(self.next_connect_height);
 				return;
 			}
 		}
