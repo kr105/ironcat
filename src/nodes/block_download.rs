@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+use crate::chainstate::ChainState;
 use crate::network::message_inv::{InvItem, InvType, MessageInv};
 use crate::network::{SharedTcpWriter, SharedTcpWriterExt};
 use crate::nodes::NodeManager;
@@ -23,19 +24,19 @@ const WINDOW_SIZE: usize = 512;
 const PER_PEER_LIMIT: usize = 48;
 
 /// How long before a request is considered stale and reassigned
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often to scan for timed-out requests when blocks are in flight
-const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often to poll when idle (waiting for headers to sync)
 const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// Flush block store to disk every N stored blocks
-const FLUSH_INTERVAL: usize = 500;
+const FLUSH_INTERVAL: u32 = 500;
 
 /// Log block download progress every N stored blocks
-const PROGRESS_LOG_INTERVAL: usize = 500;
+const PROGRESS_LOG_INTERVAL: u32 = 500;
 
 /// How many heights to fetch from the header store per batch during
 /// `fill_window` scanning. Larger means fewer `RwLock` acquires when
@@ -46,6 +47,10 @@ const SCAN_BATCH_SIZE: u32 = 4096;
 /// Prevents micro-batches (getdata count=1) by accumulating free slots
 /// before issuing requests, producing larger batches per peer
 const REFILL_THRESHOLD: usize = WINDOW_SIZE / 4;
+
+/// Maximum number of out-of-order blocks to buffer before discarding.
+/// Bounds memory usage when blocks arrive far ahead of `next_connect_height`
+const MAX_PENDING_BLOCKS: usize = WINDOW_SIZE * 2;
 
 /// Sliding-window block download manager
 ///
@@ -59,21 +64,24 @@ const REFILL_THRESHOLD: usize = WINDOW_SIZE / 4;
 pub struct BlockDownloadManager {
 	node_manager: Arc<NodeManager>,
 	block_store: Arc<BlockStore>,
+	chainstate: Arc<ChainState>,
 	block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
 	/// Blocks currently being downloaded, keyed by block hash
 	pub in_flight: HashMap<Hash256, InFlightEntry>,
 	/// Next chain height to request
 	pub next_height: u32,
-	/// Number of in-flight requests per peer
-	pub peer_counts: HashMap<IpAddr, u32>,
 	/// In-memory set of all stored block hashes (avoids redb reads)
 	stored_hashes: HashSet<Hash256>,
+	/// Blocks waiting to be connected in order, keyed by height
+	pending_blocks: BTreeMap<u32, (Hash256, Block, Vec<u8>)>,
+	/// Next height that needs to be connected to the chainstate
+	next_connect_height: u32,
 	/// Whether we were caught up on the previous loop iteration
 	was_caught_up: bool,
 	/// Blocks stored since last flush
-	blocks_since_flush: usize,
+	blocks_since_flush: u32,
 	/// Blocks stored since last progress log
-	blocks_since_progress_log: usize,
+	blocks_since_progress_log: u32,
 }
 
 /// Tracks a single in-flight block request
@@ -93,11 +101,14 @@ impl BlockDownloadManager {
 	/// so that `fill_window` can skip stored blocks with O(1) `HashSet`
 	/// lookups instead of per-height redb read transactions.
 	/// Genesis block (height 0) is skipped since it has no meaningful
-	/// transactions to download
+	/// transactions to download.
+	/// Initializes `next_connect_height` from the chainstate tip so
+	/// already-connected blocks are not re-processed
 	pub fn new(
 		node_manager: Arc<NodeManager>,
 		block_store: Arc<BlockStore>,
 		block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
+		chainstate: Arc<ChainState>,
 	) -> Self {
 		let stored_hashes = match block_store.all_indexed_hashes() {
 			Ok(hashes) => hashes,
@@ -111,17 +122,99 @@ impl BlockDownloadManager {
 		#[allow(clippy::cast_possible_truncation)] // stored blocks won't exceed u32
 		node_manager.set_block_height(stored_hashes.len() as u32);
 
+		// Start connecting from one past the chainstate tip (tip=0 means empty, start at 1)
+		let cs_height = chainstate.tip_height();
+		let next_connect_height = cs_height.saturating_add(1);
+
+		info!(
+			stored_blocks = stored_hashes.len(),
+			chainstate_tip_height = cs_height,
+			next_connect_height,
+			"BlockDownloadManager initialized"
+		);
+
 		Self {
 			node_manager,
 			block_store,
+			chainstate,
 			block_rx,
 			in_flight: HashMap::new(),
 			next_height: 1,
-			peer_counts: HashMap::new(),
 			stored_hashes,
+			pending_blocks: BTreeMap::new(),
+			next_connect_height,
 			was_caught_up: false,
 			blocks_since_flush: 0,
 			blocks_since_progress_log: 0,
+		}
+	}
+
+	/// Connects stored-but-unconnected blocks from disk to the chainstate
+	///
+	/// On restart the block store may be ahead of the chainstate. Instead
+	/// of re-downloading those blocks from peers, reads them from the flat
+	/// files and connects them in order
+	fn catch_up_chainstate(&mut self) {
+		let chain_height = self.node_manager.chain_height();
+		let mut connected: u32 = 0;
+
+		'outer: while self.next_connect_height <= chain_height {
+			let range_end = self
+				.next_connect_height
+				.saturating_add(SCAN_BATCH_SIZE)
+				.min(chain_height.saturating_add(1));
+			let height_hashes = self
+				.node_manager
+				.header_store
+				.read()
+				.hashes_in_range(self.next_connect_height, range_end);
+
+			if height_hashes.is_empty() {
+				break;
+			}
+
+			for (height, hash) in &height_hashes {
+				if !self.stored_hashes.contains(hash) {
+					break 'outer;
+				}
+
+				let raw_bytes = match self.block_store.load_block(hash) {
+					Ok(bytes) => bytes,
+					Err(e) => {
+						error!(block = %hash, height, error = %e, "failed to load block from store for chainstate catch-up");
+						break 'outer;
+					}
+				};
+
+				let block = match Block::from_bytes_and_validate(&raw_bytes) {
+					Ok(b) => b,
+					Err(e) => {
+						error!(block = %hash, height, error = %e, "failed to parse stored block for chainstate catch-up");
+						break 'outer;
+					}
+				};
+
+				if let Err(e) = self.chainstate.connect_block(&block, *height, hash) {
+					error!(block = %hash, height, error = %e, "failed to connect stored block to chainstate");
+					break 'outer;
+				}
+
+				self.next_connect_height = height.saturating_add(1);
+				connected = connected.saturating_add(1);
+
+				if connected.is_multiple_of(FLUSH_INTERVAL) {
+					self.flush_store();
+				}
+			}
+		}
+
+		if connected > 0 {
+			self.flush_store();
+			info!(
+				connected,
+				tip_height = self.next_connect_height.saturating_sub(1),
+				"chainstate catch-up from disk complete"
+			);
 		}
 	}
 
@@ -131,6 +224,8 @@ impl BlockDownloadManager {
 	/// from the channel, and scans for timed-out requests until the
 	/// channel is closed
 	pub async fn run(&mut self) {
+		self.catch_up_chainstate();
+
 		loop {
 			self.fill_window().await;
 
@@ -188,8 +283,15 @@ impl BlockDownloadManager {
 	/// are free to produce meaningful batch sizes per peer. Scans past
 	/// already-stored blocks in a tight loop since `stored_hashes` lookups
 	/// are O(1) `HashSet` operations
+	#[allow(clippy::too_many_lines)] // three sequential phases (collect, assign, send) that share local state
 	async fn fill_window(&mut self) {
-		let free_slots = WINDOW_SIZE.saturating_sub(self.in_flight.len());
+		// Every in-flight block can become a pending block when it arrives
+		// out of order. Cap new requests so that pending + in_flight + new
+		// never exceeds MAX_PENDING_BLOCKS, preventing any discards
+		let total_outstanding = self.pending_blocks.len().saturating_add(self.in_flight.len());
+		let pending_headroom = MAX_PENDING_BLOCKS.saturating_sub(total_outstanding);
+		let in_flight_headroom = WINDOW_SIZE.saturating_sub(self.in_flight.len());
+		let free_slots = in_flight_headroom.min(pending_headroom);
 
 		// Don't bother refilling for tiny batches -- wait until enough slots
 		// are free to produce meaningful getdata messages.
@@ -206,15 +308,10 @@ impl BlockDownloadManager {
 			return;
 		}
 
-		let mut writer_idx: usize = 0;
-		let mut peer_requests: HashMap<usize, Vec<InvItem>> = HashMap::new();
-		let mut new_entries: Vec<(Hash256, InFlightEntry, usize)> = Vec::new();
+		// --- Phase 1: Collect all requestable (height, hash) pairs ---
+		let mut requestable: Vec<(u32, Hash256)> = Vec::new();
 
-		// Scan heights in batches until we fill the window or reach chain tip.
-		// Each batch grabs up to SCAN_BATCH_SIZE heights from the header store
-		// with one lock acquire. Already-stored blocks are skipped via O(1)
-		// HashSet lookup, so scanning past thousands of stored blocks is fast
-		while self.in_flight.len().saturating_add(new_entries.len()) < WINDOW_SIZE && self.next_height <= chain_height {
+		while requestable.len() < free_slots && self.next_height <= chain_height {
 			let range_end = self
 				.next_height
 				.saturating_add(SCAN_BATCH_SIZE)
@@ -231,54 +328,19 @@ impl BlockDownloadManager {
 
 			let mut made_progress = false;
 			for (height, hash) in &height_hashes {
-				if self.in_flight.len().saturating_add(new_entries.len()) >= WINDOW_SIZE {
+				if requestable.len() >= free_slots {
 					break;
-				}
-
-				// Skip blocks we already have or are already in flight (O(1) in-memory)
-				if self.stored_hashes.contains(hash) || self.in_flight.contains_key(hash) {
-					self.next_height = self.next_height.max(height.saturating_add(1));
-					made_progress = true;
-					continue;
-				}
-
-				// Pick a peer under per-peer limit, round-robin
-				let Some((peer_ip, _writer)) = self.pick_peer(&writers, &mut writer_idx) else {
-					debug!("all peers at per-peer limit, pausing fill_window");
-					// Signal outer loop to stop too
-					self.next_height = self.next_height.max(height.saturating_add(1));
-					return;
-				};
-
-				// Find the writer index for batching
-				let Some(widx) = writers.iter().position(|(ip, _)| *ip == peer_ip) else {
-					warn!(peer = %peer_ip, "pick_peer returned IP not in writers list");
-					continue;
-				};
-
-				peer_requests.entry(widx).or_default().push(InvItem {
-					inv_type: InvType::Block,
-					hash: *hash,
-				});
-
-				new_entries.push((
-					*hash,
-					InFlightEntry {
-						peer: peer_ip,
-						requested_at: Instant::now(),
-						height: *height,
-					},
-					widx,
-				));
-
-				// peer_counts bounded by WINDOW_SIZE, can't overflow u32
-				#[allow(clippy::arithmetic_side_effects)]
-				{
-					*self.peer_counts.entry(peer_ip).or_insert(0) += 1;
 				}
 
 				self.next_height = self.next_height.max(height.saturating_add(1));
 				made_progress = true;
+
+				// Skip blocks we already have or are already in flight (O(1) in-memory)
+				if self.stored_hashes.contains(hash) || self.in_flight.contains_key(hash) {
+					continue;
+				}
+
+				requestable.push((*height, *hash));
 			}
 
 			if !made_progress {
@@ -286,9 +348,86 @@ impl BlockDownloadManager {
 			}
 		}
 
-		// Send batched getdata messages (one per peer)
+		if requestable.is_empty() {
+			return;
+		}
+
+		// --- Phase 2: Assign contiguous chunks to peers ---
+		// Compute how many slots each peer has available
+		let mut peer_used: HashMap<IpAddr, usize> = HashMap::new();
+		for entry in self.in_flight.values() {
+			#[allow(clippy::arithmetic_side_effects)] // bounded by WINDOW_SIZE
+			{
+				*peer_used.entry(entry.peer).or_insert(0) += 1;
+			}
+		}
+
+		// Build ordered list of (peer_index, ip, available_slots)
+		let mut available_peers: Vec<(usize, IpAddr, usize)> = writers
+			.iter()
+			.enumerate()
+			.map(|(i, (ip, _))| {
+				let used = peer_used.get(ip).copied().unwrap_or(0);
+			let free = PER_PEER_LIMIT.saturating_sub(used);
+				(i, *ip, free)
+			})
+			.filter(|(_, _, free)| *free > 0)
+			.collect();
+
+		if available_peers.is_empty() {
+			debug!("all peers at per-peer limit, pausing fill_window");
+			return;
+		}
+
+		// Assign contiguous chunks: fill each peer to its limit before moving
+		// to the next. A slow peer only blocks its own height range
+		let mut peer_requests: HashMap<usize, Vec<InvItem>> = HashMap::new();
+		let mut new_entries: Vec<(Hash256, InFlightEntry, usize)> = Vec::new();
+		let mut peer_idx = 0;
+
+		for (height, hash) in &requestable {
+			// Advance to next peer if current one is full
+			// peer_idx < len is checked by the condition; indexing is safe
+			#[allow(clippy::indexing_slicing)]
+			while peer_idx < available_peers.len() && available_peers[peer_idx].2 == 0 {
+				peer_idx = peer_idx.saturating_add(1);
+			}
+			if peer_idx >= available_peers.len() {
+				break;
+			}
+
+			// available_peers[peer_idx] is valid (checked above)
+			#[allow(clippy::indexing_slicing)]
+			let (widx, peer_ip, ref mut remaining) = available_peers[peer_idx];
+
+			peer_requests.entry(widx).or_default().push(InvItem {
+				inv_type: InvType::Block,
+				hash: *hash,
+			});
+
+			new_entries.push((
+				*hash,
+				InFlightEntry {
+					peer: peer_ip,
+					requested_at: Instant::now(),
+					height: *height,
+				},
+				widx,
+			));
+
+			#[allow(clippy::arithmetic_side_effects)] // remaining > 0 checked by while loop
+			{
+				*remaining -= 1;
+			}
+		}
+
+		if new_entries.is_empty() {
+			return;
+		}
+
+		// --- Phase 3: Send getdata messages (one per peer) ---
 		for (widx, items) in &peer_requests {
-			// widx validated by position() above
+			// widx comes from enumerate() on writers above
 			#[allow(clippy::indexing_slicing)]
 			let (peer_ip, ref writer) = writers[*widx];
 
@@ -300,17 +439,6 @@ impl BlockDownloadManager {
 				.context("failed to send batched getdata")
 			{
 				warn!(peer = %peer_ip, count, error = %e, "failed to send batched getdata");
-				// Roll back peer_counts for entries we won't commit
-				let removed = new_entries.iter().filter(|(_h, _e, w)| *w == *widx).count();
-				if let Some(pc) = self.peer_counts.get_mut(&peer_ip) {
-					#[allow(clippy::cast_possible_truncation)] // removed count bounded by WINDOW_SIZE
-					{
-						*pc = pc.saturating_sub(removed as u32);
-					}
-					if *pc == 0 {
-						self.peer_counts.remove(&peer_ip);
-					}
-				}
 				new_entries.retain(|(_h, _e, w)| *w != *widx);
 				continue;
 			}
@@ -324,45 +452,12 @@ impl BlockDownloadManager {
 		}
 	}
 
-	/// Picks a connected peer that is below the per-peer request limit
-	///
-	/// Scans from `writer_idx` forward, wrapping around. Returns None if
-	/// all peers are at their limit
-	fn pick_peer<'a>(
-		&self,
-		writers: &'a [(IpAddr, SharedTcpWriter)],
-		writer_idx: &mut usize,
-	) -> Option<(IpAddr, &'a SharedTcpWriter)> {
-		let len = writers.len();
-		for _ in 0..len {
-			// writer_idx modulo len is always in bounds; modulo of two usize values is side-effect free
-			#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-			let (ip, ref writer) = writers[*writer_idx % len];
-			*writer_idx = writer_idx.wrapping_add(1);
-
-			let count = self.peer_counts.get(&ip).copied().unwrap_or(0);
-			#[allow(clippy::cast_possible_truncation)] // PER_PEER_LIMIT fits u32
-			if count < PER_PEER_LIMIT as u32 {
-				return Some((ip, writer));
-			}
-		}
-		None
-	}
-
 	/// Processes a received block: validates structure, context, and stores to disk
 	fn handle_received_block(&mut self, hash: Hash256, raw_bytes: &[u8]) {
 		let Some(entry) = self.in_flight.remove(&hash) else {
 			debug!(block = %hash, "received block not in flight, ignoring");
 			return;
 		};
-
-		// Decrement peer count
-		if let Some(count) = self.peer_counts.get_mut(&entry.peer) {
-			*count = count.saturating_sub(1);
-			if *count == 0 {
-				self.peer_counts.remove(&entry.peer);
-			}
-		}
 
 		// Parse and validate merkle root
 		let block = match Block::from_bytes_and_validate(raw_bytes) {
@@ -409,11 +504,17 @@ impl BlockDownloadManager {
 			};
 
 			// Use system time as adjusted time (peer-based offset is a future refinement)
-			#[allow(clippy::cast_possible_truncation)] // Unix timestamp fits u32 until 2106
-			let adjusted_time = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_secs() as u32;
+			let adjusted_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+				Ok(d) => {
+					#[allow(clippy::cast_possible_truncation)] // Unix timestamp fits u32 until 2106
+					let secs = d.as_secs() as u32;
+					secs
+				}
+				Err(e) => {
+					warn!(error = %e, "system clock is before Unix epoch, skipping contextual validation");
+					return;
+				}
+			};
 
 			if let Err(e) = crate::validation::check_block_context(&block, entry.height, mtp, adjusted_time) {
 				warn!(
@@ -427,18 +528,98 @@ impl BlockDownloadManager {
 			}
 		}
 
-		if let Err(e) = self.block_store.store_block_unchecked(&hash, raw_bytes) {
+		// Connect block to chainstate if it's at the expected height
+		match entry.height.cmp(&self.next_connect_height) {
+			std::cmp::Ordering::Equal => {
+				self.connect_and_store(hash, &block, raw_bytes, entry.height);
+				self.drain_pending();
+			}
+			std::cmp::Ordering::Greater => {
+				// Out of order: buffer for later if we haven't hit the cap
+				if self.pending_blocks.len() >= MAX_PENDING_BLOCKS {
+					warn!(
+						block = %hash,
+						height = entry.height,
+						pending = self.pending_blocks.len(),
+						"pending buffer full, discarding out-of-order block"
+					);
+				} else {
+					self.pending_blocks
+						.insert(entry.height, (hash, block, raw_bytes.to_vec()));
+					debug!(
+						block = %hash,
+						height = entry.height,
+						next_connect = self.next_connect_height,
+						pending = self.pending_blocks.len(),
+						"block buffered for ordered connection"
+					);
+				}
+			}
+			std::cmp::Ordering::Less => {
+				// Already connected, just store the raw data
+				self.store_block_data(&hash, raw_bytes, entry.height);
+			}
+		}
+	}
+
+	/// Connects a block to the chainstate and stores it to disk
+	///
+	/// On connect failure the block is discarded and returns `false`.
+	/// On success the raw data is written to the block store, progress
+	/// counters are updated, and returns `true`
+	fn connect_and_store(&mut self, hash: Hash256, block: &Block, raw_bytes: &[u8], height: u32) -> bool {
+		if let Err(e) = self.chainstate.connect_block(block, height, &hash) {
 			warn!(
 				block = %hash,
-				height = entry.height,
+				height,
+				error = %e,
+				"failed to connect block to chainstate, discarding"
+			);
+			return false;
+		}
+
+		self.store_block_data(&hash, raw_bytes, height);
+		// Advance to the next height after successful connection
+		self.next_connect_height = height.saturating_add(1);
+		true
+	}
+
+	/// Drains buffered pending blocks that are now consecutive
+	///
+	/// After a successful `connect_and_store`, checks whether the
+	/// pending buffer contains the next expected height and keeps
+	/// connecting until there is a gap or the buffer is empty.
+	/// Note: `connect_and_store` advances `next_connect_height` on
+	/// success, so each iteration's `remove` targets the next key
+	fn drain_pending(&mut self) {
+		while let Some(entry) = self.pending_blocks.remove(&self.next_connect_height) {
+			let (hash, block, raw_bytes) = entry;
+			// Stop draining on failure -- subsequent blocks depend on this one
+			if !self.connect_and_store(hash, &block, &raw_bytes, self.next_connect_height) {
+				return;
+			}
+		}
+	}
+
+	/// Stores raw block data and updates progress counters
+	///
+	/// Skips the flat file write if the block is already in the store
+	fn store_block_data(&mut self, hash: &Hash256, raw_bytes: &[u8], height: u32) {
+		if !self.stored_hashes.insert(*hash) {
+			// Already stored, nothing to do
+			debug!(block = %hash, height, "block already stored, skipping");
+			return;
+		}
+
+		if let Err(e) = self.block_store.store_block_unchecked(hash, raw_bytes) {
+			warn!(
+				block = %hash,
+				height,
 				error = %e,
 				"failed to store block"
 			);
 			return;
 		}
-
-		// Track in memory so fill_window skips this block without redb reads
-		self.stored_hashes.insert(hash);
 
 		self.blocks_since_flush = self.blocks_since_flush.saturating_add(1);
 
@@ -464,13 +645,16 @@ impl BlockDownloadManager {
 			self.blocks_since_progress_log = 0;
 		}
 
-		debug!(block = %hash, height = entry.height, "block stored");
+		debug!(block = %hash, height, "block stored");
 	}
 
-	/// Flushes the block store (fsync + redb commit) and resets the counter
+	/// Flushes the block store and undo store, then resets the counter
 	fn flush_store(&mut self) {
 		if let Err(e) = self.block_store.flush() {
 			warn!(error = %e, "failed to flush block store");
+		}
+		if let Err(e) = self.chainstate.fsync_undo() {
+			warn!(error = %e, "failed to fsync undo store");
 		}
 		self.blocks_since_flush = 0;
 	}
@@ -499,13 +683,6 @@ impl BlockDownloadManager {
 					peer = %entry.peer,
 					"block request timed out"
 				);
-
-				if let Some(count) = self.peer_counts.get_mut(&entry.peer) {
-					*count = count.saturating_sub(1);
-					if *count == 0 {
-						self.peer_counts.remove(&entry.peer);
-					}
-				}
 			}
 		}
 

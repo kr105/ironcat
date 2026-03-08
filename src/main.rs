@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ironcat::{
+	chainstate::ChainState,
 	cli::Args,
 	difficulty::ConsensusParams,
 	dns,
@@ -109,6 +110,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	// Open block store for raw block data
 	let block_store = Arc::new(BlockStore::open(&args.datadir).context("failed to open block store")?);
 
+	// Open chainstate database for UTXO set management
+	let chainstate = Arc::new(ChainState::open(&args.datadir).context("failed to open chainstate")?);
+
 	// Create channel for forwarding received blocks to the download manager
 	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
 	node_manager.set_block_sender(block_tx);
@@ -188,11 +192,12 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	// loads all indexed hashes from redb (can take several seconds depending on block count)
 	let nm = Arc::clone(&node_manager);
 	let bs = Arc::clone(&block_store);
+	let cs = Arc::clone(&chainstate);
 	let download_handle = tokio::spawn(async move {
 		let mut manager = match tokio::task::spawn_blocking({
 			let nm = Arc::clone(&nm);
 			let bs = Arc::clone(&bs);
-			move || BlockDownloadManager::new(nm, bs, block_rx)
+			move || BlockDownloadManager::new(nm, bs, block_rx, cs)
 		})
 		.await
 		{

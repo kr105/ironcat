@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod chainstate;
 pub mod cli;
 pub mod difficulty;
 pub mod dns;

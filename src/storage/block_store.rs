@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -162,10 +162,8 @@ impl BlockStore {
 		let (ref mut file_number, ref mut file, ref mut offset) = *guard;
 
 		// Check if we need to rotate
-		#[allow(clippy::arithmetic_side_effects)] // ENTRY_PREFIX_SIZE is a small constant
 		let entry_size = ENTRY_PREFIX_SIZE.saturating_add(raw_bytes.len() as u64);
 
-		#[allow(clippy::arithmetic_side_effects)] // saturating_add above prevents overflow
 		if *offset > 0 && offset.saturating_add(entry_size) > self.max_file_size {
 			let next = file_number
 				.checked_add(1)
@@ -304,6 +302,32 @@ impl BlockStore {
 				None
 			}
 		}
+	}
+
+	/// Loads raw block bytes from the flat file by hash
+	///
+	/// Looks up the block's location in the index, seeks past the 8-byte
+	/// magic+size prefix, and reads the raw block data
+	pub fn load_block(&self, hash: &Hash256) -> Result<Vec<u8>> {
+		let loc = self
+			.get_location(hash)
+			.ok_or_else(|| anyhow::anyhow!("block {hash} not found in index"))?;
+
+		let file_path = self.blocks_dir.join(format!("blk{:05}.dat", loc.file_number));
+		let mut file =
+			File::open(&file_path).with_context(|| format!("failed to open block file {}", file_path.display()))?;
+
+		// Seek past the magic+size prefix to the actual block data
+		#[allow(clippy::arithmetic_side_effects)] // u32 offset + 8 fits u64
+		let data_offset = u64::from(loc.offset) + ENTRY_PREFIX_SIZE;
+		file.seek(SeekFrom::Start(data_offset))
+			.context("failed to seek in block file")?;
+
+		let mut buf = vec![0u8; loc.size as usize];
+		file.read_exact(&mut buf)
+			.context("failed to read block data from flat file")?;
+
+		Ok(buf)
 	}
 
 	/// Returns all block hashes currently committed in the redb index
