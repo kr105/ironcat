@@ -15,6 +15,9 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 dirs = "6"
 sha2 = "0.10.9"
+k256 = { version = "0.13", features = ["ecdsa"] }
+ripemd = "0.1"
+sha1 = "0.10"
 parking_lot = "0.12"
 rayon = "1.10"
 redb = "2.6"
@@ -55,6 +58,9 @@ manual_div_ceil = "allow" # triggered inside uint crate macro expansion
 # Optimize crypto-heavy deps even in debug builds so PoW validation
 # during header sync doesn't crawl (scrypt is ~15x slower at opt-level 0)
 [profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.k256]
 opt-level = 3
 
 [[bench]]
