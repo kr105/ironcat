@@ -70,7 +70,7 @@ fn make_spend_tx(outpoint: OutPoint, value: i64) -> Transaction {
 }
 
 /// Creates a block with the given previous hash and transactions
-const fn make_block(prev_hash: Hash256, txs: Vec<Transaction>) -> Block {
+fn make_block(prev_hash: Hash256, txs: Vec<Transaction>) -> Block {
 	Block {
 		header: BlockHeader {
 			version: 1,

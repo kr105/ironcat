@@ -709,21 +709,53 @@ fn op_checksig_valid_p2pkh() {
 }
 
 #[test]
-fn op_checksig_wrong_key_fails() {
+fn op_checksig_wrong_key_pushes_false() {
+	// OP_CHECKSIG with a valid non-empty sig that fails ECDSA verification
+	// should push false (not error) in non-verify mode
 	let (sk, _pk) = gen_keypair(&[0x42; 32]);
 	let (_sk2, pk2) = gen_keypair(&[0x99; 32]);
-	let script_pubkey = p2pkh_script_pubkey(&pk2); // locked to pk2
-	let tx = make_tx();
 
-	// Sign with sk (wrong key)
+	// P2PK script so we skip EQUALVERIFY and can observe the false push
+	let mut script_pubkey = vec![pk2.len() as u8];
+	script_pubkey.extend_from_slice(&pk2);
+	script_pubkey.push(0xac); // OP_CHECKSIG
+
+	let tx = make_tx();
 	let sig = sign_tx(&sk, &tx, 0, &script_pubkey);
 
 	let mut script_sig = vec![sig.len() as u8];
 	script_sig.extend_from_slice(&sig);
-	script_sig.push(pk2.len() as u8); // push pk2 but sig is from sk
-	script_sig.extend_from_slice(&pk2);
 
-	// This should fail: NULLFAIL means non-empty sig + failed verification = error
+	let sig_ctx = SignatureContext { tx: &tx, input_idx: 0 };
+	let mut engine = Engine::with_sig_context(&script_sig, sig_ctx);
+	let sig_stack = engine.execute().unwrap();
+
+	let sig_ctx2 = SignatureContext { tx: &tx, input_idx: 0 };
+	let mut engine2 = Engine::with_stack_and_sig_context(&script_pubkey, sig_stack, sig_ctx2);
+	let final_stack = engine2.execute().unwrap();
+
+	// Failed CHECKSIG pushes empty vec (false)
+	let top = final_stack.last().unwrap();
+	assert!(top.is_empty(), "expected false (empty) on failed CHECKSIG, got {top:?}");
+}
+
+#[test]
+fn op_checksigverify_wrong_key_errors() {
+	// OP_CHECKSIGVERIFY with wrong key should return error
+	let (sk, _pk) = gen_keypair(&[0x42; 32]);
+	let (_sk2, pk2) = gen_keypair(&[0x99; 32]);
+
+	// scriptPubKey: <pk2> OP_CHECKSIGVERIFY OP_1
+	let mut script_pubkey = vec![pk2.len() as u8];
+	script_pubkey.extend_from_slice(&pk2);
+	script_pubkey.push(0xad); // OP_CHECKSIGVERIFY
+
+	let tx = make_tx();
+	let sig = sign_tx(&sk, &tx, 0, &script_pubkey);
+
+	let mut script_sig = vec![sig.len() as u8];
+	script_sig.extend_from_slice(&sig);
+
 	let sig_ctx = SignatureContext { tx: &tx, input_idx: 0 };
 	let mut engine = Engine::with_sig_context(&script_sig, sig_ctx);
 	let sig_stack = engine.execute().unwrap();
@@ -957,9 +989,9 @@ fn op_checksig_empty_sig_pushes_false() {
 	let sig_ctx2 = SignatureContext { tx: &tx, input_idx: 0 };
 	let mut engine2 = Engine::with_stack_and_sig_context(&script_pubkey_p2pk, sig_stack, sig_ctx2);
 	let final_stack = engine2.execute().unwrap();
-	// Empty sig -> push false (not error)
+	// Empty sig -> push canonical false (empty vec)
 	let top = final_stack.last().unwrap();
-	assert!(top.is_empty() || top.iter().all(|&b| b == 0));
+	assert!(top.is_empty(), "expected canonical empty vec for false, got {top:?}");
 }
 
 #[test]

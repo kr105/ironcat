@@ -8,7 +8,8 @@
 )]
 
 use ironcat::script::signature::{
-	check_low_s, check_pubkey_encoding, check_signature_encoding, signature_hash, verify_ecdsa, SigHashType,
+	check_low_s, check_pubkey_encoding, check_signature_encoding, find_and_delete, signature_hash, verify_ecdsa,
+	SigHashType,
 };
 use ironcat::script::ScriptError;
 use ironcat::types::hash::Hash256;
@@ -47,10 +48,15 @@ fn sighash_all_deterministic() {
 fn sighash_none_ignores_outputs() {
 	let mut tx = make_test_tx();
 	let script_code = vec![0x76, 0xa9, 0x14];
-	let hash1 = signature_hash(&tx, 0, &script_code, SigHashType::None);
+	let hash_none = signature_hash(&tx, 0, &script_code, SigHashType::None);
+	let hash_all = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	// NONE and ALL must produce different hashes for the same tx
+	assert_ne!(hash_none, hash_all);
+
 	tx.vout[0].value = 1;
-	let hash2 = signature_hash(&tx, 0, &script_code, SigHashType::None);
-	assert_eq!(hash1, hash2);
+	let hash_none2 = signature_hash(&tx, 0, &script_code, SigHashType::None);
+	// NONE ignores outputs, so changing output value doesn't change hash
+	assert_eq!(hash_none, hash_none2);
 }
 
 #[test]
@@ -335,4 +341,41 @@ fn check_low_s_rejects_high_s() {
 	sig.extend_from_slice(&s_bytes);
 	sig.push(0x01); // hashtype
 	assert_eq!(check_low_s(&sig).unwrap_err(), ScriptError::InvalidSignatureEncoding);
+}
+
+#[test]
+fn find_and_delete_removes_direct_push() {
+	let data = vec![0xaa, 0xbb];
+	// Script contains: [0x02 0xaa 0xbb] (push 2 bytes) then OP_DUP (0x76)
+	let script = vec![0x02, 0xaa, 0xbb, 0x76];
+	let result = find_and_delete(&script, &data);
+	assert_eq!(result, vec![0x76]);
+}
+
+#[test]
+fn find_and_delete_noop_for_empty_data() {
+	let script = vec![0x02, 0xaa, 0xbb, 0x76];
+	let result = find_and_delete(&script, &[]);
+	assert_eq!(result, script);
+}
+
+#[test]
+fn find_and_delete_noop_above_75_bytes() {
+	// Data > 75 bytes should be returned unchanged (only direct push handled)
+	let data = vec![0xaa; 76];
+	let mut script = vec![0x4c, 76]; // PUSHDATA1 + length
+	script.extend_from_slice(&data);
+	let result = find_and_delete(&script, &data);
+	assert_eq!(result, script);
+}
+
+#[test]
+fn find_and_delete_at_75_byte_boundary() {
+	// Exactly 75 bytes should be handled (direct push limit)
+	let data = vec![0xcc; 75];
+	let mut script = vec![75]; // direct push opcode
+	script.extend_from_slice(&data);
+	script.push(0x76); // OP_DUP after
+	let result = find_and_delete(&script, &data);
+	assert_eq!(result, vec![0x76]);
 }
