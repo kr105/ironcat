@@ -41,7 +41,7 @@ fn setup() -> (
 	let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
 	let dir = tempfile::tempdir().unwrap();
 	let bs = Arc::new(BlockStore::open(dir.path()).unwrap());
-	let cs = Arc::new(ChainState::open(dir.path()).unwrap());
+	let cs = Arc::new(ChainState::open(dir.path(), u32::MAX).unwrap());
 	let (_tx, rx) = tokio::sync::mpsc::channel(32);
 	(nm, bs, rx, cs, dir)
 }

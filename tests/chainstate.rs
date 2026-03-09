@@ -91,7 +91,7 @@ fn block_hash(block: &Block) -> Hash256 {
 
 fn open_chainstate() -> (tempfile::TempDir, ChainState) {
 	let dir = tempfile::tempdir().unwrap();
-	let cs = ChainState::open(dir.path()).unwrap();
+	let cs = ChainState::open(dir.path(), u32::MAX).unwrap();
 	(dir, cs)
 }
 
