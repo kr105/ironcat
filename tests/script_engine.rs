@@ -53,6 +53,16 @@ fn op_1negate() {
 
 #[test]
 fn pushdata1() {
+	// PUSHDATA1 with 2 bytes
+	let script = vec![0x4c, 0x02, 0xaa, 0xbb];
+	let mut engine = Engine::new(&script);
+	let stack = engine.execute().unwrap();
+	assert_eq!(stack[0], vec![0xaa, 0xbb]);
+}
+
+#[test]
+fn pushdata1_non_minimal_accepted() {
+	// PUSHDATA1 with 2 bytes is non-minimal but accepted without MINIMALDATA flag
 	let script = vec![0x4c, 0x02, 0xaa, 0xbb];
 	let mut engine = Engine::new(&script);
 	let stack = engine.execute().unwrap();
@@ -61,6 +71,16 @@ fn pushdata1() {
 
 #[test]
 fn pushdata2() {
+	// PUSHDATA2 with 2 bytes
+	let script = vec![0x4d, 0x02, 0x00, 0xaa, 0xbb];
+	let mut engine = Engine::new(&script);
+	let stack = engine.execute().unwrap();
+	assert_eq!(stack[0], vec![0xaa, 0xbb]);
+}
+
+#[test]
+fn pushdata2_non_minimal_accepted() {
+	// PUSHDATA2 with 2 bytes is non-minimal but accepted without MINIMALDATA flag
 	let script = vec![0x4d, 0x02, 0x00, 0xaa, 0xbb];
 	let mut engine = Engine::new(&script);
 	let stack = engine.execute().unwrap();
@@ -710,12 +730,12 @@ fn op_checksig_valid_p2pkh() {
 
 #[test]
 fn op_checksig_wrong_key_pushes_false() {
-	// OP_CHECKSIG with a valid non-empty sig that fails ECDSA verification
-	// should push false (not error) in non-verify mode
+	// Without NULLFAIL, OP_CHECKSIG with a non-empty sig that fails ECDSA
+	// verification pushes false (not an error)
 	let (sk, _pk) = gen_keypair(&[0x42; 32]);
 	let (_sk2, pk2) = gen_keypair(&[0x99; 32]);
 
-	// P2PK script so we skip EQUALVERIFY and can observe the false push
+	// P2PK script
 	let mut script_pubkey = vec![pk2.len() as u8];
 	script_pubkey.extend_from_slice(&pk2);
 	script_pubkey.push(0xac); // OP_CHECKSIG
@@ -733,10 +753,9 @@ fn op_checksig_wrong_key_pushes_false() {
 	let sig_ctx2 = SignatureContext { tx: &tx, input_idx: 0 };
 	let mut engine2 = Engine::with_stack_and_sig_context(&script_pubkey, sig_stack, sig_ctx2);
 	let final_stack = engine2.execute().unwrap();
-
-	// Failed CHECKSIG pushes empty vec (false)
+	// Wrong key -> push false (empty vec)
 	let top = final_stack.last().unwrap();
-	assert!(top.is_empty(), "expected false (empty) on failed CHECKSIG, got {top:?}");
+	assert!(top.is_empty(), "expected false on stack, got {top:?}");
 }
 
 #[test]
@@ -837,8 +856,8 @@ fn op_checkmultisig_2of3() {
 }
 
 #[test]
-fn op_checkmultisig_nulldummy() {
-	// The dummy byte must be empty. Non-empty should fail
+fn op_checkmultisig_non_null_dummy_accepted() {
+	// Without NULLDUMMY (BIP147), non-empty dummy is accepted
 	let (sk1, pk1) = gen_keypair(&[0x01; 32]);
 
 	let mut script_pubkey = vec![0x51]; // OP_1
@@ -861,7 +880,9 @@ fn op_checkmultisig_nulldummy() {
 
 	let sig_ctx2 = SignatureContext { tx: &tx, input_idx: 0 };
 	let mut engine2 = Engine::with_stack_and_sig_context(&script_pubkey, sig_stack, sig_ctx2);
-	assert!(engine2.execute().is_err()); // Should fail due to NULLDUMMY
+	let final_stack = engine2.execute().unwrap();
+	let top = final_stack.last().unwrap();
+	assert_eq!(*top, vec![1u8]);
 }
 
 #[test]
@@ -1029,8 +1050,8 @@ fn pushdata1_truncated() {
 
 #[test]
 fn pushdata2_truncated() {
-	// PUSHDATA2 says 3 bytes but only 1 follows
-	let script = vec![0x4d, 0x03, 0x00, 0xaa];
+	// PUSHDATA2 says 5 bytes but only 1 follows
+	let script = vec![0x4d, 0x05, 0x00, 0xaa];
 	let mut engine = Engine::new(&script);
 	assert_eq!(engine.execute().unwrap_err(), ScriptError::InvalidPushSize);
 }

@@ -261,13 +261,17 @@ impl BlockDownloadManager {
 					}
 				}
 				() = tokio::time::sleep(sleep_duration) => {
-					self.handle_timeout_scan();
 					// Flush any pending blocks on the timer tick
 					if self.blocks_since_flush > 0 {
 						self.flush_store();
 					}
 				}
 			}
+
+			// Always scan for stale requests after any event, not just on
+			// the sleep branch. Without this, continuous block arrivals starve
+			// the timeout scanner and stalled peers block progress forever
+			self.handle_timeout_scan();
 		}
 	}
 
@@ -335,8 +339,11 @@ impl BlockDownloadManager {
 				self.next_height = self.next_height.max(height.saturating_add(1));
 				made_progress = true;
 
-				// Skip blocks we already have or are already in flight (O(1) in-memory)
-				if self.stored_hashes.contains(hash) || self.in_flight.contains_key(hash) {
+				// Skip blocks we already have, are in flight, or are pending connection
+				if self.stored_hashes.contains(hash)
+					|| self.in_flight.contains_key(hash)
+					|| self.pending_blocks.contains_key(height)
+				{
 					continue;
 				}
 

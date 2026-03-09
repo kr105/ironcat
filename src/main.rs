@@ -111,7 +111,11 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let block_store = Arc::new(BlockStore::open(&args.datadir).context("failed to open block store")?);
 
 	// Open chainstate database for UTXO set management
-	let chainstate = Arc::new(ChainState::open(&args.datadir).context("failed to open chainstate")?);
+	// Script verification is skipped for blocks at or below the last checkpoint height
+	let consensus = ConsensusParams::mainnet();
+	let chainstate = Arc::new(
+		ChainState::open(&args.datadir, consensus.last_checkpoint_height()).context("failed to open chainstate")?,
+	);
 
 	// Create channel for forwarding received blocks to the download manager
 	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);

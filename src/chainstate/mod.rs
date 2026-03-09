@@ -6,9 +6,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use redb::{Database, ReadableTable, Table, TableDefinition};
 use tracing::{debug, info};
 
+use crate::script::verify::verify_script;
 use crate::types::block::Block;
 use crate::types::hash::{Hash256, HASH_LEN};
 use crate::types::transaction::OutPoint;
@@ -47,6 +49,17 @@ pub struct ChainState {
 	undo_store: UndoStore,
 	/// Current chain tip hash and height, updated atomically
 	tip: RwLock<(Hash256, u32)>,
+	/// Blocks at or below this height skip script verification
+	script_verify_height: u32,
+}
+
+/// Formats a catoshi value as a CAT string (e.g. 50.00000000)
+#[allow(clippy::arithmetic_side_effects)] // modulo by a non-zero constant
+fn format_catoshis(catoshis: i64) -> String {
+	const CAT: i64 = 100_000_000;
+	let whole = catoshis / CAT;
+	let frac = (catoshis % CAT).unsigned_abs();
+	format!("{whole}.{frac:08}")
 }
 
 /// Converts an outpoint to a 36-byte key for the UTXO table
@@ -94,7 +107,7 @@ impl ChainState {
 	/// required tables (`UTXO_SET`, `META`, `UNDO_INDEX`). Loads the current
 	/// tip from the META table, defaulting to the zero hash
 	#[allow(clippy::missing_panics_doc)] // unwrap is after a length check, can't panic
-	pub fn open(datadir: &Path) -> Result<Self> {
+	pub fn open(datadir: &Path, script_verify_height: u32) -> Result<Self> {
 		let db_path = datadir.join("chainstate.redb");
 		let db = Database::create(&db_path)
 			.with_context(|| format!("failed to open chainstate db at {}", db_path.display()))?;
@@ -156,6 +169,7 @@ impl ChainState {
 			db,
 			undo_store,
 			tip: RwLock::new((tip, tip_height)),
+			script_verify_height,
 		})
 	}
 
@@ -196,8 +210,18 @@ impl ChainState {
 			);
 		}
 
+		anyhow::ensure!(
+			!block.transactions.is_empty(),
+			"block has no transactions (missing coinbase)"
+		);
+
 		let mut block_undo = BlockUndo { tx_undos: Vec::new() };
 		let mut total_fees: i64 = 0;
+		let mut total_inputs: usize = 0;
+		let mut total_outputs: usize = 0;
+		let mut total_input_value: i64 = 0;
+		let mut total_output_value: i64 = 0;
+		let mut scripts_verified: usize = 0;
 
 		let txn = self
 			.db
@@ -209,12 +233,15 @@ impl ChainState {
 				.open_table(UTXO_SET)
 				.context("failed to open utxos table for connect_block")?;
 
-			for (tx_idx, tx) in block.transactions.iter().enumerate() {
+			for tx in &block.transactions {
 				let txid = tx.txid();
 
 				if tx.is_coinbase() {
 					insert_outputs(&mut utxo_table, &txid, &tx.vout, height, true)?;
+					total_outputs = total_outputs.saturating_add(tx.vout.len());
 				} else {
+					anyhow::ensure!(!tx.vin.is_empty(), "non-coinbase transaction {txid} has no inputs");
+
 					// Process non-coinbase transaction
 					let mut tx_undo = TxUndo {
 						spent_outputs: Vec::with_capacity(tx.vin.len()),
@@ -255,6 +282,26 @@ impl ChainState {
 						utxo_table.remove(&key).context("failed to remove spent utxo")?;
 					}
 
+					// Verify scripts for all inputs in parallel
+					if height > self.script_verify_height {
+						let txid_display = txid;
+						tx_undo
+							.spent_outputs
+							.par_iter()
+							.enumerate()
+							.try_for_each(|(input_idx, coin)| {
+								// spent_outputs has exactly tx.vin.len() entries, so input_idx is always valid
+								#[allow(clippy::indexing_slicing)]
+								verify_script(&tx.vin[input_idx].script_sig, &coin.tx_out.script_pubkey, tx, input_idx)
+									.map_err(|e| {
+										anyhow::anyhow!(
+										"script verification failed for input {input_idx} of tx {txid_display}: {e}"
+									)
+									})
+							})?;
+						scripts_verified = scripts_verified.saturating_add(tx.vin.len());
+					}
+
 					// Sum outputs
 					let mut output_sum: i64 = 0;
 					for output in &tx.vout {
@@ -262,6 +309,11 @@ impl ChainState {
 							.checked_add(output.value)
 							.ok_or_else(|| anyhow::anyhow!("output value sum overflow"))?;
 					}
+
+					total_inputs = total_inputs.saturating_add(tx.vin.len());
+					total_outputs = total_outputs.saturating_add(tx.vout.len());
+					total_input_value = total_input_value.saturating_add(input_sum);
+					total_output_value = total_output_value.saturating_add(output_sum);
 
 					if output_sum > input_sum {
 						anyhow::bail!("tx {txid} outputs ({output_sum}) exceed inputs ({input_sum})");
@@ -277,15 +329,6 @@ impl ChainState {
 					insert_outputs(&mut utxo_table, &txid, &tx.vout, height, false)?;
 
 					block_undo.tx_undos.push(tx_undo);
-
-					debug!(
-						tx_idx,
-						txid = %txid,
-						input_sum,
-						output_sum,
-						fee,
-						"Connected transaction"
-					);
 				}
 			}
 		}
@@ -311,7 +354,10 @@ impl ChainState {
 			}
 		}
 
-		// Store undo data and write index atomically with UTXO mutations
+		// Store undo data and write index entry in the same redb transaction.
+		// Note: the flat file write happens before the redb commit. On crash
+		// between the two, orphaned bytes in the flat file are harmless --
+		// verify_or_clear_index tolerates files larger than the index expects
 		if !block_undo.tx_undos.is_empty() {
 			let loc = self
 				.undo_store
@@ -347,8 +393,13 @@ impl ChainState {
 		debug!(
 			height,
 			hash = %block_hash,
-			total_fees,
-			tx_count = block.transactions.len(),
+			txs = block.transactions.len(),
+			inputs = total_inputs,
+			outputs = total_outputs,
+			input_cat = %format_catoshis(total_input_value),
+			output_cat = %format_catoshis(total_output_value),
+			fees_cat = %format_catoshis(total_fees),
+			scripts_verified,
 			"Connected block"
 		);
 

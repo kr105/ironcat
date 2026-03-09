@@ -11,6 +11,11 @@ use ironcat::script::signature::{
 	check_low_s, check_pubkey_encoding, check_signature_encoding, find_and_delete, signature_hash, verify_ecdsa,
 	SigHashType,
 };
+
+const SIGHASH_ALL: u8 = 0x01;
+const SIGHASH_NONE: u8 = 0x02;
+const SIGHASH_SINGLE: u8 = 0x03;
+const SIGHASH_ALL_ANYONECANPAY: u8 = 0x81;
 use ironcat::script::ScriptError;
 use ironcat::types::hash::Hash256;
 use ironcat::types::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -38,8 +43,8 @@ fn make_test_tx() -> Transaction {
 fn sighash_all_deterministic() {
 	let tx = make_test_tx();
 	let script_code = vec![0x76, 0xa9, 0x14];
-	let hash1 = signature_hash(&tx, 0, &script_code, SigHashType::All);
-	let hash2 = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash1 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
+	let hash2 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	assert_eq!(hash1, hash2);
 	assert_ne!(hash1, Hash256::ZERO);
 }
@@ -48,13 +53,13 @@ fn sighash_all_deterministic() {
 fn sighash_none_ignores_outputs() {
 	let mut tx = make_test_tx();
 	let script_code = vec![0x76, 0xa9, 0x14];
-	let hash_none = signature_hash(&tx, 0, &script_code, SigHashType::None);
-	let hash_all = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash_none = signature_hash(&tx, 0, &script_code, SIGHASH_NONE);
+	let hash_all = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	// NONE and ALL must produce different hashes for the same tx
 	assert_ne!(hash_none, hash_all);
 
 	tx.vout[0].value = 1;
-	let hash_none2 = signature_hash(&tx, 0, &script_code, SigHashType::None);
+	let hash_none2 = signature_hash(&tx, 0, &script_code, SIGHASH_NONE);
 	// NONE ignores outputs, so changing output value doesn't change hash
 	assert_eq!(hash_none, hash_none2);
 }
@@ -63,9 +68,9 @@ fn sighash_none_ignores_outputs() {
 fn sighash_all_depends_on_outputs() {
 	let mut tx = make_test_tx();
 	let script_code = vec![0x76, 0xa9, 0x14];
-	let hash1 = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash1 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	tx.vout[0].value = 1;
-	let hash2 = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash2 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	assert_ne!(hash1, hash2);
 }
 
@@ -98,7 +103,7 @@ fn sighash_single_bug() {
 		locktime: 0,
 	};
 	let script_code = vec![0x76];
-	let hash = signature_hash(&tx, 1, &script_code, SigHashType::Single);
+	let hash = signature_hash(&tx, 1, &script_code, SIGHASH_SINGLE);
 	let mut expected = [0u8; 32];
 	expected[0] = 0x01;
 	assert_eq!(hash, Hash256::from_bytes(expected));
@@ -133,16 +138,16 @@ fn sighash_anyonecanpay_differs_from_all() {
 		locktime: 0,
 	};
 	let script_code = vec![0x76];
-	let hash1 = signature_hash(&tx, 0, &script_code, SigHashType::AllAnyoneCanPay);
-	let hash2 = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash1 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL_ANYONECANPAY);
+	let hash2 = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	assert_ne!(hash1, hash2);
 }
 
 #[test]
 fn sighash_all_depends_on_script_code() {
 	let tx = make_test_tx();
-	let hash1 = signature_hash(&tx, 0, &[0x76, 0xa9], SigHashType::All);
-	let hash2 = signature_hash(&tx, 0, &[0x76, 0xaa], SigHashType::All);
+	let hash1 = signature_hash(&tx, 0, &[0x76, 0xa9], SIGHASH_ALL);
+	let hash2 = signature_hash(&tx, 0, &[0x76, 0xaa], SIGHASH_ALL);
 	assert_ne!(hash1, hash2);
 }
 
@@ -150,10 +155,10 @@ fn sighash_all_depends_on_script_code() {
 fn sighash_single_normal() {
 	let tx = make_test_tx();
 	let script_code = vec![0x76];
-	let hash = signature_hash(&tx, 0, &script_code, SigHashType::Single);
+	let hash = signature_hash(&tx, 0, &script_code, SIGHASH_SINGLE);
 	assert_ne!(hash, Hash256::ZERO);
 	// Single with matching output should differ from All
-	let hash_all = signature_hash(&tx, 0, &script_code, SigHashType::All);
+	let hash_all = signature_hash(&tx, 0, &script_code, SIGHASH_ALL);
 	assert_ne!(hash, hash_all);
 }
 
@@ -163,8 +168,8 @@ fn sighash_type_from_byte() {
 	assert_eq!(SigHashType::from_byte(0x02), Some(SigHashType::None));
 	assert_eq!(SigHashType::from_byte(0x03), Some(SigHashType::Single));
 	assert_eq!(SigHashType::from_byte(0x81), Some(SigHashType::AllAnyoneCanPay));
-	assert_eq!(SigHashType::from_byte(0x00), None);
-	assert_eq!(SigHashType::from_byte(0x04), None);
+	assert_eq!(SigHashType::from_byte(0x00), Option::None);
+	assert_eq!(SigHashType::from_byte(0x04), Option::None);
 }
 
 #[test]
@@ -252,32 +257,32 @@ fn invalid_pubkey_wrong_prefix() {
 
 #[test]
 fn verify_ecdsa_with_real_key() {
-	use k256::ecdsa::{signature::Signer, SigningKey};
+	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 
-	// Generate a key and sign a message
+	// Generate a key and sign a prehashed message (Bitcoin signs raw 32-byte hashes)
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
 	let verifying_key = signing_key.verifying_key();
 	let pubkey = verifying_key.to_sec1_bytes();
 
-	let message = [0xab; 32];
-	let sig: k256::ecdsa::Signature = signing_key.sign(&message);
+	let prehash = [0xab; 32];
+	let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&prehash).unwrap();
 	let mut sig_der = sig.to_der().to_bytes().to_vec();
 	sig_der.push(0x01); // SIGHASH_ALL
 
-	let sighash = Hash256::from_bytes(message);
+	let sighash = Hash256::from_bytes(prehash);
 	assert!(verify_ecdsa(&sig_der, &pubkey, &sighash));
 }
 
 #[test]
 fn verify_ecdsa_wrong_message() {
-	use k256::ecdsa::{signature::Signer, SigningKey};
+	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
 	let verifying_key = signing_key.verifying_key();
 	let pubkey = verifying_key.to_sec1_bytes();
 
-	let message = [0xab; 32];
-	let sig: k256::ecdsa::Signature = signing_key.sign(&message);
+	let prehash = [0xab; 32];
+	let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&prehash).unwrap();
 	let mut sig_der = sig.to_der().to_bytes().to_vec();
 	sig_der.push(0x01);
 
@@ -287,18 +292,18 @@ fn verify_ecdsa_wrong_message() {
 
 #[test]
 fn verify_ecdsa_wrong_key() {
-	use k256::ecdsa::{signature::Signer, SigningKey};
+	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
 	let wrong_key = SigningKey::from_bytes(&[0x02; 32].into()).unwrap();
 	let wrong_pub = wrong_key.verifying_key().to_sec1_bytes();
 
-	let message = [0xab; 32];
-	let sig: k256::ecdsa::Signature = signing_key.sign(&message);
+	let prehash = [0xab; 32];
+	let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&prehash).unwrap();
 	let mut sig_der = sig.to_der().to_bytes().to_vec();
 	sig_der.push(0x01);
 
-	let sighash = Hash256::from_bytes(message);
+	let sighash = Hash256::from_bytes(prehash);
 	assert!(!verify_ecdsa(&sig_der, &wrong_pub, &sighash));
 }
 
