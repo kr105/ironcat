@@ -66,6 +66,8 @@ pub struct BlockDownloadManager {
 	block_store: Arc<BlockStore>,
 	chainstate: Arc<ChainState>,
 	block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
+	/// Receives peer disconnect notifications for immediate in-flight expiry
+	disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
 	/// Blocks currently being downloaded, keyed by block hash
 	pub in_flight: HashMap<Hash256, InFlightEntry>,
 	/// Next chain height to request
@@ -108,6 +110,7 @@ impl BlockDownloadManager {
 		node_manager: Arc<NodeManager>,
 		block_store: Arc<BlockStore>,
 		block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
+		disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
 		chainstate: Arc<ChainState>,
 	) -> Self {
 		let stored_hashes = match block_store.all_indexed_hashes() {
@@ -138,6 +141,7 @@ impl BlockDownloadManager {
 			block_store,
 			chainstate,
 			block_rx,
+			disconnect_rx,
 			in_flight: HashMap::new(),
 			next_height: 1,
 			stored_hashes,
@@ -259,6 +263,9 @@ impl BlockDownloadManager {
 					while let Ok((hash, raw_bytes)) = self.block_rx.try_recv() {
 						self.handle_received_block(hash, &raw_bytes);
 					}
+				}
+				Some(peer) = self.disconnect_rx.recv() => {
+					self.handle_peer_disconnect(peer);
 				}
 				() = tokio::time::sleep(sleep_duration) => {
 					// Flush any pending blocks on the timer tick
@@ -392,6 +399,7 @@ impl BlockDownloadManager {
 		let mut new_entries: Vec<(Hash256, InFlightEntry, usize)> = Vec::new();
 		let mut peer_idx = 0;
 
+		let mut assigned_count: usize = 0;
 		for (height, hash) in &requestable {
 			// Advance to next peer if current one is full
 			// peer_idx < len is checked by the condition; indexing is safe
@@ -402,6 +410,8 @@ impl BlockDownloadManager {
 			if peer_idx >= available_peers.len() {
 				break;
 			}
+
+			assigned_count = assigned_count.saturating_add(1);
 
 			// available_peers[peer_idx] is valid (checked above)
 			#[allow(clippy::indexing_slicing)]
@@ -426,6 +436,15 @@ impl BlockDownloadManager {
 			{
 				*remaining -= 1;
 			}
+		}
+
+		// If peers were exhausted before all requestable items were assigned,
+		// rewind next_height so unassigned heights get re-scanned next call
+		if assigned_count < requestable.len() {
+			// requestable is sorted by height; the first unassigned item is at assigned_count
+			#[allow(clippy::indexing_slicing)] // assigned_count < len checked above
+			let first_unassigned_height = requestable[assigned_count].0;
+			self.next_height = self.next_height.min(first_unassigned_height);
 		}
 
 		if new_entries.is_empty() {
@@ -699,6 +718,34 @@ impl BlockDownloadManager {
 			warn!(error = %e, "failed to fsync undo store");
 		}
 		self.blocks_since_flush = 0;
+	}
+
+	/// Expires all in-flight requests for a disconnected peer and resets
+	/// `next_height` so those blocks are immediately re-requested from
+	/// other peers instead of waiting for the timeout scanner
+	pub fn handle_peer_disconnect(&mut self, peer: IpAddr) {
+		let mut min_height: Option<u32> = None;
+		let mut expired: u32 = 0;
+
+		self.in_flight.retain(|_hash, entry| {
+			if entry.peer == peer {
+				min_height = Some(min_height.map_or(entry.height, |h: u32| h.min(entry.height)));
+				expired = expired.saturating_add(1);
+				false
+			} else {
+				true
+			}
+		});
+
+		if let Some(min_h) = min_height {
+			debug!(
+				peer = %peer,
+				expired,
+				min_height = min_h,
+				"expired in-flight blocks for disconnected peer"
+			);
+			self.schedule_redownload(min_h);
+		}
 	}
 
 	/// Scans in-flight requests for timeouts and resets `next_height` as needed

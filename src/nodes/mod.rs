@@ -128,6 +128,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
 /// Sender half of the block forwarding channel
 type BlockSender = tokio::sync::mpsc::Sender<(Hash256, Vec<u8>)>;
 
+/// Sender half of the peer disconnect notification channel
+type DisconnectSender = tokio::sync::mpsc::UnboundedSender<IpAddr>;
+
 /// Reason why a node was banned (bans expire after `BAN_DURATION_SECS`)
 #[derive(Debug)]
 pub enum BanReason {
@@ -491,6 +494,9 @@ pub struct NodeManager {
 	/// Channel sender for forwarding raw block payloads to the download manager
 	block_sender: parking_lot::Mutex<Option<BlockSender>>,
 
+	/// Channel sender for notifying the download manager when a peer disconnects
+	disconnect_sender: parking_lot::Mutex<Option<DisconnectSender>>,
+
 	/// Cached best contiguous block height for lock-free TUI reads
 	cached_block_height: AtomicU32,
 }
@@ -527,6 +533,7 @@ impl NodeManager {
 			cached_height: AtomicU32::new(initial_height),
 			cached_tip_bits: AtomicU32::new(initial_bits),
 			block_sender: parking_lot::Mutex::new(None),
+			disconnect_sender: parking_lot::Mutex::new(None),
 			cached_block_height: AtomicU32::new(0),
 		}
 	}
@@ -534,6 +541,19 @@ impl NodeManager {
 	/// Attaches the block channel for forwarding received blocks to the download manager
 	pub fn set_block_sender(&self, sender: BlockSender) {
 		*self.block_sender.lock() = Some(sender);
+	}
+
+	/// Attaches the disconnect notification channel for the download manager
+	pub fn set_disconnect_sender(&self, sender: DisconnectSender) {
+		*self.disconnect_sender.lock() = Some(sender);
+	}
+
+	/// Notifies the download manager that a peer has disconnected so
+	/// its in-flight block requests can be immediately reassigned
+	fn notify_peer_disconnected(&self, peer: &IpAddr) {
+		if let Some(sender) = self.disconnect_sender.lock().as_ref() {
+			let _ = sender.send(*peer);
+		}
 	}
 
 	/// Returns the best contiguous block height for TUI display
@@ -1232,6 +1252,8 @@ impl NodeManager {
 
 /// Schedules a retry or marks a node as dead based on attempt count
 fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
+	node_manager.notify_peer_disconnected(address);
+
 	let next_attempt = attempt.saturating_add(1);
 	if next_attempt >= MAX_RETRY_ATTEMPTS {
 		info!("Node {} exhausted all retry attempts, marking dead", address);

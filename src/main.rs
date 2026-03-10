@@ -153,6 +153,11 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
 	node_manager.set_block_sender(block_tx);
 
+	// Create channel for peer disconnect notifications so the download
+	// manager can immediately reassign in-flight blocks
+	let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+	node_manager.set_disconnect_sender(disconnect_tx);
+
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
 		info!(count = ban_db.bans.len(), "Loaded banlist.dat");
@@ -233,7 +238,7 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		let mut manager = match tokio::task::spawn_blocking({
 			let nm = Arc::clone(&nm);
 			let bs = Arc::clone(&bs);
-			move || BlockDownloadManager::new(nm, bs, block_rx, cs)
+			move || BlockDownloadManager::new(nm, bs, block_rx, disconnect_rx, cs)
 		})
 		.await
 		{

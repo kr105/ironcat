@@ -35,6 +35,7 @@ fn setup() -> (
 	Arc<NodeManager>,
 	Arc<BlockStore>,
 	tokio::sync::mpsc::Receiver<(Hash256, Vec<u8>)>,
+	tokio::sync::mpsc::UnboundedReceiver<std::net::IpAddr>,
 	Arc<ChainState>,
 	tempfile::TempDir,
 ) {
@@ -43,13 +44,14 @@ fn setup() -> (
 	let bs = Arc::new(BlockStore::open(dir.path()).unwrap());
 	let cs = Arc::new(ChainState::open(dir.path(), u32::MAX).unwrap());
 	let (_tx, rx) = tokio::sync::mpsc::channel(32);
-	(nm, bs, rx, cs, dir)
+	let (_dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+	(nm, bs, rx, drx, cs, dir)
 }
 
 #[tokio::test]
 async fn manager_starts_at_height_one() {
-	let (nm, bs, rx, cs, _dir) = setup();
-	let mgr = BlockDownloadManager::new(nm, bs, rx, cs);
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
 	// With no headers beyond genesis and no in-flight, it should be caught up
 	// chain_height is 0 (genesis only), next_height is 1, so 1 > 0 = true
 	assert!(mgr.is_caught_up());
@@ -57,8 +59,8 @@ async fn manager_starts_at_height_one() {
 
 #[tokio::test]
 async fn timeout_scan_removes_stale_entries() {
-	let (nm, bs, rx, cs, _dir) = setup();
-	let mut mgr = BlockDownloadManager::new(nm, bs, rx, cs);
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
 
 	// Manually inject an in-flight entry with an old timestamp
 	let hash = Hash256::from_bytes([0xAA; 32]);
@@ -85,8 +87,8 @@ async fn timeout_scan_removes_stale_entries() {
 
 #[tokio::test]
 async fn timeout_scan_resets_to_min_stale_height() {
-	let (nm, bs, rx, cs, _dir) = setup();
-	let mut mgr = BlockDownloadManager::new(nm, bs, rx, cs);
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
 
 	let fake_ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
 	let old_time = Instant::now() - Duration::from_secs(120);
@@ -122,8 +124,8 @@ async fn timeout_scan_resets_to_min_stale_height() {
 
 #[tokio::test]
 async fn timeout_scan_ignores_fresh_entries() {
-	let (nm, bs, rx, cs, _dir) = setup();
-	let mut mgr = BlockDownloadManager::new(nm, bs, rx, cs);
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
 
 	let fake_ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
 	let hash = Hash256::from_bytes([0xCC; 32]);
@@ -147,8 +149,8 @@ async fn timeout_scan_ignores_fresh_entries() {
 
 #[tokio::test]
 async fn is_caught_up_false_with_in_flight() {
-	let (nm, bs, rx, cs, _dir) = setup();
-	let mut mgr = BlockDownloadManager::new(nm, bs, rx, cs);
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
 
 	let hash = Hash256::from_bytes([0xDD; 32]);
 	let fake_ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
@@ -163,4 +165,63 @@ async fn is_caught_up_false_with_in_flight() {
 	);
 
 	assert!(!mgr.is_caught_up());
+}
+
+#[tokio::test]
+async fn peer_disconnect_expires_in_flight_blocks() {
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
+
+	let peer_a: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+	let peer_b: std::net::IpAddr = "5.6.7.8".parse().unwrap();
+	let now = Instant::now();
+
+	// Two blocks from peer_a, one from peer_b
+	mgr.in_flight.insert(
+		Hash256::from_bytes([0xAA; 32]),
+		ironcat::nodes::block_download::InFlightEntry {
+			peer: peer_a,
+			requested_at: now,
+			height: 10,
+		},
+	);
+	mgr.in_flight.insert(
+		Hash256::from_bytes([0xBB; 32]),
+		ironcat::nodes::block_download::InFlightEntry {
+			peer: peer_a,
+			requested_at: now,
+			height: 5,
+		},
+	);
+	mgr.in_flight.insert(
+		Hash256::from_bytes([0xCC; 32]),
+		ironcat::nodes::block_download::InFlightEntry {
+			peer: peer_b,
+			requested_at: now,
+			height: 20,
+		},
+	);
+	mgr.next_height = 50;
+
+	mgr.handle_peer_disconnect(peer_a);
+
+	// Only peer_b's entry should remain
+	assert_eq!(mgr.in_flight.len(), 1);
+	assert!(mgr.in_flight.values().all(|e| e.peer == peer_b));
+	// next_height should be reset to min of expired heights (5)
+	assert_eq!(mgr.next_height, 5);
+}
+
+#[tokio::test]
+async fn peer_disconnect_no_in_flight_is_noop() {
+	let (nm, bs, rx, drx, cs, _dir) = setup();
+	let mut mgr = BlockDownloadManager::new(nm, bs, rx, drx, cs);
+
+	let peer: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+	mgr.next_height = 50;
+
+	mgr.handle_peer_disconnect(peer);
+
+	assert!(mgr.in_flight.is_empty());
+	assert_eq!(mgr.next_height, 50);
 }
