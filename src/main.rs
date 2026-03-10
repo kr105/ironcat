@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
 use ironcat::{
 	chainstate::ChainState,
 	cli::Args,
@@ -16,10 +22,6 @@ use ironcat::{
 	types::{block::BlockHeader, hash::Hash256},
 	ui::tui::tui_start,
 };
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Catcoin mainnet genesis block header
 ///
@@ -43,9 +45,35 @@ async fn main() -> Result<()> {
 
 	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+	// Open debug.log in append mode unless --no-logfile is set.
+	// The datadir must be created before opening the log file
+	let file_layer = if args.no_logfile {
+		None
+	} else {
+		std::fs::create_dir_all(&args.datadir).ok();
+		let log_path = args.datadir.join("debug.log");
+		match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+			Ok(file) => Some(
+				tracing_subscriber::fmt::layer()
+					.with_writer(file)
+					.with_ansi(false)
+					.with_timer(tracing_subscriber::fmt::time::uptime()),
+			),
+			Err(e) => {
+				// Subscriber is not initialized yet, write directly to stderr
+				let _ = std::io::Write::write_fmt(
+					&mut std::io::stderr(),
+					format_args!("warning: failed to open {}: {e}\n", log_path.display()),
+				);
+				None
+			}
+		}
+	};
+
 	if args.daemon {
 		tracing_subscriber::registry()
 			.with(env_filter)
+			.with(file_layer)
 			.with(
 				tracing_subscriber::fmt::layer()
 					.with_writer(std::io::stderr)
@@ -59,7 +87,11 @@ async fn main() -> Result<()> {
 		let (log_tx, log_rx) = mpsc::channel::<TuiLogEntry>(100);
 		let tui_layer = TuiLayer::new(log_tx);
 
-		tracing_subscriber::registry().with(env_filter).with(tui_layer).init();
+		tracing_subscriber::registry()
+			.with(env_filter)
+			.with(file_layer)
+			.with(tui_layer)
+			.init();
 
 		info!("ironcat v{} - Starting ...", env!("CARGO_PKG_VERSION"));
 		run_core(Some(log_rx), &args).await

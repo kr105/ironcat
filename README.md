@@ -10,6 +10,7 @@ cargo run -- --daemon                        # Daemon mode, logs to stderr
 cargo run -- --seed 10.0.0.1:9933            # Custom seed node (default: 161.129.176.92:9933)
 cargo run -- --no-dns-seed                   # Disable DNS peer discovery
 cargo run -- --datadir /path/to/data         # Custom data directory (default: ~/.ironcat)
+cargo run -- --no-logfile                    # Disable debug.log file output
 RUST_LOG=debug cargo run                     # Control log level
 cargo run -- --help                          # Show help
 ```
@@ -40,7 +41,11 @@ The default mode launches a terminal UI with node stats, a connected nodes table
 
 ## Daemon mode
 
-Use `--daemon` to run without a TUI. All logs go to stderr with timestamps. Suitable for headless servers and piping logs to a file.
+Use `--daemon` to run without a TUI. All logs go to stderr with timestamps. Suitable for headless servers.
+
+## Logging
+
+All logs are written to `debug.log` in the data directory (default `~/.ironcat/debug.log`), in addition to stderr (daemon mode) or the TUI log panel. The file is opened in append mode so logs persist across restarts. Use `--no-logfile` to disable file logging.
 
 ## Log levels
 

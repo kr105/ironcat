@@ -66,3 +66,15 @@ fn custom_port() {
 	let args = Args::parse_from(["ironcat", "--port", "8080"]);
 	assert_eq!(args.port, 8080);
 }
+
+#[test]
+fn default_logfile_enabled() {
+	let args = Args::parse_from(["ironcat"]);
+	assert!(!args.no_logfile);
+}
+
+#[test]
+fn no_logfile_flag() {
+	let args = Args::parse_from(["ironcat", "--no-logfile"]);
+	assert!(args.no_logfile);
+}

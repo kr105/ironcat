@@ -24,6 +24,10 @@ pub struct Args {
 	#[arg(long)]
 	pub no_dns_seed: bool,
 
+	/// Disable writing logs to debug.log in the data directory
+	#[arg(long)]
+	pub no_logfile: bool,
+
 	/// Data directory for persistent storage
 	#[arg(long, default_value_os_t = default_datadir())]
 	pub datadir: PathBuf,
