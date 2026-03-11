@@ -22,7 +22,7 @@ const MAX_TX_SIZE: usize = 1_000_000;
 const MAX_TX_IN_OUT: u64 = 25_000;
 
 /// A reference to a specific output of a previous transaction
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OutPoint {
 	/// Hash of the referenced transaction
 	pub txid: Hash256,

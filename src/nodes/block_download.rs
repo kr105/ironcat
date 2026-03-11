@@ -65,6 +65,8 @@ pub struct BlockDownloadManager {
 	node_manager: Arc<NodeManager>,
 	block_store: Arc<BlockStore>,
 	chainstate: Arc<ChainState>,
+	/// Shared mempool for removing confirmed transactions
+	mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>,
 	block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
 	/// Receives peer disconnect notifications for immediate in-flight expiry
 	disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
@@ -112,6 +114,7 @@ impl BlockDownloadManager {
 		block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
 		disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
 		chainstate: Arc<ChainState>,
+		mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>,
 	) -> Self {
 		let stored_hashes = match block_store.all_indexed_hashes() {
 			Ok(hashes) => hashes,
@@ -140,6 +143,7 @@ impl BlockDownloadManager {
 			node_manager,
 			block_store,
 			chainstate,
+			mempool,
 			block_rx,
 			disconnect_rx,
 			in_flight: HashMap::new(),
@@ -636,6 +640,11 @@ impl BlockDownloadManager {
 				"failed to connect block to chainstate, discarding"
 			);
 			return false;
+		}
+
+		// Remove confirmed/conflicting transactions from the mempool
+		if let Ok(mut pool) = self.mempool.try_write() {
+			pool.remove_block_txs(block);
 		}
 
 		self.store_block_data(&hash, raw_bytes, height);

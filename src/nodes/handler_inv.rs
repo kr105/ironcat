@@ -9,12 +9,15 @@ use tracing::{debug, warn};
 use super::{NodeManager, MAX_INV_KNOWN};
 use crate::network::{
 	message_getheaders::MessageGetHeaders,
-	message_inv::{InvType, MessageInv},
+	message_inv::{InvItem, InvType, MessageInv},
 	SharedTcpWriter, SharedTcpWriterExt,
 };
 use crate::types::hash::Hash256;
 
 /// Handles an incoming inv message from a peer
+///
+/// Processes block and transaction announcements. Unknown blocks trigger a
+/// getheaders request. Unknown transactions trigger a getdata request
 pub(super) async fn handle_inv(
 	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
@@ -62,28 +65,81 @@ pub(super) async fn handle_inv(
 		debug!(peer = %address, "requesting headers after block inv");
 	}
 
+	// Check announced transactions against our mempool
+	let unknown_txids: Vec<InvItem> = if let Some(mempool_arc) = node_manager.mempool() {
+		let mempool = mempool_arc.read().await;
+		inv.items()
+			.iter()
+			.filter(|item| item.inv_type == InvType::Tx && !mempool.contains(&item.hash))
+			.cloned()
+			.collect()
+	} else {
+		Vec::new()
+	};
+
+	if !unknown_txids.is_empty() {
+		let getdata = MessageInv::new(unknown_txids);
+		tcp_writer
+			.send_message("getdata", &getdata.to_bytes())
+			.await
+			.context("failed to send getdata for unknown txs")?;
+		debug!(peer = %address, "requesting unknown txs via getdata");
+	}
+
 	Ok(())
 }
 
 /// Handles an incoming getdata message from a peer
 ///
-/// Responds with notfound for all items since we have no data to serve yet.
-/// Echoes the raw payload back as notfound -- the wire format is identical,
-/// and this preserves items with unknown inv types that `from_bytes` would drop
+/// Serves transactions from the mempool when available. Items not found
+/// in the mempool are collected into a notfound response
 pub(super) async fn handle_getdata(
-	_node_manager: &Arc<NodeManager>,
+	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
 	tcp_writer: &SharedTcpWriter,
 	payload: &[u8],
 ) -> Result<()> {
-	debug!(peer = %address, payload_len = payload.len(), "received getdata, responding with notfound");
+	let inv = MessageInv::from_bytes(payload).context("failed to parse getdata message")?;
 
-	// Echo the payload verbatim: inv/getdata/notfound share the same wire format,
-	// and we have nothing to serve, so every requested item is "not found"
-	tcp_writer
-		.send_message("notfound", payload)
-		.await
-		.context("failed to send notfound")
+	debug!(peer = %address, count = inv.items().len(), "received getdata");
+
+	let mut notfound_items: Vec<InvItem> = Vec::new();
+
+	for item in inv.items() {
+		match item.inv_type {
+			InvType::Tx => {
+				if let Some(mempool_arc) = node_manager.mempool() {
+					let mempool = mempool_arc.read().await;
+					if let Some(entry) = mempool.get(&item.hash) {
+						let tx_bytes = entry.tx.to_bytes();
+						drop(mempool);
+						tcp_writer
+							.send_message("tx", &tx_bytes)
+							.await
+							.context("failed to send tx")?;
+					} else {
+						drop(mempool);
+						notfound_items.push(item.clone());
+					}
+				} else {
+					notfound_items.push(item.clone());
+				}
+			}
+			_ => {
+				notfound_items.push(item.clone());
+			}
+		}
+	}
+
+	if !notfound_items.is_empty() {
+		let notfound = MessageInv::new(notfound_items);
+		tcp_writer
+			.send_message("notfound", &notfound.to_bytes())
+			.await
+			.context("failed to send notfound")?;
+	}
+
+	Ok(())
 }
 
 /// Handles an incoming notfound message from a peer

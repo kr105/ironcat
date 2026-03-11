@@ -526,4 +526,24 @@ impl ChainState {
 
 		Ok(())
 	}
+
+	/// Looks up a single UTXO by outpoint
+	///
+	/// Returns `None` if the outpoint is not in the UTXO set. Used by
+	/// the mempool to validate transaction inputs and calculate fees
+	pub fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<Coin>> {
+		let key = outpoint_to_key(outpoint);
+		let txn = self.db.begin_read().context("failed to begin read txn for get_utxo")?;
+		let table = txn
+			.open_table(UTXO_SET)
+			.context("failed to open utxos table for get_utxo")?;
+
+		match table.get(&key)? {
+			Some(guard) => {
+				let coin = Coin::from_bytes(guard.value()).context("failed to deserialize utxo coin")?;
+				Ok(Some(coin))
+			}
+			None => Ok(None),
+		}
+	}
 }

@@ -6,6 +6,7 @@ mod handler_block;
 mod handler_headers;
 mod handler_inv;
 mod handler_ping;
+mod handler_tx;
 mod handler_verack;
 mod handler_version;
 
@@ -347,6 +348,8 @@ pub struct NodeSnapshot {
 	pub version: u32,
 	/// User agent string from version message
 	pub user_agent: String,
+	/// Unix timestamp of last message received from this peer
+	pub last_seen: u64,
 }
 
 /// Represents a node in the Catcoin network
@@ -499,6 +502,12 @@ pub struct NodeManager {
 
 	/// Cached best contiguous block height for lock-free TUI reads
 	cached_block_height: AtomicU32,
+
+	/// Shared mempool for transaction relay
+	mempool: parking_lot::Mutex<Option<Arc<tokio::sync::RwLock<crate::mempool::Mempool>>>>,
+
+	/// Shared chainstate for UTXO lookups (needed by tx handler)
+	chainstate: parking_lot::Mutex<Option<Arc<crate::chainstate::ChainState>>>,
 }
 
 impl NodeManager {
@@ -535,6 +544,8 @@ impl NodeManager {
 			block_sender: parking_lot::Mutex::new(None),
 			disconnect_sender: parking_lot::Mutex::new(None),
 			cached_block_height: AtomicU32::new(0),
+			mempool: parking_lot::Mutex::new(None),
+			chainstate: parking_lot::Mutex::new(None),
 		}
 	}
 
@@ -546,6 +557,26 @@ impl NodeManager {
 	/// Attaches the disconnect notification channel for the download manager
 	pub fn set_disconnect_sender(&self, sender: DisconnectSender) {
 		*self.disconnect_sender.lock() = Some(sender);
+	}
+
+	/// Attaches the shared mempool for transaction relay and serving
+	pub fn set_mempool(&self, mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>) {
+		*self.mempool.lock() = Some(mempool);
+	}
+
+	/// Returns the shared mempool, or `None` if not yet attached
+	pub fn mempool(&self) -> Option<Arc<tokio::sync::RwLock<crate::mempool::Mempool>>> {
+		self.mempool.lock().as_ref().map(Arc::clone)
+	}
+
+	/// Attaches the shared chainstate for UTXO lookups
+	pub fn set_chainstate(&self, chainstate: Arc<crate::chainstate::ChainState>) {
+		*self.chainstate.lock() = Some(chainstate);
+	}
+
+	/// Returns the shared chainstate, or `None` if not yet attached
+	pub fn chainstate(&self) -> Option<Arc<crate::chainstate::ChainState>> {
+		self.chainstate.lock().as_ref().map(Arc::clone)
 	}
 
 	/// Notifies the download manager that a peer has disconnected so
@@ -810,6 +841,7 @@ impl NodeManager {
 					state_label: NodeStateLabel::from_state(&node.state),
 					version: node.version,
 					user_agent: node.user_agent.clone(),
+					last_seen: node.last_seen,
 				}
 			})
 			.collect();
@@ -999,6 +1031,18 @@ impl NodeManager {
 				}
 			})
 			.collect()
+	}
+
+	/// Returns true if a peer already knows about an inventory hash
+	pub fn peer_knows_inv(&self, peer: &IpAddr, hash: &Hash256) -> bool {
+		self.nodes.get(peer).is_none_or(|n| n.inv_known.contains(hash))
+	}
+
+	/// Marks an inventory hash as known to a peer
+	pub fn mark_peer_inv_known(&self, peer: &IpAddr, hash: Hash256) {
+		if let Some(mut node) = self.nodes.get_mut(peer) {
+			node.inv_known.insert(hash);
+		}
 	}
 
 	/// Records a peer's report of our external IP address
@@ -1510,6 +1554,25 @@ async fn parse_incoming_message(
 			Ok(())
 		}
 		NetworkCommand::Block => handler_block::handle_block(node_manager, address, &message.payload),
+		NetworkCommand::Tx => {
+			let Some(mempool) = node_manager.mempool() else {
+				debug!(peer = %address, "received tx but mempool not yet attached, ignoring");
+				return Ok(());
+			};
+			let Some(chainstate) = node_manager.chainstate() else {
+				debug!(peer = %address, "received tx but chainstate not yet attached, ignoring");
+				return Ok(());
+			};
+			handler_tx::handle_tx(
+				node_manager,
+				address,
+				tcp_writer,
+				&message.payload,
+				&mempool,
+				&chainstate,
+			)
+			.await
+		}
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())

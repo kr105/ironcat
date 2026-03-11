@@ -5,6 +5,7 @@ pub mod cli;
 pub mod difficulty;
 pub mod dns;
 pub mod headers;
+pub mod mempool;
 pub mod network;
 pub mod nodes;
 pub mod pow;

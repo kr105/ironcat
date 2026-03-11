@@ -13,7 +13,8 @@ use ironcat::{
 	cli::Args,
 	difficulty::ConsensusParams,
 	dns,
-	network::listening_start,
+	mempool::Mempool,
+	network::{listening_start, SharedTcpWriterExt},
 	nodes::{block_download::BlockDownloadManager, NodeManager},
 	storage::{
 		self, block_store::BlockStore, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore,
@@ -120,10 +121,15 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	// Create NodeManager without backend first so the TUI can start immediately
 	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER, ConsensusParams::mainnet()));
 
+	// Create mempool early so the TUI can display it from the start
+	let mempool = Arc::new(tokio::sync::RwLock::new(Mempool::new()));
+	node_manager.set_mempool(Arc::clone(&mempool));
+
 	// Spawn TUI before any heavy I/O so loading progress is visible
 	let ui_handle = tui_rx.map(|log_rx| {
 		let nm = Arc::clone(&node_manager);
-		tokio::task::spawn_blocking(move || tui_start(nm, log_rx))
+		let mp = Arc::clone(&mempool);
+		tokio::task::spawn_blocking(move || tui_start(nm, log_rx, mp))
 	});
 
 	// Load headers from backend (slow: reads + hashes all stored headers)
@@ -148,6 +154,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let chainstate = Arc::new(
 		ChainState::open(&args.datadir, consensus.last_checkpoint_height()).context("failed to open chainstate")?,
 	);
+
+	// Wire chainstate into the node manager for tx validation
+	node_manager.set_chainstate(Arc::clone(&chainstate));
 
 	// Create channel for forwarding received blocks to the download manager
 	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
@@ -234,11 +243,12 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let nm = Arc::clone(&node_manager);
 	let bs = Arc::clone(&block_store);
 	let cs = Arc::clone(&chainstate);
+	let mp = Arc::clone(&mempool);
 	let download_handle = tokio::spawn(async move {
 		let mut manager = match tokio::task::spawn_blocking({
 			let nm = Arc::clone(&nm);
 			let bs = Arc::clone(&bs);
-			move || BlockDownloadManager::new(nm, bs, block_rx, disconnect_rx, cs)
+			move || BlockDownloadManager::new(nm, bs, block_rx, disconnect_rx, cs, mp)
 		})
 		.await
 		{
@@ -249,6 +259,48 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 			}
 		};
 		manager.run().await;
+	});
+
+	// Spawn tx relay task that announces new mempool txs to peers
+	let relay_nm = Arc::clone(&node_manager);
+	let relay_mempool = Arc::clone(&mempool);
+	let relay_handle = tokio::spawn(async move {
+		let mut rx = relay_mempool.read().await.subscribe();
+		loop {
+			match rx.recv().await {
+				Ok(txid) => {
+					let inv_item = ironcat::network::message_inv::InvItem {
+						inv_type: ironcat::network::message_inv::InvType::Tx,
+						hash: txid,
+					};
+					let inv_msg = ironcat::network::message_inv::MessageInv::new(vec![inv_item]);
+					let inv_bytes = inv_msg.to_bytes();
+
+					let writers = relay_nm.get_connected_writers();
+					let mut sent_to = Vec::new();
+
+					for (addr, writer) in &writers {
+						if relay_nm.peer_knows_inv(addr, &txid) {
+							continue;
+						}
+
+						if let Err(e) = writer.send_message("inv", &inv_bytes).await {
+							tracing::debug!(peer = %addr, error = %e, "failed to relay tx inv");
+						} else {
+							sent_to.push(addr);
+						}
+					}
+
+					for addr in &sent_to {
+						relay_nm.mark_peer_inv_known(addr, txid);
+					}
+				}
+				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+					tracing::warn!(skipped = n, "tx relay lagged, some txs not announced");
+				}
+				Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+			}
+		}
 	});
 
 	tokio::select! {
@@ -269,6 +321,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = download_handle => {
 			info!("Download manager ended, shutting down");
+		}
+		_ = relay_handle => {
+			info!("Tx relay task ended, shutting down");
 		}
 		() = async {
 			match ui_handle {
