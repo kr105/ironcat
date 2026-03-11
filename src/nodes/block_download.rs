@@ -642,6 +642,11 @@ impl BlockDownloadManager {
 			return false;
 		}
 
+		// Record block connection for TUI display
+		#[allow(clippy::cast_possible_truncation)] // transaction count won't exceed u32
+		self.node_manager
+			.record_block_connected(block.transactions.len() as u32);
+
 		// Remove confirmed/conflicting transactions from the mempool
 		if let Ok(mut pool) = self.mempool.try_write() {
 			pool.remove_block_txs(block);

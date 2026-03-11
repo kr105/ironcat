@@ -47,9 +47,10 @@ impl RedbHeaderStore {
 impl HeaderStoreBackend for RedbHeaderStore {
 	fn persist_header(&self, header: &BlockHeader, height: u32) -> Result<()> {
 		let bytes = header.to_bytes();
-		// to_bytes always returns exactly HEADER_SIZE bytes
-		#[allow(clippy::unwrap_used)] // BlockHeader::to_bytes always produces exactly 80 bytes
-		let arr: &[u8; HEADER_SIZE] = bytes.as_slice().try_into().unwrap();
+		let arr: &[u8; HEADER_SIZE] = bytes
+			.as_slice()
+			.try_into()
+			.context("header serialization produced wrong size")?;
 
 		let txn = self.db.begin_write().context("failed to begin write txn")?;
 		{
@@ -71,8 +72,10 @@ impl HeaderStoreBackend for RedbHeaderStore {
 
 			for (header, height) in headers {
 				let bytes = header.to_bytes();
-				#[allow(clippy::unwrap_used)] // BlockHeader::to_bytes always produces exactly 80 bytes
-				let arr: &[u8; HEADER_SIZE] = bytes.as_slice().try_into().unwrap();
+				let arr: &[u8; HEADER_SIZE] = bytes
+					.as_slice()
+					.try_into()
+					.context("header serialization produced wrong size")?;
 				table.insert(*height, arr).context("failed to insert header in batch")?;
 			}
 		}

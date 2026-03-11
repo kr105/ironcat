@@ -86,7 +86,14 @@ impl ConsensusParams {
 	/// Returns the consensus parameters for Catcoin mainnet
 	pub fn mainnet() -> Self {
 		Self {
-			pow_limit: compact::compact_to_target(0x1e0f_fff0).0,
+			// Reference: uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+			// = 2^236 - 1 (236 one-bits). Genesis nBits 0x1e0ffff0 is slightly below
+			// this; using the genesis compact would produce 0x1e0ffff0 instead of
+			// 0x1e0fffff at minimum-difficulty retarget boundaries
+			#[allow(clippy::arithmetic_side_effects)] // constant computation, 2^236 - 1 cannot overflow U256
+			pow_limit: {
+				(U256::one() << 236) - U256::one()
+			},
 			pow_target_spacing: 600,
 			pow_target_timespan_v1: 1_209_600,
 			pow_target_timespan_v2: 21_600,

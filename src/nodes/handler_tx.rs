@@ -32,9 +32,7 @@ pub(super) async fn handle_tx(
 	let txid = tx.txid();
 
 	// Mark as known so we don't re-request this tx from this peer
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		node.inv_known.insert(txid);
-	}
+	node_manager.mark_peer_inv_known(address, txid);
 
 	{
 		let mut pool = mempool.write().await;

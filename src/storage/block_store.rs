@@ -236,24 +236,33 @@ impl BlockStore {
 
 		// Fsync the flat file first -- if we crash after this but before the
 		// index commit, the blocks are on disk but unindexed (will be re-downloaded)
-		{
-			let guard = self.current_file.lock();
-			guard.1.sync_all().context("failed to fsync flat file during flush")?;
-		}
-
-		// Batch commit all pending entries in a single redb transaction
-		let txn = self.db.begin_write().context("failed to begin write txn for flush")?;
-		{
-			let mut table = txn
-				.open_table(BLOCK_INDEX)
-				.context("failed to open block_index table for flush")?;
-			for entry in &entries {
-				table
-					.insert(&entry.hash, (entry.file_number, entry.offset, entry.size))
-					.context("failed to insert block index entry during flush")?;
+		let result = (|| -> Result<()> {
+			{
+				let guard = self.current_file.lock();
+				guard.1.sync_all().context("failed to fsync flat file during flush")?;
 			}
+
+			// Batch commit all pending entries in a single redb transaction
+			let txn = self.db.begin_write().context("failed to begin write txn for flush")?;
+			{
+				let mut table = txn
+					.open_table(BLOCK_INDEX)
+					.context("failed to open block_index table for flush")?;
+				for entry in &entries {
+					table
+						.insert(&entry.hash, (entry.file_number, entry.offset, entry.size))
+						.context("failed to insert block index entry during flush")?;
+				}
+			}
+			txn.commit().context("failed to commit flush")?;
+			Ok(())
+		})();
+
+		if let Err(e) = result {
+			// Restore entries so they can be retried on the next flush
+			self.pending.lock().extend(entries);
+			return Err(e);
 		}
-		txn.commit().context("failed to commit flush")?;
 
 		debug!(count, "Flushed block index entries");
 		Ok(())

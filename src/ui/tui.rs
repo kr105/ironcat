@@ -39,10 +39,6 @@ struct TuiState {
 	headers_per_sec: f64,
 	/// Currently active tab index (0-3)
 	active_tab: usize,
-	/// Timestamp when the last block was processed
-	last_block_time: Option<std::time::Instant>,
-	/// Transaction count in the last processed block
-	last_block_tx_count: Option<usize>,
 	/// Mempool statistics (updated when wired in)
 	mempool_stats: MempoolStats,
 	/// Recent mempool transactions (updated when wired in)
@@ -88,8 +84,6 @@ fn run(
 		prev_time: std::time::Instant::now(),
 		headers_per_sec: 0.0,
 		active_tab: 0,
-		last_block_time: None,
-		last_block_tx_count: None,
 		mempool_stats: MempoolStats::default(),
 		mempool_recent: Vec::new(),
 	};
@@ -187,7 +181,8 @@ fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<Tui
 	#[allow(clippy::indexing_slicing)] // layout produces exactly 3 elements
 	match tui_state.active_tab {
 		0 => {
-			let last_block_secs = tui_state.last_block_time.map(|t| t.elapsed().as_secs());
+			let last_block_secs = node_manager.last_block_elapsed().map(|d| d.as_secs());
+			let last_block_tx_count = node_manager.last_block_tx_count();
 			let data = tab_overview::OverviewData {
 				stats: &stats,
 				nodes: &nodes,
@@ -196,7 +191,11 @@ fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<Tui
 				block_height,
 				mempool_stats: &tui_state.mempool_stats,
 				last_block_secs,
-				last_block_tx_count: tui_state.last_block_tx_count,
+				last_block_tx_count: if last_block_tx_count > 0 {
+					Some(last_block_tx_count as usize)
+				} else {
+					None
+				},
 			};
 			tab_overview::render(frame, main_chunks[1], &data);
 		}

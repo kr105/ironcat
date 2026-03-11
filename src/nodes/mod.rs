@@ -508,6 +508,12 @@ pub struct NodeManager {
 
 	/// Shared chainstate for UTXO lookups (needed by tx handler)
 	chainstate: parking_lot::Mutex<Option<Arc<crate::chainstate::ChainState>>>,
+
+	/// Timestamp of the last connected block (for TUI display)
+	last_block_time: parking_lot::Mutex<Option<Instant>>,
+
+	/// Transaction count in the last connected block (for TUI display)
+	last_block_tx_count: AtomicU32,
 }
 
 impl NodeManager {
@@ -546,6 +552,8 @@ impl NodeManager {
 			cached_block_height: AtomicU32::new(0),
 			mempool: parking_lot::Mutex::new(None),
 			chainstate: parking_lot::Mutex::new(None),
+			last_block_time: parking_lot::Mutex::new(None),
+			last_block_tx_count: AtomicU32::new(0),
 		}
 	}
 
@@ -595,6 +603,22 @@ impl NodeManager {
 	/// Updates the cached block height from the download manager
 	pub fn set_block_height(&self, height: u32) {
 		self.cached_block_height.store(height, Ordering::Relaxed);
+	}
+
+	/// Records that a block was just connected, for TUI display
+	pub fn record_block_connected(&self, tx_count: u32) {
+		*self.last_block_time.lock() = Some(Instant::now());
+		self.last_block_tx_count.store(tx_count, Ordering::Relaxed);
+	}
+
+	/// Returns the time elapsed since the last block was connected
+	pub fn last_block_elapsed(&self) -> Option<std::time::Duration> {
+		self.last_block_time.lock().map(|t| t.elapsed())
+	}
+
+	/// Returns the transaction count of the last connected block
+	pub fn last_block_tx_count(&self) -> u32 {
+		self.last_block_tx_count.load(Ordering::Relaxed)
 	}
 
 	/// Inserts a new node into the manager if it doesn't already exist
@@ -1041,6 +1065,9 @@ impl NodeManager {
 	/// Marks an inventory hash as known to a peer
 	pub fn mark_peer_inv_known(&self, peer: &IpAddr, hash: Hash256) {
 		if let Some(mut node) = self.nodes.get_mut(peer) {
+			if node.inv_known.len() >= MAX_INV_KNOWN {
+				node.inv_known.clear();
+			}
 			node.inv_known.insert(hash);
 		}
 	}

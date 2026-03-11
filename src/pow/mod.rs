@@ -72,6 +72,7 @@ pub fn check_proof_of_work(header: &BlockHeader) -> bool {
 }
 
 #[cfg(test)]
+// Tests use unwrap for brevity since panics are the intended failure mode
 #[allow(clippy::unwrap_used)]
 mod tests {
 	use super::*;

@@ -568,7 +568,7 @@ fn parse_der_lenient(der: &[u8]) -> Option<Signature> {
 }
 
 /// Reads a DER length field, handling both short and long forms
-#[allow(clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects)] // pos is bounded by data.len() via .get() checks
 fn read_der_len(data: &[u8], pos: &mut usize) -> Option<usize> {
 	let b = *data.get(*pos)?;
 	*pos += 1;
@@ -631,6 +631,7 @@ fn scalar_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 #[cfg(test)]
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 mod tests {
 	use super::*;

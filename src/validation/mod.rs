@@ -129,50 +129,69 @@ pub fn check_block_context(block: &Block, height: u32, median_time_past: u32, ad
 
 /// Validates BIP34 coinbase height encoding
 ///
-/// The coinbase scriptSig must start with the block height serialized as
-/// a `CScript` number: a push opcode (length byte) followed by the height
-/// in little-endian minimal encoding
+/// Builds the expected `CScript` serialization of the block height and checks
+/// that the coinbase scriptSig starts with those exact bytes. This matches the
+/// reference client's approach (`CScript() << nHeight` + prefix comparison),
+/// which implicitly enforces minimal encoding and correct sign-bit handling
 fn check_bip34_height(coinbase: &crate::types::transaction::Transaction, expected_height: u32) -> Result<()> {
 	#[allow(clippy::indexing_slicing)] // coinbase has exactly 1 input (validated by is_coinbase)
 	let script = &coinbase.vin[0].script_sig;
 
-	if script.is_empty() {
-		bail!("BIP34: coinbase scriptSig is empty");
-	}
+	// Build the expected CScript encoding of the height, matching CScript::push_int64
+	let expected = encode_script_height(expected_height);
 
-	// First byte is the push opcode (number of data bytes to follow)
-	#[allow(clippy::indexing_slicing)] // script is non-empty (checked above)
-	let push_len = script[0] as usize;
-
-	#[allow(clippy::arithmetic_side_effects)] // push_len bounded by u8, +1 won't overflow usize
-	if script.len() < push_len + 1 {
+	if script.len() < expected.len() {
 		bail!("BIP34: coinbase scriptSig too short for height encoding");
 	}
 
-	// CScriptNum limits height to 4 bytes (same as reference client nMaxNumSize=4)
-	if push_len > 4 {
-		bail!("BIP34: height encoding too long ({push_len} bytes, max 4)");
-	}
-
-	// Decode the height from the pushed bytes (little-endian)
-	let mut height: u32 = 0;
-	#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-	for (i, &byte) in script[1..=push_len].iter().enumerate() {
-		// i < push_len <= 4, so 8*i <= 24 which fits in u32 shift
-		#[allow(clippy::cast_possible_truncation)]
-		{
-			height |= u32::from(byte) << (8 * i as u32);
-		}
-	}
-
-	if height != expected_height {
-		warn!(
-			expected = expected_height,
-			got = height,
-			"BIP34 coinbase height mismatch"
-		);
-		bail!("BIP34: coinbase encodes height {height}, expected {expected_height}");
+	#[allow(clippy::indexing_slicing)] // length checked above
+	if script[..expected.len()] != expected[..] {
+		warn!(expected = expected_height, "BIP34 coinbase height mismatch");
+		bail!("BIP34: coinbase does not start with expected height encoding for {expected_height}");
 	}
 
 	Ok(())
+}
+
+/// Encodes a block height as a `CScript` push, matching `CScript() << nHeight`
+///
+/// - Heights 0: `[OP_0]` (0x00)
+/// - Heights 1-16: `[OP_N]` (0x51-0x60)
+/// - Heights > 16: `[push_len, ...CScriptNum minimal LE bytes]`
+#[allow(clippy::arithmetic_side_effects)] // height values are bounded, shifts are safe
+fn encode_script_height(height: u32) -> Vec<u8> {
+	if height == 0 {
+		return vec![0x00]; // OP_0
+	}
+
+	if height <= 16 {
+		// OP_1 through OP_16 (0x51 = OP_1 - 1 + 1)
+		#[allow(clippy::cast_possible_truncation)] // height <= 16
+		return vec![0x50 + height as u8];
+	}
+
+	// CScriptNum::serialize: minimal signed little-endian encoding
+	let mut data = Vec::with_capacity(5);
+	let mut val = height;
+	while val > 0 {
+		#[allow(clippy::cast_possible_truncation)] // masking to u8
+		data.push((val & 0xff) as u8);
+		val >>= 8;
+	}
+
+	// If the MSB of the last byte has the sign bit set, append 0x00 so the
+	// value is interpreted as positive (CScriptNum sign-bit convention)
+	if let Some(&last) = data.last() {
+		if last & 0x80 != 0 {
+			data.push(0x00);
+		}
+	}
+
+	// Prepend the push length byte
+	#[allow(clippy::cast_possible_truncation)] // data.len() <= 5
+	let len_byte = data.len() as u8;
+	let mut result = Vec::with_capacity(data.len() + 1);
+	result.push(len_byte);
+	result.extend_from_slice(&data);
+	result
 }
