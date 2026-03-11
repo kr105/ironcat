@@ -155,7 +155,8 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		ChainState::open(&args.datadir, consensus.last_checkpoint_height()).context("failed to open chainstate")?,
 	);
 
-	// Wire chainstate into the node manager for tx validation
+	// Wire block store and chainstate into the node manager
+	node_manager.set_block_store(Arc::clone(&block_store));
 	node_manager.set_chainstate(Arc::clone(&chainstate));
 
 	// Create channel for forwarding received blocks to the download manager
@@ -294,6 +295,16 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 					for addr in &sent_to {
 						relay_nm.mark_peer_inv_known(addr, txid);
 					}
+
+					let total = writers.len();
+					let skipped = total.saturating_sub(sent_to.len());
+					tracing::debug!(
+						%txid,
+						peers_total = total,
+						peers_relayed = sent_to.len(),
+						peers_skipped = skipped,
+						"relayed tx inv to peers"
+					);
 				}
 				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 					tracing::warn!(skipped = n, "tx relay lagged, some txs not announced");

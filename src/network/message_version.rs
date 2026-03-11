@@ -38,7 +38,7 @@ impl MessageVersion {
 	/// Creates a new version message for the given receiving address and nonce
 	pub fn new(addr_recv: NetworkAddress, nonce: u64) -> Self {
 		let mut services = ServiceMask::empty();
-		services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
+		services.set(ServiceMask::NODE_NETWORK, true);
 
 		// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
 		#[allow(clippy::cast_possible_wrap)]

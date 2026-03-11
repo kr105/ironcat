@@ -83,7 +83,7 @@ impl NetworkAddress {
 	/// Creates a new `NetworkAddress` with the given IP address and port
 	pub fn new(address: IpAddr, port: u16) -> Self {
 		let mut services = ServiceMask::empty();
-		services.set(ServiceMask::NODE_NETWORK_LIMITED, true);
+		services.set(ServiceMask::NODE_NETWORK, true);
 
 		Self {
 			services,

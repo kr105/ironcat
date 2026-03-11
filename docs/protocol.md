@@ -12,7 +12,7 @@ Catcoin is a Litecoin fork. The wire protocol is nearly identical, with differen
 | Max message size | 2,000,000 bytes |
 | Max addr entries | 1000 per message |
 | Max varstr length | 4096 bytes |
-| User agent | `/Ironcat:0.0.7/` |
+| User agent | `/Ironcat:0.0.8/` |
 
 ## Message Framing
 
@@ -99,7 +99,7 @@ Bitfield (u64 LE):
 | 6 | NODE_COMPACT_FILTERS | 64 | Compact block filters (BIP157) |
 | 10 | NODE_NETWORK_LIMITED | 1024 | Pruned node, limited blocks |
 
-Ironcat advertises `NODE_NETWORK_LIMITED` (1024). Unknown bits from remote peers are silently dropped via `from_bits_truncate`.
+Ironcat advertises `NODE_NETWORK` (1). Unknown bits from remote peers are silently dropped via `from_bits_truncate`.
 
 ## Messages
 
@@ -114,7 +114,7 @@ Sent as the first message after TCP connect. Both sides must exchange version me
 [26] addr_recv      - NetworkAddress of the receiving node
 [26] addr_from      - NetworkAddress placeholder (26 zero bytes)
 [8] nonce           - Random u64 LE, used for self-connection detection
-[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.7/"
+[var] user_agent    - VarStr, e.g. "/Ironcat:0.0.8/"
 [4] start_height    - Last known block height (i32 LE)
 [1] relay           - BIP37 relay flag (0x00 or 0x01)
 ```
@@ -212,7 +212,7 @@ On receipt, Ironcat records the hashes in the peer's `inv_known` set (cleared wh
 
 Requests specific data from a peer. Same wire format as inv.
 
-On receipt, Ironcat responds with notfound for all requested items (block serving is not yet implemented). Ironcat sends getdata with `MSG_BLOCK` items to request blocks during block download.
+On receipt, Ironcat serves `MSG_BLOCK` items from the block store (flat files indexed by redb) and `MSG_TX` items from the mempool. Items not found are collected into a single notfound response. Ironcat sends getdata with `MSG_BLOCK` items to request blocks during block download.
 
 ### notfound
 

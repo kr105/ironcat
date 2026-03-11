@@ -509,6 +509,9 @@ pub struct NodeManager {
 	/// Shared chainstate for UTXO lookups (needed by tx handler)
 	chainstate: parking_lot::Mutex<Option<Arc<crate::chainstate::ChainState>>>,
 
+	/// Shared block store for serving blocks to peers
+	block_store: parking_lot::Mutex<Option<Arc<crate::storage::block_store::BlockStore>>>,
+
 	/// Timestamp of the last connected block (for TUI display)
 	last_block_time: parking_lot::Mutex<Option<Instant>>,
 
@@ -552,6 +555,7 @@ impl NodeManager {
 			cached_block_height: AtomicU32::new(0),
 			mempool: parking_lot::Mutex::new(None),
 			chainstate: parking_lot::Mutex::new(None),
+			block_store: parking_lot::Mutex::new(None),
 			last_block_time: parking_lot::Mutex::new(None),
 			last_block_tx_count: AtomicU32::new(0),
 		}
@@ -585,6 +589,16 @@ impl NodeManager {
 	/// Returns the shared chainstate, or `None` if not yet attached
 	pub fn chainstate(&self) -> Option<Arc<crate::chainstate::ChainState>> {
 		self.chainstate.lock().as_ref().map(Arc::clone)
+	}
+
+	/// Attaches the shared block store for serving blocks to peers
+	pub fn set_block_store(&self, store: Arc<crate::storage::block_store::BlockStore>) {
+		*self.block_store.lock() = Some(store);
+	}
+
+	/// Returns the shared block store, or `None` if not yet attached
+	pub fn block_store(&self) -> Option<Arc<crate::storage::block_store::BlockStore>> {
+		self.block_store.lock().as_ref().map(Arc::clone)
 	}
 
 	/// Notifies the download manager that a peer has disconnected so
@@ -2342,5 +2356,20 @@ mod tests {
 
 		drop(guard);
 		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 0);
+	}
+
+	#[test]
+	fn block_store_none_by_default() {
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+		assert!(nm.block_store().is_none());
+	}
+
+	#[test]
+	fn block_store_set_and_get() {
+		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+		let dir = tempfile::tempdir().unwrap();
+		let store = Arc::new(crate::storage::block_store::BlockStore::open(dir.path()).unwrap());
+		nm.set_block_store(Arc::clone(&store));
+		assert!(nm.block_store().is_some());
 	}
 }
