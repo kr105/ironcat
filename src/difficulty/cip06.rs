@@ -81,7 +81,7 @@ pub fn get_next_work(height: u32, chain: &impl ChainLookup, params: &ConsensusPa
 		let (target, _, _) = compact_to_target(block_bits);
 		#[allow(clippy::cast_sign_loss)] // n and k are positive
 		{
-			avg_target += target / U256::from(n as u64) / U256::from(k as u64);
+			avg_target += target / U256::from((n * k) as u64);
 		}
 	}
 

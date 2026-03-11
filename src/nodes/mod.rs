@@ -1035,7 +1035,7 @@ impl NodeManager {
 
 	/// Returns true if a peer already knows about an inventory hash
 	pub fn peer_knows_inv(&self, peer: &IpAddr, hash: &Hash256) -> bool {
-		self.nodes.get(peer).is_none_or(|n| n.inv_known.contains(hash))
+		self.nodes.get(peer).is_some_and(|n| n.inv_known.contains(hash))
 	}
 
 	/// Marks an inventory hash as known to a peer

@@ -68,37 +68,84 @@ impl SigHashType {
 /// Removes all occurrences of a serialized push of `data` from a script
 ///
 /// This implements Bitcoin's `FindAndDelete` for the legacy sighash algorithm.
-/// The target pattern is the data serialized as a script push operation:
-/// for data <= 75 bytes, this is `[len_byte] [data...]`
+/// The target pattern is the data serialized as a script push operation.
+/// Handles direct push (len <= 75), PUSHDATA1, PUSHDATA2, and PUSHDATA4
+/// encodings as raw byte subsequences, matching Bitcoin Core behavior
 // Pattern matching and memcpy with indices guarded by length checks
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn find_and_delete(script: &[u8], data: &[u8]) -> Vec<u8> {
-	// Only handle direct-push encoding (data.len() <= 75). DER-encoded
-	// ECDSA sigs max out at 73 bytes (incl hashtype), so PUSHDATA1/2/4
-	// encodings never appear in practice for signature data
-	if data.is_empty() || data.len() > 75 {
+	if data.is_empty() {
 		return script.to_vec();
 	}
 
-	// Build the push pattern: [len] [data...]
-	let pattern_len = 1 + data.len();
-	let mut pattern = Vec::with_capacity(pattern_len);
-	#[allow(clippy::cast_possible_truncation)] // length checked <= 75
-	pattern.push(data.len() as u8);
-	pattern.extend_from_slice(data);
+	// Build all possible push encodings for this data
+	let patterns = build_push_patterns(data);
 
 	let mut result = Vec::with_capacity(script.len());
 	let mut i = 0;
-	while i < script.len() {
-		if i + pattern_len <= script.len() && script[i..i + pattern_len] == pattern[..] {
-			// Skip this occurrence
-			i += pattern_len;
-		} else {
-			result.push(script[i]);
-			i += 1;
+	'outer: while i < script.len() {
+		for pattern in &patterns {
+			if i + pattern.len() <= script.len() && script[i..i + pattern.len()] == pattern[..] {
+				// Skip this occurrence
+				i += pattern.len();
+				continue 'outer;
+			}
 		}
+		result.push(script[i]);
+		i += 1;
 	}
 	result
+}
+
+/// Builds all valid push-encoding patterns for the given data
+///
+/// Returns patterns for each encoding that can represent this data length:
+/// - Direct push (1-75 bytes): `[len] [data]`
+/// - PUSHDATA1 (1-255 bytes): `[0x4c] [len_u8] [data]`
+/// - PUSHDATA2 (1-65535 bytes): `[0x4d] [len_u16_le] [data]`
+/// - PUSHDATA4 (any size): `[0x4e] [len_u32_le] [data]`
+#[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)] // lengths are checked against encoding limits; capacity additions are small constants + bounded len
+fn build_push_patterns(data: &[u8]) -> Vec<Vec<u8>> {
+	let len = data.len();
+	let mut patterns = Vec::with_capacity(4);
+
+	// Direct push: len 1..=75
+	if len <= 75 {
+		let mut p = Vec::with_capacity(1 + len);
+		p.push(len as u8);
+		p.extend_from_slice(data);
+		patterns.push(p);
+	}
+
+	// PUSHDATA1: len 0..=255
+	if len <= 255 {
+		let mut p = Vec::with_capacity(2 + len);
+		p.push(0x4c); // OP_PUSHDATA1
+		p.push(len as u8);
+		p.extend_from_slice(data);
+		patterns.push(p);
+	}
+
+	// PUSHDATA2: len 0..=65535
+	if len <= 65535 {
+		let mut p = Vec::with_capacity(3 + len);
+		p.push(0x4d); // OP_PUSHDATA2
+		p.extend_from_slice(&(len as u16).to_le_bytes());
+		p.extend_from_slice(data);
+		patterns.push(p);
+	}
+
+	// PUSHDATA4: any length
+	{
+		let mut p = Vec::with_capacity(5 + len);
+		p.push(0x4e); // OP_PUSHDATA4
+		#[allow(clippy::cast_possible_truncation)] // script data can't exceed u32::MAX
+		p.extend_from_slice(&(len as u32).to_le_bytes());
+		p.extend_from_slice(data);
+		patterns.push(p);
+	}
+
+	patterns
 }
 
 /// Removes `OP_CODESEPARATOR` opcodes from a script

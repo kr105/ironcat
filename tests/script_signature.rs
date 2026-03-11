@@ -365,13 +365,26 @@ fn find_and_delete_noop_for_empty_data() {
 }
 
 #[test]
-fn find_and_delete_noop_above_75_bytes() {
-	// Data > 75 bytes should be returned unchanged (only direct push handled)
+fn find_and_delete_removes_pushdata1() {
+	// Data > 75 bytes uses PUSHDATA1 encoding and should be removed
 	let data = vec![0xaa; 76];
 	let mut script = vec![0x4c, 76]; // PUSHDATA1 + length
 	script.extend_from_slice(&data);
 	let result = find_and_delete(&script, &data);
-	assert_eq!(result, script);
+	assert!(result.is_empty());
+}
+
+#[test]
+fn find_and_delete_removes_pushdata1_with_surrounding() {
+	// PUSHDATA1-encoded data surrounded by other opcodes
+	let data = vec![0xbb; 80];
+	let mut script = vec![0x76]; // OP_DUP before
+	script.push(0x4c); // PUSHDATA1
+	script.push(80);
+	script.extend_from_slice(&data);
+	script.push(0xa9); // OP_HASH160 after
+	let result = find_and_delete(&script, &data);
+	assert_eq!(result, vec![0x76, 0xa9]);
 }
 
 #[test]
