@@ -8,8 +8,8 @@
 )]
 
 use ironcat::script::signature::{
-	check_low_s, check_pubkey_encoding, check_signature_encoding, find_and_delete, signature_hash, verify_ecdsa,
-	SigHashType,
+	SigHashType, check_low_s, check_pubkey_encoding, check_signature_encoding, find_and_delete, signature_hash,
+	verify_ecdsa,
 };
 
 const SIGHASH_ALL: u8 = 0x01;
@@ -257,7 +257,7 @@ fn invalid_pubkey_wrong_prefix() {
 
 #[test]
 fn verify_ecdsa_with_real_key() {
-	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+	use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 
 	// Generate a key and sign a prehashed message (Bitcoin signs raw 32-byte hashes)
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
@@ -275,7 +275,7 @@ fn verify_ecdsa_with_real_key() {
 
 #[test]
 fn verify_ecdsa_wrong_message() {
-	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+	use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
 	let verifying_key = signing_key.verifying_key();
@@ -292,7 +292,7 @@ fn verify_ecdsa_wrong_message() {
 
 #[test]
 fn verify_ecdsa_wrong_key() {
-	use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+	use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 
 	let signing_key = SigningKey::from_bytes(&[0x01; 32].into()).unwrap();
 	let wrong_key = SigningKey::from_bytes(&[0x02; 32].into()).unwrap();

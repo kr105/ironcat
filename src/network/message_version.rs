@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{decode_varstr, write_varstr, NetworkAddress, ServiceMask};
+use super::{NetworkAddress, ServiceMask, decode_varstr, write_varstr};
 use crate::utils::unix_now;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 

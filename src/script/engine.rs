@@ -4,9 +4,9 @@ use ripemd::Ripemd160;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use super::ScriptError;
 use super::opcodes::Opcode;
 use super::signature::{find_and_delete, signature_hash, verify_ecdsa};
-use super::ScriptError;
 use crate::types::transaction::Transaction;
 
 /// Maximum allowed script size in bytes

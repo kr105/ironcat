@@ -12,7 +12,7 @@ pub mod entry;
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
@@ -346,10 +346,10 @@ impl Mempool {
 			// Step 2: Find mempool txs spending the same inputs (conflicts)
 			if !tx.is_coinbase() {
 				for input in &tx.vin {
-					if let Some(&conflicting_txid) = self.spends.get(&input.prev_output) {
-						if conflicting_txid != txid {
-							conflicting.push(conflicting_txid);
-						}
+					if let Some(&conflicting_txid) = self.spends.get(&input.prev_output)
+						&& conflicting_txid != txid
+					{
+						conflicting.push(conflicting_txid);
 					}
 				}
 			}

@@ -10,8 +10,8 @@
 mod common;
 
 use common::{gen_keypair, make_tx, p2pkh_script_pubkey, sign_tx};
-use ironcat::script::engine::{Engine, SignatureContext};
 use ironcat::script::ScriptError;
+use ironcat::script::engine::{Engine, SignatureContext};
 use sha2::Digest;
 
 #[test]

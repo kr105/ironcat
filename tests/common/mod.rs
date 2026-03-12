@@ -11,7 +11,7 @@
 use ironcat::script::signature::signature_hash;
 use ironcat::types::hash::Hash256;
 use ironcat::types::transaction::{OutPoint, Transaction, TxIn, TxOut};
-use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::Digest;
 
 /// Generate a keypair and return (signing key, compressed pubkey bytes)

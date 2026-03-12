@@ -9,8 +9,8 @@ use std::{
 };
 
 use ironcat::network::{
-	decode_varint, decode_varstr, write_varint, write_varstr, Message, MessageParseError, NetworkAddress, NetworkQueue,
-	MAX_MESSAGE_SIZE,
+	MAX_MESSAGE_SIZE, Message, MessageParseError, NetworkAddress, NetworkQueue, decode_varint, decode_varstr,
+	write_varint, write_varstr,
 };
 
 /// Helper to build a varstr for test data (mirrors the cfg(test) `encode_varstr` in src)

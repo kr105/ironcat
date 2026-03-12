@@ -7,19 +7,19 @@ use std::{
 	sync::Arc,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bitflags::bitflags;
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Digest, Sha256};
 use tokio::{
 	io::AsyncWriteExt,
-	net::{tcp::OwnedWriteHalf, TcpListener},
+	net::{TcpListener, tcp::OwnedWriteHalf},
 	sync::Mutex,
 };
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-	nodes::{node_connection_loop, NodeManager, NodeState},
+	nodes::{NodeManager, NodeState, node_connection_loop},
 	utils::ipv4_to_mapped_ipv6,
 };
 

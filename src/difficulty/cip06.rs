@@ -22,8 +22,9 @@
 use anyhow::Result;
 
 use super::{
+	ChainLookup, ConsensusParams, U256,
 	compact::{compact_to_target, target_to_compact},
-	lookup_header, ChainLookup, ConsensusParams, U256,
+	lookup_header,
 };
 
 /// Computes the expected `nBits` for `height` under CIP06 (LWMA) rules

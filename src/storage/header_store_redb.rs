@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use anyhow::{Context, Result, bail};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use tracing::error;
 
 use crate::types::block::{BlockHeader, HEADER_SIZE};
@@ -29,7 +29,7 @@ impl RedbHeaderStore {
 	///
 	/// Creates the table on first open
 	pub fn open(path: &Path) -> Result<Self> {
-		let db = Database::create(path).with_context(|| format!("failed to open header db at {}", path.display()))?;
+		let db = super::open_or_recreate_db(path)?;
 
 		// Ensure table exists
 		let txn = db

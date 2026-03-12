@@ -6,7 +6,7 @@
 	clippy::missing_const_for_fn
 )]
 
-use ironcat::network::message_getheaders::{MessageGetHeaders, GETHEADERS_VERSION, MAX_LOCATOR_HASHES};
+use ironcat::network::message_getheaders::{GETHEADERS_VERSION, MAX_LOCATOR_HASHES, MessageGetHeaders};
 use ironcat::types::hash::Hash256;
 
 fn make_hash(byte: u8) -> Hash256 {

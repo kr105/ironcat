@@ -2,11 +2,11 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use super::{decode_varint, write_varint};
-use crate::types::hash::{Hash256, HASH_LEN};
+use crate::types::hash::{HASH_LEN, Hash256};
 
 /// Protocol version we send in the getheaders version field
 pub const GETHEADERS_VERSION: u32 = 70012;

@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -58,13 +58,13 @@ struct BatchLookup<'a> {
 impl ChainLookup for BatchLookup<'_> {
 	fn header_at(&self, height: u32) -> Option<(u32, u32)> {
 		// Check pending batch first (heights are sequential, so O(1) index lookup)
-		if let Some(&(_, _, first_height)) = self.pending.first() {
-			if height >= first_height {
-				#[allow(clippy::arithmetic_side_effects)] // height >= first_height checked above
-				let idx = (height - first_height) as usize;
-				if let Some(&(_, header, _)) = self.pending.get(idx) {
-					return Some((header.timestamp, header.bits));
-				}
+		if let Some(&(_, _, first_height)) = self.pending.first()
+			&& height >= first_height
+		{
+			#[allow(clippy::arithmetic_side_effects)] // height >= first_height checked above
+			let idx = (height - first_height) as usize;
+			if let Some(&(_, header, _)) = self.pending.get(idx) {
+				return Some((header.timestamp, header.bits));
 			}
 		}
 		// Fall back to committed store

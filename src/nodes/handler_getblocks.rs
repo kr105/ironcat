@@ -8,9 +8,9 @@ use tracing::debug;
 
 use super::NodeManager;
 use crate::network::{
+	SharedTcpWriter, SharedTcpWriterExt,
 	message_getheaders::MessageGetHeaders,
 	message_inv::{InvItem, InvType, MessageInv},
-	SharedTcpWriter, SharedTcpWriterExt,
 };
 use crate::types::hash::Hash256;
 

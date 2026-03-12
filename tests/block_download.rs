@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use ironcat::chainstate::ChainState;
 use ironcat::difficulty::ConsensusParams;
-use ironcat::nodes::block_download::BlockDownloadManager;
 use ironcat::nodes::NodeManager;
+use ironcat::nodes::block_download::BlockDownloadManager;
 use ironcat::storage::block_store::BlockStore;
 use ironcat::types::block::BlockHeader;
 use ironcat::types::hash::Hash256;

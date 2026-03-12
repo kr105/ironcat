@@ -2,10 +2,10 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::{decode_varint, write_varint, NetworkAddress};
+use super::{NetworkAddress, decode_varint, write_varint};
 use crate::utils::unix_now;
 
 /// An entry in an addr message, pairing a network address with its timestamp

@@ -7,18 +7,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use redb::{Database, ReadableTable, Table, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use tracing::{debug, info};
 
 use crate::script::verify::verify_script;
 use crate::types::block::Block;
-use crate::types::hash::{Hash256, HASH_LEN};
+use crate::types::hash::{HASH_LEN, Hash256};
 use crate::types::transaction::OutPoint;
 use crate::validation::subsidy::get_block_subsidy;
 
 use self::coin::Coin;
 use self::undo::{BlockUndo, TxUndo};
-use self::undo_store::{UndoStore, UNDO_INDEX};
+use self::undo_store::{UNDO_INDEX, UndoStore};
 
 pub mod coin;
 pub mod undo;
@@ -109,8 +109,7 @@ impl ChainState {
 	#[allow(clippy::missing_panics_doc)] // unwrap is after a length check, can't panic
 	pub fn open(datadir: &Path, script_verify_height: u32) -> Result<Self> {
 		let db_path = datadir.join("chainstate.redb");
-		let db = Database::create(&db_path)
-			.with_context(|| format!("failed to open chainstate db at {}", db_path.display()))?;
+		let db = crate::storage::open_or_recreate_db(&db_path)?;
 
 		// Ensure all tables exist
 		let txn = db
@@ -295,8 +294,8 @@ impl ChainState {
 								verify_script(&tx.vin[input_idx].script_sig, &coin.tx_out.script_pubkey, tx, input_idx)
 									.map_err(|e| {
 										anyhow::anyhow!(
-										"script verification failed for input {input_idx} of tx {txid_display}: {e}"
-									)
+											"script verification failed for input {input_idx} of tx {txid_display}: {e}"
+										)
 									})
 							})?;
 						scripts_verified = scripts_verified.saturating_add(tx.vin.len());
@@ -473,28 +472,28 @@ impl ChainState {
 				}
 
 				// Restore spent inputs for non-coinbase txs
-				if !tx.is_coinbase() {
-					if let Some(ref undo) = block_undo {
-						// Non-coinbase tx at block position i maps to undo index (i-1)
-						// since coinbase is at position 0
-						#[allow(clippy::arithmetic_side_effects)] // tx_idx > 0 for non-coinbase
-						let undo_idx = tx_idx - 1;
-						let tx_undo = undo
-							.tx_undos
-							.get(undo_idx)
-							.ok_or_else(|| anyhow::anyhow!("missing tx undo at index {undo_idx}"))?;
+				if !tx.is_coinbase()
+					&& let Some(ref undo) = block_undo
+				{
+					// Non-coinbase tx at block position i maps to undo index (i-1)
+					// since coinbase is at position 0
+					#[allow(clippy::arithmetic_side_effects)] // tx_idx > 0 for non-coinbase
+					let undo_idx = tx_idx - 1;
+					let tx_undo = undo
+						.tx_undos
+						.get(undo_idx)
+						.ok_or_else(|| anyhow::anyhow!("missing tx undo at index {undo_idx}"))?;
 
-						for (input_idx, input) in tx.vin.iter().enumerate() {
-							let coin = tx_undo
-								.spent_outputs
-								.get(input_idx)
-								.ok_or_else(|| anyhow::anyhow!("missing spent output at input index {input_idx}"))?;
-							let key = outpoint_to_key(&input.prev_output);
-							let coin_bytes = coin.to_bytes();
-							utxo_table
-								.insert(&key, coin_bytes.as_slice())
-								.context("failed to restore utxo during disconnect")?;
-						}
+					for (input_idx, input) in tx.vin.iter().enumerate() {
+						let coin = tx_undo
+							.spent_outputs
+							.get(input_idx)
+							.ok_or_else(|| anyhow::anyhow!("missing spent output at input index {input_idx}"))?;
+						let key = outpoint_to_key(&input.prev_output);
+						let coin_bytes = coin.to_bytes();
+						utxo_table
+							.insert(&key, coin_bytes.as_slice())
+							.context("failed to restore utxo during disconnect")?;
 					}
 				}
 			}

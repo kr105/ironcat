@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Tests use unwrap for brevity since panics are the intended failure mode
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(
+	clippy::unwrap_used,
+	clippy::indexing_slicing,
+	clippy::ip_constant,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	clippy::cast_possible_wrap
+)]
 
 use ironcat::storage::peers::{PeerDb, SavedPeer};
 use ironcat::storage::{checksummed_decode, checksummed_encode};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn sample_peer() -> SavedPeer {
 	SavedPeer {
@@ -104,4 +111,128 @@ fn load_missing_file_returns_none() {
 	let path = dir.path().join("nonexistent.dat");
 	let result: Option<PeerDb> = ironcat::storage::load_file(&path);
 	assert!(result.is_none());
+}
+
+#[test]
+fn ipv6_peer_roundtrip() {
+	let db = PeerDb {
+		version: 1,
+		peers: vec![SavedPeer {
+			ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+			port: 9933,
+			services: 1,
+			last_seen: 1_700_000_000,
+			user_agent: "/test/".to_string(),
+			height: 100,
+		}],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: PeerDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(
+		decoded.peers[0].ip,
+		IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+	);
+}
+
+#[test]
+fn mixed_ipv4_ipv6_peers_roundtrip() {
+	let db = PeerDb {
+		version: 1,
+		peers: vec![
+			SavedPeer {
+				ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+				port: 9933,
+				services: 0,
+				last_seen: 0,
+				user_agent: String::new(),
+				height: 0,
+			},
+			SavedPeer {
+				ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+				port: 9933,
+				services: 0,
+				last_seen: 0,
+				user_agent: String::new(),
+				height: 0,
+			},
+		],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: PeerDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.peers.len(), 2);
+	assert!(decoded.peers[0].ip.is_ipv4());
+	assert!(decoded.peers[1].ip.is_ipv6());
+}
+
+#[test]
+fn extreme_values_roundtrip() {
+	let db = PeerDb {
+		version: u32::MAX,
+		peers: vec![SavedPeer {
+			ip: IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+			port: u16::MAX,
+			services: u64::MAX,
+			last_seen: u64::MAX,
+			user_agent: "a".repeat(1000),
+			height: i32::MIN,
+		}],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: PeerDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.version, u32::MAX);
+	assert_eq!(decoded.peers[0].port, u16::MAX);
+	assert_eq!(decoded.peers[0].services, u64::MAX);
+	assert_eq!(decoded.peers[0].last_seen, u64::MAX);
+	assert_eq!(decoded.peers[0].height, i32::MIN);
+	assert_eq!(decoded.peers[0].user_agent.len(), 1000);
+}
+
+#[test]
+fn unicode_user_agent_roundtrip() {
+	let db = PeerDb {
+		version: 1,
+		peers: vec![SavedPeer {
+			ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+			port: 9933,
+			services: 0,
+			last_seen: 0,
+			user_agent: "/Catcoin:2.0/\u{1F431}\u{00E9}\u{4E16}\u{754C}/".to_string(),
+			height: 0,
+		}],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: PeerDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.peers[0].user_agent, db.peers[0].user_agent);
+}
+
+#[test]
+fn truncated_payload_rejected() {
+	let db = PeerDb {
+		version: 1,
+		peers: vec![sample_peer()],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	// Keep the checksum (32 bytes) but truncate the payload
+	let truncated = &encoded[..33];
+	let result: Result<PeerDb, _> = checksummed_decode(truncated);
+	assert!(result.is_err());
+}
+
+#[test]
+fn many_peers_roundtrip() {
+	let peers: Vec<SavedPeer> = (0u32..500)
+		.map(|i| SavedPeer {
+			ip: IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+			port: 9933,
+			services: 1,
+			last_seen: 1_700_000_000 + u64::from(i),
+			user_agent: format!("/node-{i}/"),
+			height: i as i32,
+		})
+		.collect();
+	let db = PeerDb { version: 1, peers };
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: PeerDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.peers.len(), 500);
+	assert_eq!(decoded.peers[499].height, 499);
 }

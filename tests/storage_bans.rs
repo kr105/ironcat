@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Tests use unwrap for brevity since panics are the intended failure mode
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::cast_possible_truncation)]
 
 use ironcat::difficulty::ConsensusParams;
 use ironcat::storage::bans::{BanDb, SavedBan};
 use ironcat::storage::{checksummed_decode, checksummed_encode};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn sample_ban() -> SavedBan {
 	SavedBan {
@@ -127,4 +127,70 @@ fn collect_bans_from_node_manager() {
 	let db = nm.collect_bans_for_save();
 	assert_eq!(db.bans.len(), 1);
 	assert_eq!(db.bans[0].ip, IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)));
+}
+
+#[test]
+fn ipv6_ban_roundtrip() {
+	let db = BanDb {
+		version: 1,
+		bans: vec![SavedBan {
+			ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+			reason: "ipv6 misbehavior".to_string(),
+			created: 1_700_000_000,
+			expires: 1_700_086_400,
+		}],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: BanDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(
+		decoded.bans[0].ip,
+		IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+	);
+	assert_eq!(decoded.bans[0].reason, "ipv6 misbehavior");
+}
+
+#[test]
+fn extreme_ban_values_roundtrip() {
+	let db = BanDb {
+		version: u32::MAX,
+		bans: vec![SavedBan {
+			ip: IpAddr::V4(Ipv4Addr::BROADCAST),
+			reason: "x".repeat(2000),
+			created: u64::MAX,
+			expires: u64::MAX,
+		}],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: BanDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.version, u32::MAX);
+	assert_eq!(decoded.bans[0].created, u64::MAX);
+	assert_eq!(decoded.bans[0].reason.len(), 2000);
+}
+
+#[test]
+fn many_bans_roundtrip() {
+	let bans: Vec<SavedBan> = (0u32..200)
+		.map(|i| SavedBan {
+			ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, (i % 256) as u8)),
+			reason: format!("ban reason {i}"),
+			created: 1_700_000_000 + u64::from(i),
+			expires: 1_800_000_000 + u64::from(i),
+		})
+		.collect();
+	let db = BanDb { version: 1, bans };
+	let encoded = checksummed_encode(&db).unwrap();
+	let decoded: BanDb = checksummed_decode(&encoded).unwrap();
+	assert_eq!(decoded.bans.len(), 200);
+}
+
+#[test]
+fn truncated_ban_payload_rejected() {
+	let db = BanDb {
+		version: 1,
+		bans: vec![sample_ban()],
+	};
+	let encoded = checksummed_encode(&db).unwrap();
+	let truncated = &encoded[..33];
+	let result: Result<BanDb, _> = checksummed_decode(truncated);
+	assert!(result.is_err());
 }

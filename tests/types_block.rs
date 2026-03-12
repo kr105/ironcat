@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use ironcat::types::{
-	block::{compute_merkle_root, Block, BlockHeader, HEADER_SIZE},
-	hash::{double_sha256, Hash256},
+	block::{Block, BlockHeader, HEADER_SIZE, compute_merkle_root},
+	hash::{Hash256, double_sha256},
 	transaction::{OutPoint, Transaction, TxIn, TxOut},
 };
 

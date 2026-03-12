@@ -6,8 +6,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use ironcat::network::{
-	message_addr::{AddrEntry, MessageAddr},
 	NetworkAddress,
+	message_addr::{AddrEntry, MessageAddr},
 };
 
 #[test]

@@ -9,8 +9,8 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
-use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedReadHalf;
 
 use crate::network::{Message, MessageParseError, SharedTcpWriter};
 use crate::types::block::BlockHeader;
@@ -42,6 +42,7 @@ pub async fn tcp_pair() -> (SharedTcpWriter, OwnedReadHalf) {
 
 /// Reads all protocol messages from the stream until the writer is dropped.
 /// Call after the handler has returned so all data is already buffered
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 pub async fn read_all_messages(reader: &mut OwnedReadHalf) -> Vec<Message> {
 	let mut buf = Vec::new();
 	reader.read_to_end(&mut buf).await.unwrap();

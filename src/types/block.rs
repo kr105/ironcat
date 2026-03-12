@@ -2,10 +2,10 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::hash::{double_sha256, Hash256, HASH_LEN};
+use super::hash::{HASH_LEN, Hash256, double_sha256};
 use super::transaction::Transaction;
 use crate::network::decode_varint;
 
@@ -213,10 +213,10 @@ pub fn compute_merkle_root(txids: &[Hash256]) -> (Hash256, bool) {
 		}
 
 		// Duplicate last if odd count
-		if !level.len().is_multiple_of(2) {
-			if let Some(&last) = level.last() {
-				level.push(last);
-			}
+		if !level.len().is_multiple_of(2)
+			&& let Some(&last) = level.last()
+		{
+			level.push(last);
 		}
 
 		// chunks_exact(2) guarantees each slice has exactly 2 elements

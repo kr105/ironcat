@@ -5,7 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use ironcat::network::{message_version::MessageVersion, NetworkAddress, ServiceMask};
+use ironcat::network::{NetworkAddress, ServiceMask, message_version::MessageVersion};
 
 /// Build a minimal valid version message payload with the given service bits
 fn build_version_payload(services_bits: u64) -> Vec<u8> {

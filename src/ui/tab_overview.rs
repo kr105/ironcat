@@ -3,11 +3,11 @@
 //! Overview tab -- 2x2 grid of stats panels
 
 use ratatui::{
+	Frame,
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
 	widgets::{Block, Borders, Paragraph},
-	Frame,
 };
 
 use crate::difficulty::{self, ConsensusParams};

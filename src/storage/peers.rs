@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 use std::{net::IpAddr, path::Path};
 
 use super::{atomic_write, checksummed_encode};
 
 /// On-disk format for the peer database
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct PeerDb {
 	/// Schema version for future migrations
 	pub version: u32,
@@ -16,7 +16,7 @@ pub struct PeerDb {
 }
 
 /// A single peer entry for persistence
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct SavedPeer {
 	/// IP address
 	pub ip: IpAddr,

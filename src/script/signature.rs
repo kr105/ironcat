@@ -6,7 +6,7 @@ use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{Signature, VerifyingKey};
 
 use crate::network::write_varint;
-use crate::types::hash::{double_sha256, Hash256};
+use crate::types::hash::{Hash256, double_sha256};
 use crate::types::transaction::Transaction;
 
 use super::ScriptError;

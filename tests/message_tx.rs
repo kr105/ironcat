@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
 use ironcat::types::hash::Hash256;
 use ironcat::types::transaction::{OutPoint, Transaction, TxIn, TxOut};
 

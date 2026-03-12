@@ -2,10 +2,10 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::hash::{double_sha256, Hash256, HASH_LEN};
+use super::hash::{HASH_LEN, Hash256, double_sha256};
 use crate::network::{decode_varint, write_varint};
 
 /// Maximum size of a script in bytes (10KB)

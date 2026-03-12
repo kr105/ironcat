@@ -3,11 +3,11 @@
 //! Peers tab -- full-screen peer table
 
 use ratatui::{
+	Frame,
 	layout::{Alignment, Constraint, Rect},
 	style::{Color, Modifier, Style},
 	text::Line,
 	widgets::{Block, Borders, Cell, Row, Table},
-	Frame,
 };
 
 use crate::nodes::{NodeSnapshot, NodeStateLabel};

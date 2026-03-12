@@ -11,9 +11,9 @@
 
 use ironcat::chainstate::ChainState;
 use ironcat::types::block::{Block, BlockHeader};
-use ironcat::types::hash::{double_sha256, Hash256};
+use ironcat::types::hash::{Hash256, double_sha256};
 use ironcat::types::transaction::{OutPoint, Transaction, TxIn, TxOut};
-use ironcat::validation::subsidy::{get_block_subsidy, COIN};
+use ironcat::validation::subsidy::{COIN, get_block_subsidy};
 
 /// Creates a coinbase transaction with BIP34 height encoding in the `script_sig`
 fn make_coinbase(height: u32, value: i64) -> Transaction {
@@ -70,7 +70,7 @@ fn make_spend_tx(outpoint: OutPoint, value: i64) -> Transaction {
 }
 
 /// Creates a block with the given previous hash and transactions
-fn make_block(prev_hash: Hash256, txs: Vec<Transaction>) -> Block {
+const fn make_block(prev_hash: Hash256, txs: Vec<Transaction>) -> Block {
 	Block {
 		header: BlockHeader {
 			version: 1,

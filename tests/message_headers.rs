@@ -6,7 +6,7 @@
 	clippy::missing_const_for_fn
 )]
 
-use ironcat::network::message_headers::{MessageHeaders, MAX_HEADERS_PER_MSG};
+use ironcat::network::message_headers::{MAX_HEADERS_PER_MSG, MessageHeaders};
 use ironcat::types::block::BlockHeader;
 use ironcat::types::hash::Hash256;
 

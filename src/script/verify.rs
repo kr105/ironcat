@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::engine::{is_truthy, Engine, SignatureContext};
 use super::ScriptError;
+use super::engine::{Engine, SignatureContext, is_truthy};
 use crate::types::transaction::Transaction;
 
 /// Verifies a transaction input by executing scriptSig and scriptPubKey

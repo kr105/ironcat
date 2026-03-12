@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use super::{decode_varint, write_varint};
 use crate::types::block::{BlockHeader, HEADER_SIZE};

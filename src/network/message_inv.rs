@@ -2,12 +2,12 @@
 
 use std::io::{Cursor, Read};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use byteorder::{LittleEndian, ReadBytesExt};
 use tracing::debug;
 
 use super::{decode_varint, write_varint};
-use crate::types::hash::{Hash256, HASH_LEN};
+use crate::types::hash::{HASH_LEN, Hash256};
 
 /// Maximum number of inventory items in a single message
 const MAX_INV_SIZE: usize = 50_000;

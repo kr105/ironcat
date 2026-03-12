@@ -4,11 +4,11 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::cast_possible_truncation)]
 
 use std::sync::{
-	atomic::{AtomicBool, Ordering},
 	Arc,
+	atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use ironcat::{
 	difficulty::ConsensusParams,
 	headers::HeaderStore,

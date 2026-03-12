@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 use std::{net::IpAddr, path::Path};
 
 use crate::utils::unix_now;
@@ -9,7 +9,7 @@ use crate::utils::unix_now;
 use super::{atomic_write, checksummed_encode};
 
 /// On-disk format for the ban database
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct BanDb {
 	/// Schema version for future migrations
 	pub version: u32,
@@ -26,7 +26,7 @@ impl BanDb {
 }
 
 /// A single ban entry for persistence
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct SavedBan {
 	/// Banned IP address
 	pub ip: IpAddr,

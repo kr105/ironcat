@@ -149,7 +149,7 @@ fn verify_p2sh_with_p2pkh_redeem() {
 #[test]
 fn verify_p2sh_wrong_hash_fails() {
 	let redeem_script = vec![0x51]; // OP_1
-								 // Use wrong hash
+	// Use wrong hash
 	let wrong_hash = [0xab; 20];
 
 	let mut script_pubkey = vec![0xa9, 0x14];

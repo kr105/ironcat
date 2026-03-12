@@ -10,12 +10,12 @@ use tokio::time::Instant;
 use tracing::{debug, info};
 
 use super::{
-	ConnectionType, NodeManager, NodeState, ADDR_RELAY_MAX_ENTRIES, ADDR_RELAY_PEER_COUNT, ADDR_TOKEN_CAPACITY,
-	ADDR_TOKEN_RATE, GETADDR_RECENT_WINDOW, MAX_ADDR_KNOWN,
+	ADDR_RELAY_MAX_ENTRIES, ADDR_RELAY_PEER_COUNT, ADDR_TOKEN_CAPACITY, ADDR_TOKEN_RATE, ConnectionType,
+	GETADDR_RECENT_WINDOW, MAX_ADDR_KNOWN, NodeManager, NodeState,
 };
 use crate::network::{
-	message_addr::{AddrEntry, MessageAddr},
 	NetworkAddress, SharedTcpWriter, SharedTcpWriterExt,
+	message_addr::{AddrEntry, MessageAddr},
 };
 use crate::utils::{is_recently_active, is_routable, unix_now};
 
@@ -147,7 +147,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 /// Refills a peer's addr token bucket based on elapsed time
 ///
 /// Returns the updated token count, capped at `ADDR_TOKEN_CAPACITY`
-pub(super) fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
+pub(super) const fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
 	// Both operands are finite and bounded; result is capped by min()
 	#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
 	elapsed
@@ -270,11 +270,11 @@ pub(super) async fn handle_getaddr(
 			return Ok(());
 		};
 
-		if let Some(last) = node.last_getaddr_response {
-			if last.elapsed() < Duration::from_secs(60) {
-				debug!("Rate limiting getaddr from {}", address);
-				return Ok(());
-			}
+		if let Some(last) = node.last_getaddr_response
+			&& last.elapsed() < Duration::from_secs(60)
+		{
+			debug!("Rate limiting getaddr from {}", address);
+			return Ok(());
 		}
 
 		node.last_getaddr_response = Some(Instant::now());

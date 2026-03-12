@@ -48,7 +48,7 @@ pub async fn resolve_dns_seeds() -> Vec<SocketAddr> {
 	}
 
 	let mut addrs: Vec<SocketAddr> = seen.into_iter().collect();
-	addrs.shuffle(&mut rand::thread_rng());
+	addrs.shuffle(&mut rand::rng());
 
 	info!(
 		count = addrs.len(),

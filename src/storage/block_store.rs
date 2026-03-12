@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, info, warn};
 
-use crate::types::hash::{Hash256, HASH_LEN};
+use crate::types::hash::{HASH_LEN, Hash256};
 
 /// Catcoin mainnet magic bytes used as flat file block separator
 const BLOCK_MAGIC: [u8; 4] = [0xFC, 0xC1, 0xB7, 0xDC];
@@ -76,8 +76,7 @@ impl BlockStore {
 			.with_context(|| format!("failed to create blocks dir at {}", blocks_dir.display()))?;
 
 		let db_path = datadir.join("index.redb");
-		let db = Database::create(&db_path)
-			.with_context(|| format!("failed to open block index db at {}", db_path.display()))?;
+		let db = super::open_or_recreate_db(&db_path)?;
 
 		// Ensure table exists
 		let txn = db

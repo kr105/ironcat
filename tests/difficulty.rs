@@ -11,8 +11,9 @@
 use std::collections::HashMap;
 
 use ironcat::difficulty::{
+	ChainLookup, ConsensusParams, U256,
 	compact::{bits_u256, compact_to_target, target_to_compact},
-	compact_to_difficulty, format_difficulty, get_next_work_required, ChainLookup, ConsensusParams, U256,
+	compact_to_difficulty, format_difficulty, get_next_work_required,
 };
 
 /// Mock chain for testing: maps height -> (timestamp, bits)

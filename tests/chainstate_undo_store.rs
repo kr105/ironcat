@@ -11,7 +11,7 @@
 
 use ironcat::chainstate::coin::Coin;
 use ironcat::chainstate::undo::{BlockUndo, TxUndo};
-use ironcat::chainstate::undo_store::{UndoStore, UNDO_INDEX};
+use ironcat::chainstate::undo_store::{UNDO_INDEX, UndoStore};
 use ironcat::types::hash::Hash256;
 use ironcat::types::transaction::TxOut;
 use redb::Database;

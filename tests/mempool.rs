@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Tests use unwrap/indexing for brevity since panics are the intended failure mode
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +40,7 @@ fn make_tx(inputs: Vec<OutPoint>, outputs: Vec<i64>) -> Transaction {
 	}
 }
 
-fn dummy_block_header() -> BlockHeader {
+const fn dummy_block_header() -> BlockHeader {
 	BlockHeader {
 		version: 1,
 		prev_hash: Hash256::ZERO,

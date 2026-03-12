@@ -15,9 +15,9 @@
 use anyhow::Result;
 
 use super::{
-	cip04,
+	ChainLookup, ConsensusParams, cip04,
 	compact::{compact_to_target, target_to_compact},
-	lookup_header, ChainLookup, ConsensusParams,
+	lookup_header,
 };
 
 /// Computes the expected `nBits` for `height` under CIP05 rules

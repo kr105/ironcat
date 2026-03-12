@@ -3,11 +3,11 @@
 //! Mempool tab -- detailed mempool statistics and transaction list
 
 use ratatui::{
+	Frame,
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
 	widgets::{Block, Borders, Cell, Paragraph, Row, Table},
-	Frame,
 };
 
 use crate::mempool::{MempoolStats, RecentTxEntry};

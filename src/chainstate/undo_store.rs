@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, info, warn};
 
-use crate::types::hash::{Hash256, HASH_LEN};
+use crate::types::hash::{HASH_LEN, Hash256};
 
 use super::undo::BlockUndo;
 

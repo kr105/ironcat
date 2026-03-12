@@ -2,12 +2,12 @@
 
 use anyhow::{Context, Result};
 use ratatui::{
+	DefaultTerminal, Frame,
 	crossterm::event::{self, Event, KeyCode},
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
 	widgets::Paragraph,
-	DefaultTerminal, Frame,
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -137,20 +137,20 @@ fn run(
 		let time_to_refresh = STATS_REFRESH_INTERVAL.saturating_sub(last_draw.elapsed());
 		let poll_timeout = time_to_refresh.min(Duration::from_millis(500));
 
-		if event::poll(poll_timeout).context("event poll failed")? {
-			if let Event::Key(key) = event::read().context("event read failed")? {
-				match key.code {
-					KeyCode::Char('q') => break,
-					KeyCode::Tab => {
-						#[allow(clippy::arithmetic_side_effects)] // tab index wraps within small constant range
-						{
-							tui_state.active_tab = (tui_state.active_tab + 1) % TAB_COUNT;
-						}
-						terminal.draw(|f| draw(f, node_manager, &log_buffer, &tui_state))?;
-						last_draw = std::time::Instant::now();
+		if event::poll(poll_timeout).context("event poll failed")?
+			&& let Event::Key(key) = event::read().context("event read failed")?
+		{
+			match key.code {
+				KeyCode::Char('q') => break,
+				KeyCode::Tab => {
+					#[allow(clippy::arithmetic_side_effects)] // tab index wraps within small constant range
+					{
+						tui_state.active_tab = (tui_state.active_tab + 1) % TAB_COUNT;
 					}
-					_ => {}
+					terminal.draw(|f| draw(f, node_manager, &log_buffer, &tui_state))?;
+					last_draw = std::time::Instant::now();
 				}
+				_ => {}
 			}
 		}
 	}

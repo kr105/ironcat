@@ -6,7 +6,7 @@
 //! set, no previous headers). Covers structural rules like tx count,
 //! coinbase position, and block weight
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::warn;
 
 use crate::types::block::{Block, HEADER_SIZE};

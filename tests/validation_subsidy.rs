@@ -3,7 +3,7 @@
 // Tests use unwrap/indexing for brevity since panics are the intended failure mode
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use ironcat::validation::subsidy::{get_block_subsidy, COIN, HALVING_INTERVAL, INITIAL_SUBSIDY, MAX_MONEY};
+use ironcat::validation::subsidy::{COIN, HALVING_INTERVAL, INITIAL_SUBSIDY, MAX_MONEY, get_block_subsidy};
 
 #[test]
 fn constants_are_correct() {

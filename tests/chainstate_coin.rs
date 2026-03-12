@@ -6,7 +6,7 @@
 use ironcat::chainstate::coin::Coin;
 use ironcat::types::transaction::TxOut;
 
-fn make_coin(value: i64, script: Vec<u8>, height: u32, is_coinbase: bool) -> Coin {
+const fn make_coin(value: i64, script: Vec<u8>, height: u32, is_coinbase: bool) -> Coin {
 	Coin {
 		tx_out: TxOut {
 			value,
@@ -68,7 +68,7 @@ fn truncated_script_returns_error() {
 	data.push(0); // is_coinbase
 	data.extend_from_slice(&1000i64.to_le_bytes()); // value
 	data.extend_from_slice(&100u32.to_le_bytes()); // script_len = 100
-												// No script bytes follow
+	// No script bytes follow
 
 	assert!(Coin::from_bytes(&data).is_err());
 }

@@ -12,19 +12,20 @@ mod handler_tx;
 mod handler_verack;
 mod handler_version;
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod test_helpers;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
-use rand::RngCore;
+use rand::Rng;
 use std::{
 	collections::HashSet,
 	ffi::CStr,
 	fmt,
 	net::IpAddr,
 	sync::{
-		atomic::{AtomicU32, AtomicUsize, Ordering},
 		Arc,
+		atomic::{AtomicU32, AtomicUsize, Ordering},
 	},
 	time::Duration,
 };
@@ -32,7 +33,7 @@ use tokio::{
 	io::{self, AsyncWriteExt},
 	net::TcpStream,
 	sync::Mutex,
-	time::{sleep, timeout, Instant},
+	time::{Instant, sleep, timeout},
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -41,8 +42,8 @@ use crate::{
 	dns::DEFAULT_PORT,
 	headers::HeaderStore,
 	network::{
-		message_addr::MessageAddr, message_version::MessageVersion, Message, NetworkAddress, NetworkCommand,
-		NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		Message, NetworkAddress, NetworkCommand, NetworkQueue, ServiceMask, SharedTcpWriter, SharedTcpWriterExt,
+		message_addr::MessageAddr, message_version::MessageVersion,
 	},
 	storage::header_store_backend::HeaderStoreBackend,
 	types::{block::BlockHeader, hash::Hash256},
@@ -227,7 +228,7 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 		// Modulo by a nonzero value is safe, and wrapping is acceptable for RNG
 		#[allow(clippy::arithmetic_side_effects)]
 		{
-			rand::thread_rng().next_u64() % jitter_window
+			rand::rng().next_u64() % jitter_window
 		}
 	} else {
 		0
@@ -540,7 +541,7 @@ impl NodeManager {
 		params: ConsensusParams,
 		backend: Option<Arc<dyn HeaderStoreBackend>>,
 	) -> Self {
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		let store = HeaderStore::with_backend(genesis_header, params, backend);
 		let initial_height = store.height();
 		let initial_bits = store.tip_bits();
@@ -663,11 +664,11 @@ impl NodeManager {
 		}
 
 		// Per-IP cooldown: reject if this IP connected too recently
-		if let Some(last) = self.incoming_cooldowns.get(&address) {
-			if last.elapsed() < INCOMING_IP_COOLDOWN {
-				debug!("Rejecting {}:{} (per-IP cooldown)", address, port);
-				return None;
-			}
+		if let Some(last) = self.incoming_cooldowns.get(&address)
+			&& last.elapsed() < INCOMING_IP_COOLDOWN
+		{
+			debug!("Rejecting {}:{} (per-IP cooldown)", address, port);
+			return None;
 		}
 
 		if self.try_insert_or_reactivate(address, port, ConnectionType::Incoming, true) {
@@ -766,7 +767,7 @@ impl NodeManager {
 
 	/// Sends a ping message to a connected node and stores the nonce for pong validation
 	pub async fn send_ping(&self, address: &IpAddr) {
-		let nonce = rand::thread_rng().next_u64();
+		let nonce = rand::rng().next_u64();
 
 		let tcp_writer = if let Some(mut node) = self.nodes.get_mut(address) {
 			let writer = if let NodeState::Connected { ref writer } = node.state {
@@ -971,14 +972,14 @@ impl NodeManager {
 
 			for address in stale_nodes {
 				warn!("Node {} stuck in stale state, scheduling retry", address);
-				if let Some(mut node) = self.nodes.get_mut(&address) {
-					if matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. }) {
-						node.inv_known.clear();
-						node.state = NodeState::Disconnected {
-							retry_at: Instant::now(),
-							attempt: 0,
-						};
-					}
+				if let Some(mut node) = self.nodes.get_mut(&address)
+					&& matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. })
+				{
+					node.inv_known.clear();
+					node.state = NodeState::Disconnected {
+						retry_at: Instant::now(),
+						attempt: 0,
+					};
 				}
 			}
 
@@ -986,10 +987,11 @@ impl NodeManager {
 				info!(count = expired_bans.len(), "Reaper: clearing expired bans");
 			}
 			for address in expired_bans {
-				if let Some(mut node) = self.nodes.get_mut(&address) {
-					if matches!(node.state, NodeState::Banned { .. }) && !node.state.is_banned() {
-						node.state = NodeState::Dead;
-					}
+				if let Some(mut node) = self.nodes.get_mut(&address)
+					&& matches!(node.state, NodeState::Banned { .. })
+					&& !node.state.is_banned()
+				{
+					node.state = NodeState::Dead;
 				}
 			}
 
@@ -1136,23 +1138,24 @@ impl NodeManager {
 	///
 	/// Returns true if the node was revived, false otherwise
 	pub fn revive_if_newer(self: &Arc<Self>, address: &IpAddr, port: u16, timestamp: u32) -> bool {
-		if let Some(mut node) = self.nodes.get_mut(address) {
-			if matches!(node.state, NodeState::Dead) && u64::from(timestamp) > node.last_seen {
-				node.state = NodeState::Connecting { since: Instant::now() };
-				node.last_seen = u64::from(timestamp);
-				node.port = port;
-				let revived_addr = *address;
-				let revived_port = node.port;
-				drop(node);
+		if let Some(mut node) = self.nodes.get_mut(address)
+			&& matches!(node.state, NodeState::Dead)
+			&& u64::from(timestamp) > node.last_seen
+		{
+			node.state = NodeState::Connecting { since: Instant::now() };
+			node.last_seen = u64::from(timestamp);
+			node.port = port;
+			let revived_addr = *address;
+			let revived_port = node.port;
+			drop(node);
 
-				// Spawn a connection task for the revived node
-				let nm = Arc::clone(self);
-				tokio::spawn(async move {
-					handle_node_connection(nm, revived_addr, revived_port, 0).await;
-				});
+			// Spawn a connection task for the revived node
+			let nm = Arc::clone(self);
+			tokio::spawn(async move {
+				handle_node_connection(nm, revived_addr, revived_port, 0).await;
+			});
 
-				return true;
-			}
+			return true;
 		}
 		false
 	}
@@ -1259,15 +1262,14 @@ impl NodeManager {
 					created,
 					expires,
 				} = &entry.value().state
+					&& *expires > now
 				{
-					if *expires > now {
-						return Some(crate::storage::bans::SavedBan {
-							ip: *entry.key(),
-							reason: reason.to_string(),
-							created: *created,
-							expires: *expires,
-						});
-					}
+					return Some(crate::storage::bans::SavedBan {
+						ip: *entry.key(),
+						reason: reason.to_string(),
+						created: *created,
+						expires: *expires,
+					});
 				}
 				None
 			})
@@ -1368,8 +1370,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	if !node_manager.should_attempt_connection(&address) {
 		trace!(
 			"Avoiding connection to node {}:{} as it is not a good candidate",
-			address,
-			port
+			address, port
 		);
 		return;
 	}
@@ -1391,10 +1392,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 		if tcp_attempt < TCP_MAX_ATTEMPTS {
 			trace!(
 				"Failed to connect to {}:{} on attempt {}: {}",
-				address,
-				port,
-				tcp_attempt,
-				fail_reason
+				address, port, tcp_attempt, fail_reason
 			);
 			sleep(TCP_RETRY_DELAY).await;
 		} else {
@@ -1446,11 +1444,11 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	node_connection_loop(Arc::clone(&node_manager), address, tcp_stream).await;
 
 	// Don't overwrite banned nodes -- they were banned for a reason
-	if let Some(node) = node_manager.nodes.get(&address) {
-		if node.state.is_banned() {
-			debug!("Node {} is banned, not scheduling retry", address);
-			return;
-		}
+	if let Some(node) = node_manager.nodes.get(&address)
+		&& node.state.is_banned()
+	{
+		debug!("Node {} is banned, not scheduling retry", address);
+		return;
 	}
 
 	// Connection loop ended -- schedule retry
@@ -1713,7 +1711,7 @@ mod tests {
 	#[test]
 	fn backoff_caps_at_maximum() {
 		let d = calculate_backoff(20); // way past cap
-								 // BACKOFF_MAX_SECS + 25% jitter headroom + 1s tolerance
+		// BACKOFF_MAX_SECS + 25% jitter headroom + 1s tolerance
 		#[allow(clippy::arithmetic_side_effects)]
 		let max_with_jitter = Duration::from_secs(BACKOFF_MAX_SECS + BACKOFF_MAX_SECS / 4 + 1);
 		assert!(d <= max_with_jitter);

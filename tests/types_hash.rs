@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use ironcat::types::hash::{double_sha256, Hash256, HASH_LEN};
+use ironcat::types::hash::{HASH_LEN, Hash256, double_sha256};
 
 #[test]
 fn double_sha256_empty() {

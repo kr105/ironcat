@@ -6,11 +6,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
-use super::{NodeManager, MAX_INV_KNOWN};
+use super::{MAX_INV_KNOWN, NodeManager};
 use crate::network::{
+	SharedTcpWriter, SharedTcpWriterExt,
 	message_getheaders::MessageGetHeaders,
 	message_inv::{InvItem, InvType, MessageInv},
-	SharedTcpWriter, SharedTcpWriterExt,
 };
 use crate::types::hash::Hash256;
 
@@ -55,10 +55,10 @@ pub(super) async fn handle_inv(
 		// Peer announcing unknown blocks means they're at least at our tip + 1
 		#[allow(clippy::cast_possible_wrap)] // chain height fits in i32 for the foreseeable chain
 		let estimated = node_manager.chain_height().saturating_add(1) as i32;
-		if let Some(mut node) = node_manager.nodes.get_mut(address) {
-			if estimated > node.height {
-				node.height = estimated;
-			}
+		if let Some(mut node) = node_manager.nodes.get_mut(address)
+			&& estimated > node.height
+		{
+			node.height = estimated;
 		}
 
 		let locator = node_manager.header_store.read().build_locator();
@@ -201,7 +201,7 @@ pub(super) fn handle_notfound(address: &IpAddr, payload: &[u8]) {
 
 #[cfg(test)]
 // Tests use unwrap/indexing for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::cast_possible_truncation)]
 mod tests {
 	use super::*;
 	use crate::difficulty::ConsensusParams;

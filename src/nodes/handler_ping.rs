@@ -3,10 +3,10 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{debug, warn};
 
-use super::{ban_expires_at, BanReason, NodeManager, NodeState};
+use super::{BanReason, NodeManager, NodeState, ban_expires_at};
 use crate::network::{SharedTcpWriter, SharedTcpWriterExt};
 use crate::utils::{unix_now, vec_to_u64_le};
 

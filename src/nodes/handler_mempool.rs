@@ -8,8 +8,8 @@ use tracing::debug;
 
 use super::NodeManager;
 use crate::network::{
-	message_inv::{InvItem, InvType, MessageInv},
 	SharedTcpWriter, SharedTcpWriterExt,
+	message_inv::{InvItem, InvType, MessageInv},
 };
 
 /// Maximum number of inv items per message (protocol limit)
@@ -67,7 +67,6 @@ mod tests {
 	use crate::difficulty::ConsensusParams;
 	use crate::mempool::Mempool;
 	use crate::nodes::test_helpers::{read_all_messages, tcp_pair, test_genesis};
-	use crate::types::hash::Hash256;
 
 	use std::net::IpAddr;
 	use tokio::sync::RwLock;

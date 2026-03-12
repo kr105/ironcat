@@ -10,9 +10,9 @@ use tracing::{debug, error, info, warn};
 
 use super::NodeManager;
 use crate::network::{
-	message_getheaders::MessageGetHeaders,
-	message_headers::{MessageHeaders, MAX_HEADERS_PER_MSG},
 	SharedTcpWriter, SharedTcpWriterExt,
+	message_getheaders::MessageGetHeaders,
+	message_headers::{MAX_HEADERS_PER_MSG, MessageHeaders},
 };
 use crate::types::hash::Hash256;
 
@@ -92,10 +92,10 @@ pub(super) async fn handle_headers(
 	// Sender sent us headers, so they have at least what we have
 	#[allow(clippy::cast_possible_wrap)] // chain height fits in i32 for the foreseeable chain
 	let tip = node_manager.chain_height() as i32;
-	if let Some(mut node) = node_manager.nodes.get_mut(address) {
-		if tip > node.height {
-			node.height = tip;
-		}
+	if let Some(mut node) = node_manager.nodes.get_mut(address)
+		&& tip > node.height
+	{
+		node.height = tip;
 	}
 
 	// Request more headers before persisting so the next batch arrives

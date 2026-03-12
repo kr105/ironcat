@@ -3,11 +3,11 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
-use super::{ban_expires_at, BanReason, NodeManager, NodeState, SENDHEADERS_VERSION};
-use crate::network::{message_getheaders::MessageGetHeaders, SharedTcpWriter, SharedTcpWriterExt};
+use super::{BanReason, NodeManager, NodeState, SENDHEADERS_VERSION, ban_expires_at};
+use crate::network::{SharedTcpWriter, SharedTcpWriterExt, message_getheaders::MessageGetHeaders};
 use crate::types::hash::Hash256;
 use crate::utils::unix_now;
 

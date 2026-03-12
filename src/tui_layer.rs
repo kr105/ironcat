@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use tokio::sync::mpsc;
-use tracing::{field::Visit, Level, Subscriber};
-use tracing_subscriber::{layer::Context, Layer};
+use tracing::{Level, Subscriber, field::Visit};
+use tracing_subscriber::{Layer, layer::Context};
 
 /// A log entry sent to the TUI for display
 pub struct TuiLogEntry {

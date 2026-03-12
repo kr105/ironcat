@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::warn;
 
 use crate::types::transaction::{OutPoint, Transaction};

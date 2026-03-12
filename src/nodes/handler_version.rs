@@ -3,11 +3,11 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::warn;
 
-use super::{ban_expires_at, BanReason, ConnectionType, NodeManager, NodeState, MAX_USER_AGENT_DISPLAY};
-use crate::network::{message_version::MessageVersion, NetworkAddress, SharedTcpWriter, SharedTcpWriterExt};
+use super::{BanReason, ConnectionType, MAX_USER_AGENT_DISPLAY, NodeManager, NodeState, ban_expires_at};
+use crate::network::{NetworkAddress, SharedTcpWriter, SharedTcpWriterExt, message_version::MessageVersion};
 use crate::utils::unix_now;
 
 /// Handles an incoming version message from a peer

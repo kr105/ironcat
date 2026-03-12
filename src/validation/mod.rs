@@ -10,13 +10,13 @@ pub mod block;
 pub mod subsidy;
 pub mod transaction;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::warn;
 
 use crate::difficulty::ChainLookup;
 use crate::types::block::Block;
 
-use subsidy::{get_block_subsidy, MAX_MONEY};
+use subsidy::{MAX_MONEY, get_block_subsidy};
 
 /// Block height at which BIP34 (height in coinbase) is enforced
 const BIP34_HEIGHT: u32 = 111;
@@ -181,10 +181,10 @@ fn encode_script_height(height: u32) -> Vec<u8> {
 
 	// If the MSB of the last byte has the sign bit set, append 0x00 so the
 	// value is interpreted as positive (CScriptNum sign-bit convention)
-	if let Some(&last) = data.last() {
-		if last & 0x80 != 0 {
-			data.push(0x00);
-		}
+	if let Some(&last) = data.last()
+		&& last & 0x80 != 0
+	{
+		data.push(0x00);
 	}
 
 	// Prepend the push length byte

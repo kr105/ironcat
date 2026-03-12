@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use ironcat::{
 	chainstate::ChainState,
@@ -14,8 +14,8 @@ use ironcat::{
 	difficulty::ConsensusParams,
 	dns,
 	mempool::Mempool,
-	network::{listening_start, SharedTcpWriterExt},
-	nodes::{block_download::BlockDownloadManager, NodeManager},
+	network::{SharedTcpWriterExt, listening_start},
+	nodes::{NodeManager, block_download::BlockDownloadManager},
 	storage::{
 		self, block_store::BlockStore, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore,
 	},
