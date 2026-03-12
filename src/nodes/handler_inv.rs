@@ -205,62 +205,8 @@ pub(super) fn handle_notfound(address: &IpAddr, payload: &[u8]) {
 mod tests {
 	use super::*;
 	use crate::difficulty::ConsensusParams;
-	use crate::network::Message;
+	use crate::nodes::test_helpers::{command_name, read_all_messages, tcp_pair, test_genesis};
 	use crate::storage::block_store::BlockStore;
-	use crate::types::block::BlockHeader;
-
-	use std::ffi::CStr;
-	use tokio::io::AsyncReadExt;
-	use tokio::net::tcp::OwnedReadHalf;
-	use tokio::net::TcpListener;
-
-	const fn test_genesis() -> BlockHeader {
-		BlockHeader {
-			version: 1,
-			prev_hash: Hash256::ZERO,
-			merkle_root: Hash256::ZERO,
-			timestamp: 0,
-			bits: 0,
-			nonce: 0,
-		}
-	}
-
-	/// Creates a loopback TCP pair and returns (writer for handler, reader for assertions)
-	async fn tcp_pair() -> (SharedTcpWriter, OwnedReadHalf) {
-		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
-		let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-		let (server, _) = listener.accept().await.unwrap();
-		let (read_half, _write_half) = server.into_split();
-		let (_client_read, client_write) = client.into_split();
-		let writer = Arc::new(tokio::sync::Mutex::new(client_write));
-		(writer, read_half)
-	}
-
-	/// Reads all protocol messages from the stream until the writer is dropped.
-	/// Call after the handler has returned so all data is already buffered
-	async fn read_all_messages(reader: &mut OwnedReadHalf) -> Vec<Message> {
-		let mut buf = Vec::new();
-		reader.read_to_end(&mut buf).await.unwrap();
-		let mut messages = Vec::new();
-		let mut offset = 0;
-		while offset < buf.len() {
-			match Message::from_bytes(&buf[offset..]) {
-				Ok((msg, consumed)) => {
-					offset += consumed;
-					messages.push(msg);
-				}
-				Err(crate::network::MessageParseError::Incomplete) => break,
-				Err(e) => panic!("corrupt message at offset {offset}: {e:?}"),
-			}
-		}
-		messages
-	}
-
-	/// Extracts the command name from a message's command field
-	fn command_name(msg: &Message) -> &str {
-		CStr::from_bytes_until_nul(&msg.command).unwrap().to_str().unwrap()
-	}
 
 	#[tokio::test]
 	async fn getdata_serves_block_from_store() {

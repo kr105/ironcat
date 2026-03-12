@@ -3,12 +3,16 @@
 pub mod block_download;
 mod handler_addr;
 mod handler_block;
+mod handler_getblocks;
 mod handler_headers;
 mod handler_inv;
+mod handler_mempool;
 mod handler_ping;
 mod handler_tx;
 mod handler_verack;
 mod handler_version;
+#[cfg(test)]
+mod test_helpers;
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -1614,6 +1618,10 @@ async fn parse_incoming_message(
 			)
 			.await
 		}
+		NetworkCommand::GetBlocks => {
+			handler_getblocks::handle_getblocks(node_manager, address, tcp_writer, &message.payload).await
+		}
+		NetworkCommand::Mempool => handler_mempool::handle_mempool(node_manager, address, tcp_writer).await,
 		NetworkCommand::Unknown(cmd) => {
 			warn!("Unknown command from {}: {}", address, cmd);
 			Ok(())

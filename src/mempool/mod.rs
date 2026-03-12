@@ -119,6 +119,11 @@ impl Mempool {
 		self.txs.is_empty()
 	}
 
+	/// Returns all transaction IDs in the mempool
+	pub fn txids(&self) -> Vec<Hash256> {
+		self.txs.keys().copied().collect()
+	}
+
 	/// Validates and accepts a transaction into the mempool
 	///
 	/// Validates against consensus rules, checks inputs exist in the

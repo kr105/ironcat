@@ -303,6 +303,35 @@ On receipt, Ironcat extracts the block hash from the header and forwards the raw
 
 Blocks with duplicate trailing transactions are rejected (CVE-2012-2459 merkle tree malleability protection).
 
+### mempool
+
+Empty payload. Requests the peer's mempool transaction IDs.
+
+On receipt, Ironcat responds with an inv message containing all transaction IDs in the mempool as MSG_TX items, up to 50,000 (the protocol inv limit). If the mempool is empty, no response is sent. If the mempool is not yet initialized, the message is silently ignored.
+
+### getblocks
+
+Requests block hashes starting from a block locator. Same wire format as getheaders.
+
+```
+[4] version         - Protocol version (u32 LE), currently 70012
+[var] hash_count    - VarInt, number of locator hashes (max 101)
+```
+
+Repeated `hash_count` times:
+
+```
+[32] hash           - Block hash (Hash256)
+```
+
+Followed by:
+
+```
+[32] hash_stop      - Hash of the last desired block, or all zeros for "send to tip"
+```
+
+On receipt, Ironcat finds the first locator hash that exists in its chain (the fork point), then responds with an inv message containing up to 500 block hashes as MSG_BLOCK items starting after the fork point. If `hash_stop` is non-zero and matched, that block is included and the response stops there. If no locator hash matches, genesis is used as the fork point and blocks are sent starting from height 1. Uses the height index for O(k) response construction.
+
 ### alert
 
 Ignored. Legacy alert system, deprecated.
