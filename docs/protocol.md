@@ -364,13 +364,13 @@ Us              Peer
 
 ```
 Peer            Us
-|-- version    -->  |
-|<-- version      --|
-|<-- verack       --|
-|-- verack     -->  |
-|<-- getaddr      --|
-|<-- sendheaders  --|  (if peer version >= 70012)
-|<-- getheaders   --|
+| -- version ------> |
+| <-- version ------ |
+| <-- verack ------- |
+| -- verack -------> |
+| <-- getaddr ------ |
+| <-- sendheaders -- |  (if peer version >= 70012)
+| <-- getheaders --- |
 ```
 
 1. Peer connects and sends their version
