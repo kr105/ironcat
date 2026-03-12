@@ -8,8 +8,8 @@
 - Prefer simple implementations over clever abstractions
 - Minimize external dependencies, prefer stdlib when reasonable
 - Update README.md when adding features or information relevant to newcomers
-- Update docs/protocol.md when changing wire format, message handling, handshake logic, state machine, or connection constants
-- Keep all documentation concrete, accurate, and free of filler -- every sentence should convey useful information
+- Update documentation in docs/ when changing wire format, message handling, handshake logic, state machine, connection constants or other important implementations
+- Keep all documentation concrete, accurate, and free of filler: every sentence should convey useful information
 
 ## Testing
 - TDD methodology, tests are equally or more important than working code
@@ -34,7 +34,7 @@
 
 ## Code Quality
 - No unsafe blocks unless absolutely unavoidable, and always document why with a // SAFETY: comment
-- Every #[allow(clippy::...)] must have a comment explaining why the lint doesn't apply. No blanket allows on functions; put them on the specific line. Exception: dense numerical code (crypto primitives, difficulty algorithms) where arithmetic/indexing/cast lints would fire on nearly every line -- blanket allows on the function are OK with a single comment explaining why
+- Every #[allow(clippy::...)] must have a comment explaining why the lint doesn't apply. No blanket allows on functions; put them on the specific line. Exception: dense numerical code (crypto primitives, difficulty algorithms, etc) where arithmetic/indexing/cast lints would fire on nearly every line -- blanket allows on the function are OK with a single comment explaining why
 - All public functions and types must have /// doc comments
 - Code must pass cargo fmt and cargo clippy with no warnings before being considered done
 
