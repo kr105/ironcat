@@ -25,7 +25,6 @@ use ironcat::types::block::{Block, BlockHeader};
 use ironcat::types::hash::{Hash256, double_sha256};
 use ironcat::types::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use ironcat::validation::subsidy::COIN;
-use redb::TableDefinition;
 
 /// Test genesis block header (not real Catcoin genesis, just for test isolation)
 const GENESIS_HEADER: BlockHeader = BlockHeader {
@@ -130,7 +129,7 @@ fn make_tx(inputs: Vec<OutPoint>, outputs: Vec<i64>) -> Transaction {
 
 /// Inserts a UTXO directly into the chainstate database for testing
 fn seed_utxo(cs: &ChainState, outpoint: &OutPoint, value: i64) {
-	const UTXO_SET: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("utxos");
+	use ironcat::chainstate::UTXO_SET;
 
 	let coin = Coin {
 		tx_out: TxOut {
@@ -332,6 +331,39 @@ fn activate_best_chain_need_blocks_when_fork_blocks_missing() {
 			assert!(missing.contains(&f1));
 			assert!(missing.contains(&f2));
 			assert!(missing.contains(&f3));
+		}
+		other => panic!("expected NeedBlocks, got {other:?}"),
+	}
+
+	// Chainstate should be unchanged
+	assert_eq!(ctx.chainstate.tip_height(), 2);
+}
+
+#[test]
+fn activate_best_chain_need_blocks_partial_availability() {
+	let mut ctx = ReorgTestCtx::new();
+	let genesis_hash = GENESIS_HEADER.block_hash();
+
+	// Build a 2-block active chain
+	let (h1, _) = ctx.connect_block(genesis_hash, 1, 100);
+	let (_h2, _) = ctx.connect_block(h1, 2, 200);
+
+	// Build a 4-block fork: store block data for f1 and f3 only,
+	// leave f2 and f4 as headers-only
+	let (f1, _) = ctx.add_fork_block(genesis_hash, 1, 3001);
+	let f2 = ctx.add_fork_header(f1, 3002);
+	let (f3, _) = ctx.add_fork_block(f2, 3, 3003);
+	let f4 = ctx.add_fork_header(f3, 3004);
+
+	// Reorg should report only the two missing blocks
+	let result =
+		reorg::activate_best_chain(&mut ctx.headers, &ctx.chainstate, &ctx.block_store, &mut ctx.mempool).unwrap();
+
+	match result {
+		ActivateResult::NeedBlocks(missing) => {
+			assert_eq!(missing.len(), 2, "expected 2 missing blocks, got {}", missing.len());
+			assert!(missing.contains(&f2), "f2 should be missing");
+			assert!(missing.contains(&f4), "f4 should be missing");
 		}
 		other => panic!("expected NeedBlocks, got {other:?}"),
 	}

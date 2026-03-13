@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use ironcat::{
@@ -179,24 +179,28 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 			}
 			let mut mempool_guard = mp.blocking_write();
 			match reorg::activate_best_chain(&mut headers, &cs, &bs, &mut mempool_guard) {
-				Ok(result) => {
-					if let reorg::ActivateResult::Reorganized {
-						ref old_tip,
-						ref new_tip,
+				Ok(reorg::ActivateResult::Reorganized {
+					ref old_tip,
+					ref new_tip,
+					disconnected,
+					connected,
+				}) => {
+					info!(
+						old_tip = %old_tip,
+						new_tip = %new_tip,
 						disconnected,
 						connected,
-					} = result
-					{
-						info!(
-							old_tip = %old_tip,
-							new_tip = %new_tip,
-							disconnected,
-							connected,
-							"crash recovery: chain reorganization completed"
-						);
-						headers.purge_stale_forks(cs.tip_height());
-					}
+						"crash recovery: chain reorganization completed"
+					);
+					headers.purge_stale_forks(cs.tip_height());
 				}
+				Ok(reorg::ActivateResult::NeedBlocks(ref missing)) => {
+					warn!(
+						count = missing.len(),
+						"crash recovery: fork blocks missing, will fetch after block download starts"
+					);
+				}
+				Ok(reorg::ActivateResult::AlreadyBest) => {}
 				Err(e) => {
 					error!(error = %e, "crash recovery: chain reorganization failed");
 				}

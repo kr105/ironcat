@@ -25,7 +25,7 @@ pub mod undo;
 pub mod undo_store;
 
 /// UTXO set table: outpoint (txid 32 bytes + index 4 bytes) -> serialized Coin
-const UTXO_SET: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("utxos");
+pub const UTXO_SET: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("utxos");
 
 /// Metadata table for chain tip and other state
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

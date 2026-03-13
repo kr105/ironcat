@@ -53,11 +53,9 @@ const fn dummy_block_header() -> BlockHeader {
 
 /// Helper: inserts a UTXO directly into the chainstate database for testing
 fn seed_utxo(cs: &ChainState, outpoint: &OutPoint, value: i64) {
+	use ironcat::chainstate::UTXO_SET;
 	use ironcat::chainstate::coin::Coin;
 	use ironcat::types::transaction::TxOut;
-	use redb::TableDefinition;
-
-	const UTXO_SET: TableDefinition<&[u8; 36], &[u8]> = TableDefinition::new("utxos");
 
 	let coin = Coin {
 		tx_out: TxOut {
