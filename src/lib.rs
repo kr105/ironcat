@@ -9,6 +9,7 @@ pub mod mempool;
 pub mod network;
 pub mod nodes;
 pub mod pow;
+pub mod reorg;
 pub mod script;
 pub mod storage;
 pub mod tui_layer;

@@ -16,6 +16,7 @@ use ironcat::{
 	mempool::Mempool,
 	network::{SharedTcpWriterExt, listening_start},
 	nodes::{NodeManager, block_download::BlockDownloadManager},
+	reorg,
 	storage::{
 		self, block_store::BlockStore, header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore,
 	},
@@ -159,6 +160,52 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	node_manager.set_block_store(Arc::clone(&block_store));
 	node_manager.set_chainstate(Arc::clone(&chainstate));
 
+	// Crash recovery: if the best header tip differs from the chainstate tip,
+	// attempt a reorg to reconcile state from a previous unclean shutdown.
+	// Uses blocking_write on the mempool lock directly -- safe because no
+	// async tasks are running yet. Bypasses try_activate_best_chain to avoid
+	// the try_write skip-on-contention path which could silently do nothing
+	{
+		let nm = Arc::clone(&node_manager);
+		let cs = Arc::clone(&chainstate);
+		let bs = Arc::clone(&block_store);
+		let mp = Arc::clone(&mempool);
+		#[allow(clippy::significant_drop_tightening)] // headers write lock intentionally held through reorg + purge
+		tokio::task::spawn_blocking(move || {
+			let mut headers = nm.header_store.write();
+			let (best_hash, _, _) = headers.best_tip();
+			if best_hash == cs.tip() {
+				return;
+			}
+			let mut mempool_guard = mp.blocking_write();
+			match reorg::activate_best_chain(&mut headers, &cs, &bs, &mut mempool_guard) {
+				Ok(result) => {
+					if let reorg::ActivateResult::Reorganized {
+						ref old_tip,
+						ref new_tip,
+						disconnected,
+						connected,
+					} = result
+					{
+						info!(
+							old_tip = %old_tip,
+							new_tip = %new_tip,
+							disconnected,
+							connected,
+							"crash recovery: chain reorganization completed"
+						);
+						headers.purge_stale_forks(cs.tip_height());
+					}
+				}
+				Err(e) => {
+					error!(error = %e, "crash recovery: chain reorganization failed");
+				}
+			}
+		})
+		.await
+		.context("crash recovery reorg task panicked")?;
+	}
+
 	// Create channel for forwarding received blocks to the download manager
 	let (block_tx, block_rx) = tokio::sync::mpsc::channel(512);
 	node_manager.set_block_sender(block_tx);
@@ -167,6 +214,10 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	// manager can immediately reassign in-flight blocks
 	let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
 	node_manager.set_disconnect_sender(disconnect_tx);
+
+	// Create channel for reorg notifications to the download manager
+	let (reorg_tx, reorg_rx) = tokio::sync::mpsc::unbounded_channel();
+	node_manager.set_reorg_sender(reorg_tx);
 
 	// Load bans first so banned IPs get rejected when loading peers
 	if let Some(ban_db) = storage::load_file::<storage::bans::BanDb>(&args.datadir.join("banlist.dat")) {
@@ -249,7 +300,7 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		let mut manager = match tokio::task::spawn_blocking({
 			let nm = Arc::clone(&nm);
 			let bs = Arc::clone(&bs);
-			move || BlockDownloadManager::new(nm, bs, block_rx, disconnect_rx, cs, mp)
+			move || BlockDownloadManager::new(nm, bs, block_rx, disconnect_rx, reorg_rx, cs, mp)
 		})
 		.await
 		{

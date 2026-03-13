@@ -338,6 +338,15 @@ impl BlockStore {
 		Ok(buf)
 	}
 
+	/// Loads and deserializes a block from the flat file by hash
+	///
+	/// Wraps `load_block` with `Block::from_bytes`. No re-validation is
+	/// performed since these blocks were already validated when first stored
+	pub fn load_and_deserialize(&self, hash: &Hash256) -> Result<crate::types::block::Block> {
+		let raw = self.load_block(hash)?;
+		crate::types::block::Block::from_bytes(&raw).with_context(|| format!("failed to deserialize block {hash}"))
+	}
+
 	/// Returns all block hashes currently committed in the redb index
 	///
 	/// Used at startup to populate in-memory tracking so the download

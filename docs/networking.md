@@ -150,6 +150,10 @@ Blocks are connected in strict height order via `chainstate.connect_block()`, wh
 
 On startup, `catch_up_chainstate()` reads already-stored blocks from disk to resume where a previous session left off.
 
+### Reorg Handling
+
+After a chain reorganization, `handle_reorg` resets the download manager: clears all in-flight requests and pending blocks (they may reference the old chain), and sets `next_connect_height` to resume downloading from the new tip. The headers handler triggers reorgs post-IBD when `accept_header` detects a fork with more cumulative work. See [consensus.md](consensus.md) for reorg execution details.
+
 ## Shutdown
 
 On exit (Ctrl+C or TUI quit), ironcat sends a clean TCP FIN to all connected peers before terminating. Writers are collected without holding DashMap locks, then shut down sequentially to avoid lock contention across await points.

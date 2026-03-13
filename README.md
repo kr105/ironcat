@@ -16,14 +16,14 @@ Ironcat is an independent full node implementation that doesn't share code with 
 - Block download via sliding-window manager with parallel peer fetching
 - Block and transaction validation (structural, contextual, and script verification)
 - Script engine with P2SH support, 45+ opcodes, ECDSA signature verification
-- Chainstate with UTXO tracking, coinbase maturity, and undo data for future reorg support
+- Chainstate with UTXO tracking, coinbase maturity, and undo data for reorg support
+- Chain reorganization with cumulative chainwork tracking, fork detection, and atomic disconnect/connect
 - Transaction mempool with fee-based eviction, script verification, and parent chain resolution
 - Persistent storage for headers, blocks, peers, bans, and chainstate across restarts
 - TUI mode with live stats, peer table, mempool view, and log panel
 - Daemon mode for headless servers
 
 **Not yet implemented:**
-- Chain reorganization (reorg detection and block disconnection)
 - Wallet (key management, address generation, transaction creation)
 - JSON-RPC interface for programmatic access
 - Mining / block template creation

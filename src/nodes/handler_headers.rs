@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
 use super::NodeManager;
+use crate::headers::AcceptResult;
 use crate::network::{
 	SharedTcpWriter, SharedTcpWriterExt,
 	message_getheaders::MessageGetHeaders,
@@ -30,7 +31,10 @@ pub(super) fn handle_sendheaders(node_manager: &NodeManager, address: &IpAddr) {
 /// Handles an incoming headers message from a peer
 ///
 /// Validates chain continuity via batch insertion, then requests
-/// more headers if we received a full batch (2000)
+/// more headers if we received a full batch (2000). Post-IBD, falls
+/// back to individual `accept_header` for fork headers and triggers
+/// reorg when a fork has more cumulative work
+#[allow(clippy::too_many_lines)] // sequential handling phases, splitting would obscure the flow
 pub(super) async fn handle_headers(
 	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
@@ -51,15 +55,54 @@ pub(super) async fn handle_headers(
 	// Don't disconnect on failure -- the peer may have sent orphan or fork headers
 	// that we can't connect yet
 	let start = Instant::now();
-	let (batch, locator) = {
+	let (batch, locator, need_reorg) = {
 		let mut store = node_manager.header_store.write();
 		let result = store.validate_and_commit(&headers);
 		let elapsed_ms = start.elapsed().as_millis();
-		let batch = match result {
-			Ok(b) => b,
+
+		let (batch, need_reorg) = match result {
+			Ok(b) => (b, false),
 			Err(e) => {
-				warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
-				return Ok(());
+				// Batch validation failed -- try accept_header individually (fork headers)
+				if node_manager.is_in_ibd() {
+					warn!(peer = %address, error = %e, "failed to add headers during IBD, ignoring batch");
+					return Ok(());
+				}
+
+				let mut need_reorg = false;
+				let mut accepted = 0u32;
+				for header in &headers {
+					match store.accept_header(header.clone()) {
+						Ok(AcceptResult::NeedReorg) => {
+							need_reorg = true;
+							accepted = accepted.saturating_add(1);
+						}
+						Ok(AcceptResult::Accepted) => {
+							accepted = accepted.saturating_add(1);
+						}
+						Ok(AcceptResult::AlreadyKnown) => {}
+						Err(accept_err) => {
+							debug!(
+								peer = %address,
+								error = %accept_err,
+								"accept_header rejected individual header"
+							);
+						}
+					}
+				}
+
+				if accepted > 0 {
+					info!(
+						peer = %address,
+						accepted,
+						elapsed_ms,
+						"accepted fork headers individually"
+					);
+				} else {
+					warn!(peer = %address, error = %e, "failed to add headers, ignoring batch");
+				}
+
+				(Vec::new(), need_reorg)
 			}
 		};
 
@@ -73,16 +116,18 @@ pub(super) async fn handle_headers(
 		let tip_height = store.height();
 		drop(store);
 
-		info!(
-			received = count,
-			added = batch.len(),
-			tip = tip_height,
-			elapsed_ms = elapsed_ms,
-			peer = %address,
-			"processed headers"
-		);
+		if !batch.is_empty() {
+			info!(
+				received = count,
+				added = batch.len(),
+				tip = tip_height,
+				elapsed_ms = start.elapsed().as_millis(),
+				peer = %address,
+				"processed headers"
+			);
+		}
 
-		(batch, locator)
+		(batch, locator, need_reorg)
 	};
 
 	if !batch.is_empty() {
@@ -114,6 +159,14 @@ pub(super) async fn handle_headers(
 		let persist_result = node_manager.header_store.read().persist_batch(&batch);
 		if let Err(e) = persist_result {
 			error!(peer = %address, error = %e, "failed to persist headers to disk");
+		}
+	}
+
+	// Trigger reorg if a fork with more work was detected
+	if need_reorg {
+		let nm = Arc::clone(node_manager);
+		if let Err(e) = tokio::task::spawn_blocking(move || nm.try_activate_best_chain()).await {
+			error!(error = %e, "reorg task panicked");
 		}
 	}
 

@@ -364,6 +364,45 @@ impl Mempool {
 		}
 	}
 
+	/// Re-validates and accepts transactions from disconnected blocks
+	///
+	/// Filters coinbase transactions, then uses a multi-pass approach to
+	/// handle dependency ordering (tx B spends tx A output). Transactions
+	/// that are no longer valid against the new chain are silently dropped.
+	/// Returns the number of successfully re-added transactions
+	pub fn readd_disconnected_txs(&mut self, txs: Vec<Transaction>, chainstate: &ChainState) -> u32 {
+		let mut pending: Vec<Transaction> = txs.into_iter().filter(|tx| !tx.is_coinbase()).collect();
+
+		let mut total_added: u32 = 0;
+		let mut made_progress = true;
+
+		// Multi-pass: keep trying until no progress (handles dependencies)
+		while made_progress && !pending.is_empty() {
+			made_progress = false;
+			let mut remaining = Vec::new();
+			for tx in pending {
+				let txid = tx.txid();
+				match self.accept_tx(tx.clone(), chainstate) {
+					Ok(_) => {
+						total_added = total_added.saturating_add(1);
+						made_progress = true;
+					}
+					Err(e) => {
+						debug!(
+							%txid,
+							error = %e,
+							"disconnected tx invalid against new chain"
+						);
+						remaining.push(tx);
+					}
+				}
+			}
+			pending = remaining;
+		}
+
+		total_added
+	}
+
 	/// Returns a statistics snapshot for TUI display
 	pub fn get_stats(&self) -> MempoolStats {
 		if self.txs.is_empty() {

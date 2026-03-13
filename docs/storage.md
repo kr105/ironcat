@@ -22,30 +22,34 @@ All persistent data lives in a single directory (default `~/.ironcat/`, configur
 
 ## Header Storage
 
-Block headers are stored in `headers.redb` and loaded entirely into memory at startup for fast access.
+Block headers are stored in `headers.redb` and loaded entirely into memory at startup for fast access. The store is a tree that tracks all valid headers (active chain and forks) with cumulative chainwork.
 
 ### Database Schema
 
-Single redb table:
-
 | Table | Key | Value |
 |-------|-----|-------|
-| `headers` | u32 (block height) | `[u8; 80]` (raw serialized header) |
+| `headers_v2` | `[u8; 32]` (block hash) | `[u8; 116]` (header 80 + height 4 LE + chainwork 32 LE) |
+| `invalid_tips` | `[u8; 32]` (block hash) | `()` |
 
-Block hashes are not stored -- they are recomputed from the raw bytes on load.
+The `headers_v2` table stores headers keyed by hash (not height) to support fork storage. Each value is a fixed 116-byte entry encoding the 80-byte header, 4-byte LE height, and 32-byte LE chainwork (U256). The `invalid_tips` table persists fork tips that failed validation so they survive restarts.
+
+Schema migration: if the old height-keyed `headers` table is detected on open, it is deleted and the node re-syncs headers from peers.
 
 ### Write Strategy
 
-Write-through: headers are persisted to redb on every batch insertion, then committed to the in-memory store. The in-memory store uses dual indexing:
+Write-through: headers are persisted to redb on every batch insertion, then committed to the in-memory store. The in-memory store uses:
 
 - `HashMap<Hash256, StoredHeader>` for O(1) hash lookups
-- `Vec<Hash256>` for O(1) height lookups
+- `Vec<Hash256>` (`active_chain`) for O(1) height lookups on the best chain
+- `HashSet<Hash256>` (`active_set`) for O(1) active chain membership checks
+- `HashSet<Hash256>` (`tips`) tracking all chain tips
+- `(Hash256, U256)` (`best_known_tip`) caching the tip with highest chainwork
 
 The HashMap is pre-allocated for 500,000 entries to minimize rehashing during initial block download.
 
 ### Loading
 
-On startup, all headers are loaded from redb in a single scan. Heights must be contiguous from 0 -- any gap causes load failure. A safety cap of 10 million headers prevents OOM from corrupted databases.
+On startup, all headers are loaded from redb. The active chain is reconstructed by walking `prev_hash` links from the best tip (highest chainwork) back to genesis. Tips are identified as headers not referenced as `prev_hash` by any other header. Invalid tips are loaded from the `invalid_tips` table. A safety cap of 10 million headers prevents OOM from corrupted databases.
 
 If genesis doesn't match the expected network hash, the store is cleared. Backend errors cause fallback to in-memory only.
 

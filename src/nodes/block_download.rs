@@ -70,6 +70,8 @@ pub struct BlockDownloadManager {
 	block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
 	/// Receives peer disconnect notifications for immediate in-flight expiry
 	disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
+	/// Receives reorg notifications (new tip height) to reset download state
+	reorg_rx: mpsc::UnboundedReceiver<u32>,
 	/// Blocks currently being downloaded, keyed by block hash
 	pub in_flight: HashMap<Hash256, InFlightEntry>,
 	/// Next chain height to request
@@ -77,9 +79,9 @@ pub struct BlockDownloadManager {
 	/// In-memory set of all stored block hashes (avoids redb reads)
 	stored_hashes: HashSet<Hash256>,
 	/// Blocks waiting to be connected in order, keyed by height
-	pending_blocks: BTreeMap<u32, (Hash256, Block, Vec<u8>)>,
+	pub pending_blocks: BTreeMap<u32, (Hash256, Block, Vec<u8>)>,
 	/// Next height that needs to be connected to the chainstate
-	next_connect_height: u32,
+	pub next_connect_height: u32,
 	/// Whether we were caught up on the previous loop iteration
 	was_caught_up: bool,
 	/// Blocks stored since last flush
@@ -113,6 +115,7 @@ impl BlockDownloadManager {
 		block_store: Arc<BlockStore>,
 		block_rx: mpsc::Receiver<(Hash256, Vec<u8>)>,
 		disconnect_rx: mpsc::UnboundedReceiver<IpAddr>,
+		reorg_rx: mpsc::UnboundedReceiver<u32>,
 		chainstate: Arc<ChainState>,
 		mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>,
 	) -> Self {
@@ -146,6 +149,7 @@ impl BlockDownloadManager {
 			mempool,
 			block_rx,
 			disconnect_rx,
+			reorg_rx,
 			in_flight: HashMap::new(),
 			next_height: 1,
 			stored_hashes,
@@ -270,6 +274,9 @@ impl BlockDownloadManager {
 				}
 				Some(peer) = self.disconnect_rx.recv() => {
 					self.handle_peer_disconnect(peer);
+				}
+				Some(new_tip_height) = self.reorg_rx.recv() => {
+					self.handle_reorg(new_tip_height);
 				}
 				() = tokio::time::sleep(sleep_duration) => {
 					// Flush any pending blocks on the timer tick
@@ -798,6 +805,23 @@ impl BlockDownloadManager {
 			);
 			self.next_height = self.next_height.min(min_height);
 		}
+	}
+
+	/// Resets download state after a chain reorganization
+	///
+	/// Clears all in-flight requests and pending blocks since they may
+	/// reference the old chain. Sets the next connect height to resume
+	/// downloading from the new tip
+	pub fn handle_reorg(&mut self, new_tip_height: u32) {
+		self.next_connect_height = new_tip_height.saturating_add(1);
+		self.in_flight.clear();
+		self.pending_blocks.clear();
+
+		info!(
+			new_tip_height,
+			next_connect = self.next_connect_height,
+			"block download manager reset after reorg"
+		);
 	}
 
 	/// Collects writers for all currently connected peers

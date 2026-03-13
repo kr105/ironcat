@@ -77,6 +77,24 @@ pub fn target_to_compact(target: U256) -> u32 {
 	compact
 }
 
+/// Computes the proof-of-work for a block given its compact target (nBits)
+///
+/// Returns `2^256 / (target + 1)`. Invalid targets (negative, overflow, or
+/// zero) return zero work
+pub fn work_from_bits(compact: u32) -> U256 {
+	let (target, negative, overflow) = compact_to_target(compact);
+	if negative || overflow || target.is_zero() {
+		return U256::zero();
+	}
+	// 2^256 is not representable in U256, but we can compute:
+	// 2^256 / (target+1) = (!target) / (target+1) + 1
+	// because !target = 2^256 - 1 - target
+	#[allow(clippy::arithmetic_side_effects)] // target is non-zero, so target+1 > 0; division and +1 cannot overflow
+	{
+		(!target / (target + 1)) + 1
+	}
+}
+
 /// Returns the number of bits needed to represent the value (position of
 /// the highest set bit + 1). Returns 0 for zero
 ///

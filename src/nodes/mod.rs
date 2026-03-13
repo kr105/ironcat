@@ -137,6 +137,9 @@ type BlockSender = tokio::sync::mpsc::Sender<(Hash256, Vec<u8>)>;
 /// Sender half of the peer disconnect notification channel
 type DisconnectSender = tokio::sync::mpsc::UnboundedSender<IpAddr>;
 
+/// Sender half of the reorg notification channel (carries new tip height)
+type ReorgSender = tokio::sync::mpsc::UnboundedSender<u32>;
+
 /// Reason why a node was banned (bans expire after `BAN_DURATION_SECS`)
 #[derive(Debug)]
 pub enum BanReason {
@@ -505,6 +508,9 @@ pub struct NodeManager {
 	/// Channel sender for notifying the download manager when a peer disconnects
 	disconnect_sender: parking_lot::Mutex<Option<DisconnectSender>>,
 
+	/// Channel sender for notifying the download manager after a reorg
+	reorg_sender: parking_lot::Mutex<Option<ReorgSender>>,
+
 	/// Cached best contiguous block height for lock-free TUI reads
 	cached_block_height: AtomicU32,
 
@@ -557,6 +563,7 @@ impl NodeManager {
 			cached_tip_bits: AtomicU32::new(initial_bits),
 			block_sender: parking_lot::Mutex::new(None),
 			disconnect_sender: parking_lot::Mutex::new(None),
+			reorg_sender: parking_lot::Mutex::new(None),
 			cached_block_height: AtomicU32::new(0),
 			mempool: parking_lot::Mutex::new(None),
 			chainstate: parking_lot::Mutex::new(None),
@@ -574,6 +581,11 @@ impl NodeManager {
 	/// Attaches the disconnect notification channel for the download manager
 	pub fn set_disconnect_sender(&self, sender: DisconnectSender) {
 		*self.disconnect_sender.lock() = Some(sender);
+	}
+
+	/// Attaches the reorg notification channel for the download manager
+	pub fn set_reorg_sender(&self, sender: ReorgSender) {
+		*self.reorg_sender.lock() = Some(sender);
 	}
 
 	/// Attaches the shared mempool for transaction relay and serving
@@ -828,6 +840,82 @@ impl NodeManager {
 		let store = self.header_store.read();
 		self.cached_height.store(store.height(), Ordering::Relaxed);
 		self.cached_tip_bits.store(store.tip_bits(), Ordering::Relaxed);
+	}
+
+	/// Returns true if the node is in initial block download
+	///
+	/// IBD is defined as the chainstate tip being more than 1000 blocks
+	/// behind the header tip. During IBD, reorg attempts are suppressed
+	pub fn is_in_ibd(&self) -> bool {
+		let header_height = self.header_store.read().height();
+		let chain_height = self.chainstate().map_or(0, |cs| cs.tip_height());
+		header_height.saturating_sub(chain_height) > 1_000
+	}
+
+	/// Attempts to activate the best known chain if it differs from the chainstate tip
+	///
+	/// Acquires write locks on header store and mempool, then calls the
+	/// reorg coordinator. Returns the result for the caller to act on
+	/// (e.g. resetting the block download manager). No-op during IBD
+	#[allow(clippy::significant_drop_tightening)] // headers write lock intentionally held through reorg + purge
+	pub fn try_activate_best_chain(&self) -> Option<crate::reorg::ActivateResult> {
+		if self.is_in_ibd() {
+			return None;
+		}
+
+		let chainstate = self.chainstate()?;
+		let block_store = self.block_store()?;
+		let mempool_arc = self.mempool()?;
+
+		// Quick check: does best_tip differ from chainstate tip?
+		let (best_hash, _, _) = self.header_store.read().best_tip();
+		if best_hash == chainstate.tip() {
+			return None;
+		}
+
+		let mut headers = self.header_store.write();
+		// Try to acquire mempool lock without blocking. If contended,
+		// skip this attempt -- we'll retry on the next header message.
+		// This avoids the tokio anti-pattern of calling blocking_write
+		// on an async RwLock from a synchronous spawn_blocking context
+		let Ok(mut mempool) = mempool_arc.try_write() else {
+			warn!("mempool lock contended during reorg attempt, will retry");
+			return None;
+		};
+
+		match crate::reorg::activate_best_chain(&mut headers, &chainstate, &block_store, &mut mempool) {
+			Ok(result) => {
+				if let crate::reorg::ActivateResult::Reorganized {
+					ref old_tip,
+					ref new_tip,
+					disconnected,
+					connected,
+				} = result
+				{
+					let new_height = chainstate.tip_height();
+					info!(
+						old_tip = %old_tip,
+						new_tip = %new_tip,
+						disconnected,
+						connected,
+						"chain reorganization completed"
+					);
+
+					// Notify download manager to reset its state
+					if let Some(sender) = self.reorg_sender.lock().as_ref() {
+						let _ = sender.send(new_height);
+					}
+
+					// Purge stale fork headers
+					headers.purge_stale_forks(new_height);
+				}
+				Some(result)
+			}
+			Err(e) => {
+				error!(error = %e, "chain reorganization failed");
+				None
+			}
+		}
 	}
 
 	/// Returns stats and node snapshots in a single `DashMap` iteration

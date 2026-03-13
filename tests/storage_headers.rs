@@ -10,7 +10,7 @@ use std::sync::{
 
 use anyhow::{Result, bail};
 use ironcat::{
-	difficulty::ConsensusParams,
+	difficulty::{ConsensusParams, U256},
 	headers::HeaderStore,
 	storage::{header_store_backend::HeaderStoreBackend, header_store_redb::RedbHeaderStore},
 	types::{block::BlockHeader, hash::Hash256},
@@ -193,8 +193,12 @@ fn load_all_returns_sorted_by_height() {
 	let all = backend.load_all().unwrap();
 	assert_eq!(all.len(), 4);
 
-	for (i, (_header, height)) in all.iter().enumerate() {
-		assert_eq!(*height, i as u32);
+	// Hash-keyed storage doesn't guarantee height ordering in iteration,
+	// but all heights 0-3 should be present
+	let mut heights: Vec<u32> = all.iter().map(|(_, _, h, _)| *h).collect();
+	heights.sort_unstable();
+	for (i, &h) in heights.iter().enumerate() {
+		assert_eq!(h, i as u32);
 	}
 }
 
@@ -244,21 +248,29 @@ impl FailingBackend {
 }
 
 impl HeaderStoreBackend for FailingBackend {
-	fn persist_header(&self, _header: &BlockHeader, _height: u32) -> Result<()> {
+	fn persist_header(&self, _hash: &Hash256, _header: &BlockHeader, _height: u32, _chainwork: U256) -> Result<()> {
 		if self.should_fail.load(Ordering::Relaxed) {
 			bail!("simulated persist failure");
 		}
 		Ok(())
 	}
 
-	fn persist_headers(&self, _headers: &[(BlockHeader, u32)]) -> Result<()> {
+	fn persist_headers(&self, _headers: &[(Hash256, BlockHeader, u32, U256)]) -> Result<()> {
 		if self.should_fail.load(Ordering::Relaxed) {
 			bail!("simulated batch persist failure");
 		}
 		Ok(())
 	}
 
-	fn load_all(&self) -> Result<Vec<(BlockHeader, u32)>> {
+	fn load_all(&self) -> Result<Vec<(Hash256, BlockHeader, u32, U256)>> {
+		Ok(Vec::new())
+	}
+
+	fn persist_invalid_tip(&self, _hash: &Hash256) -> Result<()> {
+		Ok(())
+	}
+
+	fn load_invalid_tips(&self) -> Result<Vec<Hash256>> {
 		Ok(Vec::new())
 	}
 
@@ -319,6 +331,51 @@ fn batch_persist_failure_blocks_all_inserts() {
 	assert!(store.add_headers(&[h1, h2]).is_err());
 	// In-memory state should NOT have advanced
 	assert_eq!(store.height(), 0);
+}
+
+#[test]
+fn persist_invalid_tip_survives_reload() {
+	let dir = tempfile::tempdir().unwrap();
+	let db_path = dir.path().join("headers.redb");
+
+	let tip_hash = make_header(genesis_hash(), 100).block_hash();
+
+	// First session: persist an invalid tip
+	{
+		let backend = open_at(&db_path);
+		let _store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::testing(), Some(Arc::clone(&backend)));
+		backend.persist_invalid_tip(&tip_hash).unwrap();
+	}
+
+	// Second session: reopen and verify
+	{
+		let backend = open_at(&db_path);
+		let tips = backend.load_invalid_tips().unwrap();
+		assert_eq!(tips.len(), 1);
+		assert_eq!(tips[0], tip_hash);
+	}
+}
+
+#[test]
+fn clear_removes_invalid_tips() {
+	let dir = tempfile::tempdir().unwrap();
+	let backend = open_at(&dir.path().join("headers.redb"));
+	let mut store = HeaderStore::with_backend(GENESIS_HEADER, ConsensusParams::testing(), Some(Arc::clone(&backend)));
+
+	// Add a header and an invalid tip
+	let h1 = make_header(genesis_hash(), 100);
+	store.add_header(&h1).unwrap();
+	backend.persist_invalid_tip(&h1.block_hash()).unwrap();
+
+	// Verify they exist before clearing
+	assert_eq!(backend.count().unwrap(), 2);
+	assert_eq!(backend.load_invalid_tips().unwrap().len(), 1);
+
+	// Clear everything
+	backend.clear().unwrap();
+
+	assert!(backend.load_invalid_tips().unwrap().is_empty());
+	assert!(backend.load_all().unwrap().is_empty());
 }
 
 #[test]

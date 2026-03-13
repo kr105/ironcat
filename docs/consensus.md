@@ -10,7 +10,8 @@ Key modules:
 - `script` -- stack-based VM, opcodes, ECDSA signature verification
 - `chainstate` -- UTXO set, block connection/disconnection, undo data
 - `pow` -- scrypt hash computation and target comparison
-- `headers` -- header chain with batch validation and `BatchLookup` overlay
+- `headers` -- header tree with batch validation, fork tracking, and `BatchLookup`/`ForkLookup` overlays
+- `reorg` -- chain reorganization coordinator
 
 ## Difficulty Algorithms
 
@@ -163,6 +164,51 @@ Reverses a connected block using stored undo data: removes the block's outputs f
 ### Storage
 
 UTXO set and undo index are stored in `chainstate.redb`. See [storage.md](storage.md) for details on the database schema, undo flat files, and data formats.
+
+## Chain Reorganization
+
+When a fork accumulates more proof-of-work than the active chain, ironcat switches to it.
+
+### Chainwork
+
+Each block contributes `work = 2^256 / (target + 1)` where `target` is derived from the header's compact nBits. Cumulative chainwork for a block is the sum of work for all blocks from genesis to that block. The chain with the highest cumulative chainwork is considered best.
+
+### Header Tree
+
+The header store maintains a tree of all known valid headers, not just the active chain. Fork headers are accepted via `accept_header` (post-IBD) and tracked with their cumulative chainwork. The `tips` set tracks all chain tips, and `best_known_tip` caches the tip with the highest chainwork.
+
+`ForkLookup` enables difficulty validation for fork headers by walking `prev_hash` links for headers not on the active chain, falling back to the active chain for shared ancestry.
+
+### Reorg Execution
+
+When `accept_header` detects a fork with more chainwork than the active chain (`NeedReorg`), the reorg coordinator (`activate_best_chain`) orchestrates the switch:
+
+1. **Fork point:** `find_fork_point` walks both chains backward until they meet
+2. **Availability check:** All blocks on the new chain must be in the block store. Missing blocks return `NeedBlocks` for the caller to fetch
+3. **Disconnect:** Old chain blocks are disconnected in reverse order via `chainstate.disconnect_block`, collecting non-coinbase transactions for mempool re-addition
+4. **Connect:** New chain blocks are connected in forward order via `chainstate.connect_block`. Confirmed transactions are removed from the mempool
+5. **Update:** The header store's `active_chain` is rebuilt from the new tip
+6. **Mempool:** Disconnected transactions are re-validated and re-added to the mempool via `readd_disconnected_txs` (multi-pass for dependency ordering)
+
+### Rollback on Failure
+
+If `connect_block` fails during the connect phase, the coordinator rolls back: disconnects the newly-connected blocks, re-connects the original chain, and marks the failing fork tip as invalid. If rollback itself fails (node state inconsistent), the process exits immediately.
+
+### Constants
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MAX_REORG_DEPTH` | 1,000 | Maximum blocks that can be disconnected |
+| `MAX_FORK_HEADERS` | 10,000 | Maximum non-active headers in memory |
+| `MAX_FORK_AGE` | 1,000 | Fork tips this far behind the active tip are purged |
+
+### IBD Suppression
+
+Reorg attempts are suppressed during initial block download (chainstate tip more than 1,000 blocks behind the header tip). Fork headers are still stored and evaluated once the node catches up.
+
+### Crash Recovery
+
+On startup, `try_activate_best_chain` is called to reconcile any inconsistency between the header store's best tip and the chainstate tip from a previous unclean shutdown.
 
 ## Proof of Work
 
