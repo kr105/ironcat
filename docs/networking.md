@@ -154,6 +154,14 @@ On startup, `catch_up_chainstate()` reads already-stored blocks from disk to res
 
 After a chain reorganization, `handle_reorg` resets the download manager: clears all in-flight requests and pending blocks (they may reference the old chain), and sets `next_connect_height` to resume downloading from the new tip. The headers handler triggers reorgs post-IBD when `accept_header` detects a fork with more cumulative work. See [consensus.md](consensus.md) for reorg execution details.
 
+## Header Sync
+
+After the version/verack handshake completes, ironcat sends `getheaders` to the peer to begin header synchronization. The peer responds with batches of up to 2000 headers; if a full batch is received, ironcat sends another `getheaders` to continue. This repeats until the peer's tip is reached.
+
+Ironcat also responds to incoming `getheaders` requests from peers, serving up to 2000 headers per request from the active chain.
+
+**Known limitation:** ironcat currently sends `getheaders` to every peer after handshake, syncing headers in parallel from all of them. The reference client (Catcoin Core) only syncs headers from one peer at a time (`nSyncStarted` guard), allowing parallel sync only when the tip is already recent (<24h). This means ironcat generates more header traffic than necessary, especially on first connect when many peers complete handshake simultaneously. A single-peer header sync with fallback timeout (similar to the reference client's `CHAIN_SYNC_TIMEOUT` of 20 minutes) would reduce redundant bandwidth.
+
 ## Shutdown
 
 On exit (Ctrl+C or TUI quit), ironcat sends a clean TCP FIN to all connected peers before terminating. Writers are collected without holding DashMap locks, then shut down sequentially to avoid lock contention across await points.

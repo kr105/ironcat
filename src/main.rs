@@ -177,6 +177,16 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 			if best_hash == cs.tip() {
 				return;
 			}
+			// If the chainstate tip is not in the header store (e.g. after a
+			// header schema migration), skip reorg -- header sync will catch up
+			if headers.get(&cs.tip()).is_none() {
+				info!(
+					chainstate_tip = %cs.tip(),
+					header_tip = %best_hash,
+					"crash recovery: chainstate tip not in header store, skipping reorg"
+				);
+				return;
+			}
 			let mut mempool_guard = mp.blocking_write();
 			match reorg::activate_best_chain(&mut headers, &cs, &bs, &mut mempool_guard) {
 				Ok(reorg::ActivateResult::Reorganized {
