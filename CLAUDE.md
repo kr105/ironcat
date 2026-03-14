@@ -13,7 +13,7 @@
 
 ## Testing
 - TDD methodology, tests are equally or more important than working code
-- Tests go in tests/ directory, not inline modules, unless testing private internals
+- Tests go in tests/ directory, not inline modules. Use pub visibility on fields/types when needed to support this -- keeping src/ files focused on production code is more important than minimal visibility, unless there is a strong reason to not keep the fields/types as public, if so, document that on the code
 - No unwrap/expect in production code paths, only in tests
 
 ## Error Handling

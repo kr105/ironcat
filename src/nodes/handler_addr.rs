@@ -23,7 +23,7 @@ use crate::utils::{is_recently_active, is_routable, unix_now};
 ///
 /// Uses `SipHash-1-3` keyed by `relay_key` to produce a stable ranking of peers
 /// for a given address within a 24-hour time bucket. Same inputs always produce same output
-pub(super) fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
+pub fn compute_relay_score(relay_key: u64, addr_hash: u64, time_bucket: u64, peer_hash: u64) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = SipHasher13::new_with_keys(relay_key, 0);
 	addr_hash.hash(&mut hasher);
@@ -147,7 +147,7 @@ async fn relay_addr(node_manager: &Arc<NodeManager>, source_address: &IpAddr, en
 /// Refills a peer's addr token bucket based on elapsed time
 ///
 /// Returns the updated token count, capped at `ADDR_TOKEN_CAPACITY`
-pub(super) const fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
+pub const fn refill_addr_tokens(tokens: f64, elapsed: Duration) -> f64 {
 	// Both operands are finite and bounded; result is capped by min()
 	#[allow(clippy::arithmetic_side_effects, clippy::float_arithmetic)]
 	elapsed

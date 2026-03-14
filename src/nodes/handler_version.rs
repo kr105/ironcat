@@ -125,7 +125,7 @@ pub(super) async fn handle_version(
 ///
 /// Prevents terminal escape sequence injection via malicious user agents.
 /// Trims leading/trailing whitespace to prevent display confusion
-pub(super) fn sanitize_user_agent(s: &str) -> String {
+pub fn sanitize_user_agent(s: &str) -> String {
 	s.chars()
 		.filter(|c| c.is_ascii_graphic() || *c == ' ')
 		.take(MAX_USER_AGENT_DISPLAY)

@@ -17,13 +17,13 @@ use crate::types::hash::Hash256;
 /// Maximum number of blocks to serve in a single getdata response.
 /// Prevents a peer from triggering unbounded disk I/O and memory usage
 /// with a single message. Remaining block items are added to notfound
-const MAX_BLOCKS_PER_GETDATA: usize = 16;
+pub const MAX_BLOCKS_PER_GETDATA: usize = 16;
 
 /// Handles an incoming inv message from a peer
 ///
 /// Processes block and transaction announcements. Unknown blocks trigger a
 /// getheaders request. Unknown transactions trigger a getdata request
-pub(super) async fn handle_inv(
+pub async fn handle_inv(
 	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
 	tcp_writer: &SharedTcpWriter,
@@ -61,13 +61,22 @@ pub(super) async fn handle_inv(
 			node.height = estimated;
 		}
 
-		let locator = node_manager.header_store.read().build_locator();
-		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-		tcp_writer
-			.send_message("getheaders", &getheaders.to_bytes())
-			.await
-			.context("failed to send getheaders after block inv")?;
-		debug!(peer = %address, "requesting headers after block inv");
+		let excluded = node_manager.nodes.get(address).is_some_and(|n| n.strike_excluded);
+
+		if !excluded {
+			let locator = node_manager.header_store.read().build_locator();
+			let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+			tcp_writer
+				.send_message("getheaders", &getheaders.to_bytes())
+				.await
+				.context("failed to send getheaders after block inv")?;
+
+			if let Some(mut node) = node_manager.nodes.get_mut(address) {
+				node.pending_getheaders = Some(tokio::time::Instant::now());
+			}
+
+			debug!(peer = %address, "requesting headers after block inv");
+		}
 	}
 
 	// Check announced transactions against our mempool
@@ -103,7 +112,7 @@ pub(super) async fn handle_inv(
 /// Send failures for individual items are logged and treated as notfound
 /// rather than aborting the entire response, so remaining items still get
 /// processed
-pub(super) async fn handle_getdata(
+pub async fn handle_getdata(
 	node_manager: &Arc<NodeManager>,
 	address: &IpAddr,
 	tcp_writer: &SharedTcpWriter,
@@ -188,7 +197,7 @@ pub(super) async fn handle_getdata(
 }
 
 /// Handles an incoming notfound message from a peer
-pub(super) fn handle_notfound(address: &IpAddr, payload: &[u8]) {
+pub fn handle_notfound(address: &IpAddr, payload: &[u8]) {
 	match MessageInv::from_bytes(payload) {
 		Ok(inv) => {
 			debug!(count = inv.items().len(), peer = %address, "received notfound");
@@ -196,177 +205,5 @@ pub(super) fn handle_notfound(address: &IpAddr, payload: &[u8]) {
 		Err(e) => {
 			warn!(peer = %address, error = %e, "failed to parse notfound message");
 		}
-	}
-}
-
-#[cfg(test)]
-// Tests use unwrap/indexing for brevity since panics are the intended failure mode
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::cast_possible_truncation)]
-mod tests {
-	use super::*;
-	use crate::difficulty::ConsensusParams;
-	use crate::nodes::test_helpers::{command_name, read_all_messages, tcp_pair, test_genesis};
-	use crate::storage::block_store::BlockStore;
-
-	#[tokio::test]
-	async fn getdata_serves_block_from_store() {
-		let dir = tempfile::tempdir().unwrap();
-		let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-		let hash = Hash256::from_bytes([0xAA; 32]);
-		let block_data = vec![1u8, 2, 3, 4, 5];
-		store.store_block(&hash, &block_data).unwrap();
-		store.flush().unwrap();
-
-		let nm = Arc::new(super::super::NodeManager::new(
-			test_genesis(),
-			ConsensusParams::mainnet(),
-		));
-		nm.set_block_store(Arc::clone(&store));
-
-		let getdata = MessageInv::new(vec![InvItem {
-			inv_type: InvType::Block,
-			hash,
-		}]);
-
-		let (writer, mut reader) = tcp_pair().await;
-		let peer: IpAddr = "10.0.0.1".parse().unwrap();
-
-		handle_getdata(&nm, &peer, &writer, &getdata.to_bytes()).await.unwrap();
-		drop(writer);
-
-		let msgs = read_all_messages(&mut reader).await;
-		assert_eq!(msgs.len(), 1);
-		assert_eq!(command_name(&msgs[0]), "block");
-		assert_eq!(msgs[0].payload, block_data);
-	}
-
-	#[tokio::test]
-	async fn getdata_notfound_for_missing_block() {
-		let dir = tempfile::tempdir().unwrap();
-		let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-		let nm = Arc::new(super::super::NodeManager::new(
-			test_genesis(),
-			ConsensusParams::mainnet(),
-		));
-		nm.set_block_store(Arc::clone(&store));
-
-		let missing_hash = Hash256::from_bytes([0xBB; 32]);
-		let getdata = MessageInv::new(vec![InvItem {
-			inv_type: InvType::Block,
-			hash: missing_hash,
-		}]);
-
-		let (writer, mut reader) = tcp_pair().await;
-		let peer: IpAddr = "10.0.0.1".parse().unwrap();
-
-		handle_getdata(&nm, &peer, &writer, &getdata.to_bytes()).await.unwrap();
-		drop(writer);
-
-		let msgs = read_all_messages(&mut reader).await;
-		assert_eq!(msgs.len(), 1);
-		assert_eq!(command_name(&msgs[0]), "notfound");
-		let inv = MessageInv::from_bytes(&msgs[0].payload).unwrap();
-		assert_eq!(inv.items().len(), 1);
-		assert_eq!(inv.items()[0].hash, missing_hash);
-	}
-
-	#[tokio::test]
-	async fn getdata_notfound_when_no_block_store() {
-		let nm = Arc::new(super::super::NodeManager::new(
-			test_genesis(),
-			ConsensusParams::mainnet(),
-		));
-
-		let hash = Hash256::from_bytes([0xCC; 32]);
-		let getdata = MessageInv::new(vec![InvItem {
-			inv_type: InvType::Block,
-			hash,
-		}]);
-
-		let (writer, mut reader) = tcp_pair().await;
-		let peer: IpAddr = "10.0.0.1".parse().unwrap();
-
-		handle_getdata(&nm, &peer, &writer, &getdata.to_bytes()).await.unwrap();
-		drop(writer);
-
-		let msgs = read_all_messages(&mut reader).await;
-		assert_eq!(msgs.len(), 1);
-		assert_eq!(command_name(&msgs[0]), "notfound");
-		let inv = MessageInv::from_bytes(&msgs[0].payload).unwrap();
-		assert_eq!(inv.items().len(), 1);
-		assert_eq!(inv.items()[0].hash, hash);
-	}
-
-	#[tokio::test]
-	async fn getdata_caps_blocks_at_limit() {
-		let dir = tempfile::tempdir().unwrap();
-		let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-
-		// Store more blocks than the cap
-		let total = MAX_BLOCKS_PER_GETDATA + 4;
-		let mut items = Vec::with_capacity(total);
-		for i in 0..total {
-			let mut hash_bytes = [0u8; 32];
-			hash_bytes[0] = i as u8;
-			hash_bytes[1] = (i >> 8) as u8;
-			let hash = Hash256::from_bytes(hash_bytes);
-			store.store_block(&hash, &[i as u8; 10]).unwrap();
-			items.push(InvItem {
-				inv_type: InvType::Block,
-				hash,
-			});
-		}
-		store.flush().unwrap();
-
-		let nm = Arc::new(super::super::NodeManager::new(
-			test_genesis(),
-			ConsensusParams::mainnet(),
-		));
-		nm.set_block_store(Arc::clone(&store));
-
-		let getdata = MessageInv::new(items);
-		let (writer, mut reader) = tcp_pair().await;
-		let peer: IpAddr = "10.0.0.1".parse().unwrap();
-
-		handle_getdata(&nm, &peer, &writer, &getdata.to_bytes()).await.unwrap();
-		drop(writer);
-
-		let msgs = read_all_messages(&mut reader).await;
-		let block_count = msgs.iter().filter(|m| command_name(m) == "block").count();
-		let notfound_msgs: Vec<_> = msgs.iter().filter(|m| command_name(m) == "notfound").collect();
-
-		assert_eq!(block_count, MAX_BLOCKS_PER_GETDATA);
-		assert_eq!(notfound_msgs.len(), 1);
-		let inv = MessageInv::from_bytes(&notfound_msgs[0].payload).unwrap();
-		assert_eq!(inv.items().len(), 4);
-	}
-
-	#[tokio::test]
-	async fn getdata_unsupported_types_return_notfound() {
-		let nm = Arc::new(super::super::NodeManager::new(
-			test_genesis(),
-			ConsensusParams::mainnet(),
-		));
-
-		let hash = Hash256::from_bytes([0xDD; 32]);
-		let getdata = MessageInv::new(vec![InvItem {
-			inv_type: InvType::FilteredBlock,
-			hash,
-		}]);
-
-		let (writer, mut reader) = tcp_pair().await;
-		let peer: IpAddr = "10.0.0.1".parse().unwrap();
-
-		handle_getdata(&nm, &peer, &writer, &getdata.to_bytes()).await.unwrap();
-		drop(writer);
-
-		let msgs = read_all_messages(&mut reader).await;
-		assert_eq!(msgs.len(), 1);
-		assert_eq!(command_name(&msgs[0]), "notfound");
-		let inv = MessageInv::from_bytes(&msgs[0].payload).unwrap();
-		assert_eq!(inv.items().len(), 1);
-		assert_eq!(inv.items()[0].inv_type, InvType::FilteredBlock);
 	}
 }

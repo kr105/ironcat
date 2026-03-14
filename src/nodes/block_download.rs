@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::chainstate::ChainState;
 use crate::network::message_inv::{InvItem, InvType, MessageInv};
 use crate::network::{SharedTcpWriter, SharedTcpWriterExt};
-use crate::nodes::NodeManager;
+use crate::nodes::{MAX_TIMEOUT_STRIKES, NodeManager};
 use crate::storage::block_store::BlockStore;
 use crate::types::block::Block;
 use crate::types::hash::Hash256;
@@ -391,6 +391,7 @@ impl BlockDownloadManager {
 		let mut available_peers: Vec<(usize, IpAddr, usize)> = writers
 			.iter()
 			.enumerate()
+			.filter(|(_, (ip, _))| !self.node_manager.nodes.get(ip).is_some_and(|n| n.strike_excluded))
 			.map(|(i, (ip, _))| {
 				let used = peer_used.get(ip).copied().unwrap_or(0);
 				let free = PER_PEER_LIMIT.saturating_sub(used);
@@ -777,10 +778,12 @@ impl BlockDownloadManager {
 		let now = Instant::now();
 		let mut min_stale_height: Option<u32> = None;
 		let mut stale_hashes: Vec<Hash256> = Vec::new();
+		let mut stale_peers: HashSet<IpAddr> = HashSet::new();
 
 		for (hash, entry) in &self.in_flight {
 			if now.duration_since(entry.requested_at) > REQUEST_TIMEOUT {
 				stale_hashes.push(*hash);
+				stale_peers.insert(entry.peer);
 				min_stale_height = Some(min_stale_height.map_or(entry.height, |h: u32| h.min(entry.height)));
 			}
 		}
@@ -796,24 +799,58 @@ impl BlockDownloadManager {
 			}
 		}
 
+		// One strike per peer per scan pass (not per expired item).
+		// Skip peers already excluded -- no point striking them further
+		let mut cleared_count: usize = 0;
+		for peer in &stale_peers {
+			if self.node_manager.nodes.get(peer).is_some_and(|n| n.strike_excluded) {
+				continue;
+			}
+			let strikes = self.node_manager.increment_strike(peer);
+			if strikes >= MAX_TIMEOUT_STRIKES {
+				warn!(
+					peer = %peer,
+					strikes,
+					"peer reached max timeout strikes, excluding from download requests"
+				);
+
+				// Clear all remaining in-flight for this excluded peer
+				let mut excluded_min_height: Option<u32> = None;
+				self.in_flight.retain(|_hash, entry| {
+					if entry.peer == *peer {
+						excluded_min_height =
+							Some(excluded_min_height.map_or(entry.height, |h: u32| h.min(entry.height)));
+						false
+					} else {
+						true
+					}
+				});
+				if let Some(h) = excluded_min_height {
+					cleared_count = cleared_count.saturating_add(1);
+					min_stale_height = Some(min_stale_height.map_or(h, |cur| cur.min(h)));
+				}
+			}
+		}
+
 		if let Some(min_height) = min_stale_height {
 			debug!(
 				old_next = self.next_height,
 				new_next = min_height,
-				stale_count = stale_hashes.len(),
+				stale_count = stale_hashes.len().saturating_add(cleared_count),
 				"resetting next_height after timeout scan"
 			);
-			self.next_height = self.next_height.min(min_height);
+			self.schedule_redownload(min_height);
 		}
 	}
 
 	/// Resets download state after a chain reorganization
 	///
 	/// Clears all in-flight requests and pending blocks since they may
-	/// reference the old chain. Sets the next connect height to resume
-	/// downloading from the new tip
+	/// reference the old chain. Resets both `next_height` and
+	/// `next_connect_height` to resume downloading from the new tip
 	pub fn handle_reorg(&mut self, new_tip_height: u32) {
 		self.next_connect_height = new_tip_height.saturating_add(1);
+		self.next_height = self.next_connect_height;
 		self.in_flight.clear();
 		self.pending_blocks.clear();
 

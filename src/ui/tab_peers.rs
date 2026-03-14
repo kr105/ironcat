@@ -10,7 +10,7 @@ use ratatui::{
 	widgets::{Block, Borders, Cell, Row, Table},
 };
 
-use crate::nodes::{NodeSnapshot, NodeStateLabel};
+use crate::nodes::{MAX_TIMEOUT_STRIKES, NodeSnapshot, NodeStateLabel};
 
 /// Renders the peers table (full-screen version for the Peers tab)
 pub fn render(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
@@ -18,6 +18,7 @@ pub fn render(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
 		Cell::from(Line::from("Endpoint").alignment(Alignment::Center)),
 		Cell::from(Line::from("Height").alignment(Alignment::Center)),
 		Cell::from(Line::from("State").alignment(Alignment::Center)),
+		Cell::from(Line::from("Strikes").alignment(Alignment::Center)),
 		Cell::from(Line::from("Type").alignment(Alignment::Center)),
 		Cell::from(Line::from("Version").alignment(Alignment::Center)),
 		Cell::from(Line::from("Last Seen").alignment(Alignment::Center)),
@@ -50,6 +51,24 @@ pub fn render(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
 				Cell::from(format!("{}:{}", node.address, node.port)),
 				Cell::from(node.height.to_string()),
 				Cell::from(node.state_label.to_string()).style(Style::default().fg(state_color)),
+				Cell::from({
+					if !matches!(node.state_label, NodeStateLabel::Connected) || node.timeout_strikes == 0 {
+						String::new()
+					} else if node.strike_excluded {
+						"EXCLUDED".to_string()
+					} else {
+						format!("{}/{MAX_TIMEOUT_STRIKES}", node.timeout_strikes)
+					}
+				})
+				.style(Style::default().fg(
+					if !matches!(node.state_label, NodeStateLabel::Connected) || node.timeout_strikes == 0 {
+						Color::Reset
+					} else if node.strike_excluded {
+						Color::Red
+					} else {
+						Color::Yellow
+					},
+				)),
 				Cell::from(node.connection_type.to_string()),
 				Cell::from(node.version.to_string()),
 				Cell::from(last_seen_str),
@@ -64,6 +83,7 @@ pub fn render(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
 			Constraint::Length(22),     // Endpoint (IP:port)
 			Constraint::Length(8),      // Height
 			Constraint::Length(13),     // State (longest: "Disconnected")
+			Constraint::Length(10),     // Strikes
 			Constraint::Length(4),      // Type (In/Out)
 			Constraint::Length(8),      // Version
 			Constraint::Length(10),     // Last Seen

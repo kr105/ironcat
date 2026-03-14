@@ -114,7 +114,8 @@ See [protocol.md](protocol.md) for wire format details, message definitions, and
 `BlockDownloadManager` coordinates block fetching after headers are synced. It runs as an independent tokio task, communicating with handlers via channels:
 
 - `block_sender/block_rx` (mpsc): handlers forward received block payloads
-- `disconnect_sender/disconnect_rx` (unbounded): reaper notifies of peer disconnects
+- `disconnect_sender/disconnect_rx` (unbounded): handler tasks notify of peer disconnects
+- `reorg_sender/reorg_rx` (unbounded): notifies the download manager after a chain reorg (carries new tip height)
 
 ### Sliding Window
 
@@ -144,6 +145,28 @@ After every event (not just timer ticks), a timeout scan checks for in-flight en
 
 When a peer disconnects, all its in-flight entries are expired immediately without waiting for the 10-second timeout.
 
+### Timeout Strike Counter
+
+Peers that consistently time out are progressively excluded from block and header requests without being disconnected. Each timeout scanner pass that finds expired requests from a peer counts as 1 strike, regardless of how many individual items expired (distinguishing consistent slowness from a single spike).
+
+| Parameter | Value |
+|-----------|-------|
+| Max strikes before exclusion | 5 |
+| Strike decay interval | 5 minutes per strike |
+| Header request timeout | 5 seconds |
+| Header scanner interval | 3 seconds |
+| Full recovery time | 25 minutes minimum |
+
+When a peer reaches 5 strikes, its `strike_excluded` flag is set. Excluded peers:
+- Do not receive `getdata` for blocks (filtered from `fill_window`)
+- Do not receive `getheaders` from any send site (verack, headers follow-up, block inv)
+- Remain connected for addr gossip, inv relay, ping/pong, and all other protocol traffic
+- Have all remaining in-flight block requests immediately cleared
+
+Exclusion is sticky: dropping below 5 strikes alone does not restore eligibility. A peer must decay all the way to 0 strikes before `strike_excluded` is cleared. At 5 minutes per strike, a fully excluded peer takes at least 25 minutes of clean behavior to recover.
+
+Strike state survives disconnect/reconnect within a session (same `Node` entry is reused) but is not persisted across restarts. If all connected peers become excluded, recovery happens naturally through strike decay and new peer connections.
+
 ### Chainstate Connection
 
 Blocks are connected in strict height order via `chainstate.connect_block()`, which validates inputs, checks coinbase maturity, verifies scripts in parallel (rayon), and stores undo data. See [consensus.md](consensus.md) for validation details.
@@ -152,7 +175,7 @@ On startup, `catch_up_chainstate()` reads already-stored blocks from disk to res
 
 ### Reorg Handling
 
-After a chain reorganization, `handle_reorg` resets the download manager: clears all in-flight requests and pending blocks (they may reference the old chain), and sets `next_connect_height` to resume downloading from the new tip. The headers handler triggers reorgs post-IBD when `accept_header` detects a fork with more cumulative work. See [consensus.md](consensus.md) for reorg execution details.
+After a chain reorganization, `handle_reorg` resets the download manager: clears all in-flight requests and pending blocks (they may reference the old chain), and resets both `next_height` and `next_connect_height` to resume downloading from the new tip. The headers handler triggers reorgs post-IBD when `accept_header` detects a fork with more cumulative work. See [consensus.md](consensus.md) for reorg execution details.
 
 ## Header Sync
 

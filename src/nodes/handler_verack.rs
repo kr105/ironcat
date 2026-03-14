@@ -31,13 +31,16 @@ pub(super) async fn handle_verack(
 				created: now,
 				expires: ban_expires_at(now),
 			};
-			warn!("Node {} sent verack before version, banning", address);
+			warn!(peer = %address, "peer sent verack before version, banning");
 			return Err(anyhow!("Node {address} sent verack before version"));
 		}
 
 		info!(
-			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			address, node.version, node.height, node.user_agent
+			peer = %address,
+			version = node.version,
+			height = node.height,
+			user_agent = %node.user_agent,
+			"connection ready"
 		);
 
 		node.state = NodeState::Connected {
@@ -68,15 +71,23 @@ pub(super) async fn handle_verack(
 			.context("failed to send sendheaders")?;
 	}
 
-	// Begin header sync
-	let locator = node_manager.header_store.read().build_locator();
-	let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-	tcp_writer
-		.send_message("getheaders", &getheaders.to_bytes())
-		.await
-		.context("failed to send initial getheaders")?;
+	// Begin header sync (skip if peer is excluded from requests)
+	let excluded = node_manager.nodes.get(address).is_some_and(|n| n.strike_excluded);
 
-	debug!(peer = %address, "sent initial getheaders for header sync");
+	if !excluded {
+		let locator = node_manager.header_store.read().build_locator();
+		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+		tcp_writer
+			.send_message("getheaders", &getheaders.to_bytes())
+			.await
+			.context("failed to send initial getheaders")?;
+
+		if let Some(mut node) = node_manager.nodes.get_mut(address) {
+			node.pending_getheaders = Some(tokio::time::Instant::now());
+		}
+
+		debug!(peer = %address, "sent initial getheaders for header sync");
+	}
 
 	Ok(())
 }
