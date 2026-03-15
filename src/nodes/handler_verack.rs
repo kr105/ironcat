@@ -7,7 +7,10 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
 use super::{BanReason, NodeManager, NodeState, SENDHEADERS_VERSION, ban_expires_at};
-use crate::network::{SharedTcpWriter, SharedTcpWriterExt, message_getheaders::MessageGetHeaders};
+use crate::network::{
+	NetworkAddress, SharedTcpWriter, SharedTcpWriterExt, message_addr::MessageAddr,
+	message_getheaders::MessageGetHeaders,
+};
 use crate::types::hash::Hash256;
 use crate::utils::unix_now;
 
@@ -31,13 +34,16 @@ pub(super) async fn handle_verack(
 				created: now,
 				expires: ban_expires_at(now),
 			};
-			warn!("Node {} sent verack before version, banning", address);
+			warn!(peer = %address, "peer sent verack before version, banning");
 			return Err(anyhow!("Node {address} sent verack before version"));
 		}
 
 		info!(
-			"Connection ready with node {} version={}, blocks={}, user_agent={}",
-			address, node.version, node.height, node.user_agent
+			peer = %address,
+			version = node.version,
+			height = node.height,
+			user_agent = %node.user_agent,
+			"connection ready"
 		);
 
 		node.state = NodeState::Connected {
@@ -51,7 +57,34 @@ pub(super) async fn handle_verack(
 
 	// Record external IP vote only after handshake completes
 	if let Some(ip) = pending_ip {
+		let had_consensus = node_manager.get_external_ip().is_some();
 		node_manager.record_external_ip_vote(ip);
+
+		// If we just reached IP consensus, probe our own reachability inline
+		// so the advertisement check below can see the result immediately
+		if !had_consensus && node_manager.get_external_ip().is_some() {
+			node_manager.probe_reachability().await;
+		}
+	}
+
+	// Advertise our address if we have confirmed that our port is reachable.
+	// This avoids polluting peer tables with unreachable addresses (e.g. behind NAT)
+	if node_manager.is_port_reachable()
+		&& let Some(external_ip) = node_manager.get_external_ip()
+	{
+		let addr = NetworkAddress::new(external_ip, node_manager.listen_port);
+		let msg = MessageAddr::new(vec![addr]);
+		tcp_writer
+			.send_message("addr", &msg.to_bytes())
+			.await
+			.context("failed to send self-advertisement")?;
+
+		debug!(
+			peer = %address,
+			external_ip = %external_ip,
+			port = node_manager.listen_port,
+			"advertised own address during handshake"
+		);
 	}
 
 	tcp_writer
@@ -68,15 +101,23 @@ pub(super) async fn handle_verack(
 			.context("failed to send sendheaders")?;
 	}
 
-	// Begin header sync
-	let locator = node_manager.header_store.read().build_locator();
-	let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-	tcp_writer
-		.send_message("getheaders", &getheaders.to_bytes())
-		.await
-		.context("failed to send initial getheaders")?;
+	// Begin header sync (skip if peer is excluded from requests)
+	let excluded = node_manager.nodes.get(address).is_some_and(|n| n.strike_excluded);
 
-	debug!(peer = %address, "sent initial getheaders for header sync");
+	if !excluded {
+		let locator = node_manager.header_store.read().build_locator();
+		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+		tcp_writer
+			.send_message("getheaders", &getheaders.to_bytes())
+			.await
+			.context("failed to send initial getheaders")?;
+
+		if let Some(mut node) = node_manager.nodes.get_mut(address) {
+			node.pending_getheaders = Some(tokio::time::Instant::now());
+		}
+
+		debug!(peer = %address, "sent initial getheaders for header sync");
+	}
 
 	Ok(())
 }

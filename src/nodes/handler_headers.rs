@@ -3,8 +3,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use std::time::Instant;
-
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +22,7 @@ use crate::types::hash::Hash256;
 pub(super) fn handle_sendheaders(node_manager: &NodeManager, address: &IpAddr) {
 	if let Some(mut node) = node_manager.nodes.get_mut(address) {
 		node.prefer_headers = true;
-		debug!("Peer {} prefers headers announcements", address);
+		debug!(peer = %address, "peer prefers headers announcements");
 	}
 }
 
@@ -44,17 +42,22 @@ pub(super) async fn handle_headers(
 	let msg = MessageHeaders::from_bytes(payload).context("failed to parse headers message")?;
 	let count = msg.headers().len();
 
+	// Clear pending request tracker -- response received
+	if let Some(mut node) = node_manager.nodes.get_mut(address) {
+		node.pending_getheaders = None;
+	}
+
 	if count == 0 {
 		return Ok(());
 	}
 
 	let headers = msg.into_headers();
 
-	// Validate and commit under write lock (fast, in-memory only).
-	// Persist to redb outside the lock to avoid blocking readers during disk I/O.
+	// Validate and commit under write lock (fast, in-memory only)
+	// Persist to redb outside the lock to avoid blocking readers during disk I/O
 	// Don't disconnect on failure -- the peer may have sent orphan or fork headers
 	// that we can't connect yet
-	let start = Instant::now();
+	let start = tokio::time::Instant::now();
 	let (batch, locator, need_reorg) = {
 		let mut store = node_manager.header_store.write();
 		let result = store.validate_and_commit(&headers);
@@ -107,7 +110,9 @@ pub(super) async fn handle_headers(
 		};
 
 		// Build locator while we still hold the lock (avoids a second acquire)
-		let locator = if count == MAX_HEADERS_PER_MSG {
+		// Only request more if we actually added new headers -- otherwise we loop
+		// forever requesting batches of duplicates we already have
+		let locator = if count == MAX_HEADERS_PER_MSG && !batch.is_empty() {
 			Some(store.build_locator())
 		} else {
 			None
@@ -146,12 +151,21 @@ pub(super) async fn handle_headers(
 	// Request more headers before persisting so the next batch arrives
 	// while we're writing to disk
 	if let Some(locator) = locator {
-		let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
-		tcp_writer
-			.send_message("getheaders", &getheaders.to_bytes())
-			.await
-			.context("failed to send follow-up getheaders")?;
-		debug!(peer = %address, "requesting more headers");
+		let excluded = node_manager.nodes.get(address).is_some_and(|n| n.strike_excluded);
+
+		if !excluded {
+			let getheaders = MessageGetHeaders::new(locator, Hash256::ZERO);
+			tcp_writer
+				.send_message("getheaders", &getheaders.to_bytes())
+				.await
+				.context("failed to send follow-up getheaders")?;
+
+			if let Some(mut node) = node_manager.nodes.get_mut(address) {
+				node.pending_getheaders = Some(tokio::time::Instant::now());
+			}
+
+			debug!(peer = %address, "requesting more headers");
+		}
 	}
 
 	// Persist to redb outside the write lock -- headers are cheap to re-fetch on crash

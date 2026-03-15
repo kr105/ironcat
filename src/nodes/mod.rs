@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod block_download;
-mod handler_addr;
+pub mod handler_addr;
 mod handler_block;
 mod handler_getblocks;
 mod handler_headers;
-mod handler_inv;
+pub mod handler_inv;
 mod handler_mempool;
 mod handler_ping;
 mod handler_tx;
 mod handler_verack;
-mod handler_version;
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
-mod test_helpers;
+pub mod handler_version;
+pub mod test_helpers;
 
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
@@ -25,7 +23,7 @@ use std::{
 	net::IpAddr,
 	sync::{
 		Arc,
-		atomic::{AtomicU32, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 	},
 	time::Duration,
 };
@@ -51,10 +49,10 @@ use crate::{
 };
 
 /// Base delay for exponential backoff in seconds
-const BACKOFF_BASE_SECS: u64 = 30;
+pub const BACKOFF_BASE_SECS: u64 = 30;
 
 /// Maximum backoff delay in seconds (30 minutes)
-const BACKOFF_MAX_SECS: u64 = 30 * 60;
+pub const BACKOFF_MAX_SECS: u64 = 30 * 60;
 
 /// Maximum retry attempts before marking a node as dead
 const MAX_RETRY_ATTEMPTS: u32 = 10;
@@ -81,7 +79,7 @@ const STALE_CONNECTING_TIMEOUT: Duration = Duration::from_secs(300);
 const STALE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the reaper scans for retryable/stale nodes
-const REAPER_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+pub const REAPER_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Window for "recently active" outgoing nodes in `GetAddr` responses (2 hours)
 const GETADDR_RECENT_WINDOW: u64 = 60 * 60 * 2;
@@ -96,19 +94,22 @@ const ADDR_RELAY_PEER_COUNT: usize = 2;
 const ADDR_TOKEN_RATE: f64 = 0.1;
 
 /// Token bucket maximum capacity
-const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
+pub const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
 
 /// Token bucket initial fill for new/reactivated connections
-const ADDR_TOKEN_INITIAL: f64 = 10.0;
+pub const ADDR_TOKEN_INITIAL: f64 = 10.0;
 
 /// How often to announce our own address to peers
-const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Maximum length of user agent string after sanitization
-const MAX_USER_AGENT_DISPLAY: usize = 256;
+pub const MAX_USER_AGENT_DISPLAY: usize = 256;
 
 /// Maximum number of entries in the external IP votes map
 const MAX_EXTERNAL_IP_VOTES: usize = 100;
+
+/// Timeout for the self-connectivity probe
+const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum entries in a peer's `addr_known` set within a 24h bucket
 const MAX_ADDR_KNOWN: usize = 5000;
@@ -116,17 +117,26 @@ const MAX_ADDR_KNOWN: usize = 5000;
 /// Maximum entries in a peer's `inv_known` set before clearing
 const MAX_INV_KNOWN: usize = 50_000;
 
+/// Maximum timeout strikes before a peer is excluded from download requests
+pub const MAX_TIMEOUT_STRIKES: u8 = 5;
+
+/// Time between strike decay decrements (5 minutes)
+const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long before a header request is considered timed out
+const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Minimum protocol version that supports sendheaders (BIP 130)
 const SENDHEADERS_VERSION: u32 = 70012;
 
 /// Maximum concurrent incoming connections
-const MAX_INCOMING_CONNECTIONS: usize = 125;
+pub const MAX_INCOMING_CONNECTIONS: usize = 125;
 
 /// Cooldown period before the same IP can make a new incoming connection
-const INCOMING_IP_COOLDOWN: Duration = Duration::from_secs(30);
+pub const INCOMING_IP_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How long a ban lasts in seconds (24 hours)
-const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
+pub const BAN_DURATION_SECS: u64 = 24 * 60 * 60;
 
 /// How long a connection can sit idle before being dropped (2x `PING_INTERVAL`)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
@@ -358,6 +368,10 @@ pub struct NodeSnapshot {
 	pub user_agent: String,
 	/// Unix timestamp of last message received from this peer
 	pub last_seen: u64,
+	/// Number of timeout strikes for display
+	pub timeout_strikes: u8,
+	/// Whether peer is excluded from download requests
+	pub strike_excluded: bool,
 }
 
 /// Represents a node in the Catcoin network
@@ -425,6 +439,18 @@ pub struct Node {
 
 	/// Whether this peer prefers block announcements via headers (BIP 130)
 	pub prefer_headers: bool,
+
+	/// Number of accumulated timeout strikes
+	pub timeout_strikes: u8,
+
+	/// When the last strike was recorded (for decay timing)
+	pub last_strike: Option<Instant>,
+
+	/// Whether this peer is excluded from block/header requests
+	pub strike_excluded: bool,
+
+	/// When the current pending getheaders request was sent
+	pub pending_getheaders: Option<Instant>,
 }
 
 impl Node {
@@ -452,6 +478,10 @@ impl Node {
 			last_ping_nonce: None,
 			inv_known: HashSet::new(),
 			prefer_headers: false,
+			timeout_strikes: 0,
+			last_strike: None,
+			strike_excluded: false,
+			pending_getheaders: None,
 		}
 	}
 }
@@ -476,7 +506,7 @@ impl Drop for IncomingGuard {
 /// The `relay_key` seeds deterministic peer selection for addr relay
 pub struct NodeManager {
 	/// Concurrent map of all tracked nodes, keyed by IP address
-	pub(crate) nodes: DashMap<IpAddr, Node>,
+	pub nodes: DashMap<IpAddr, Node>,
 
 	/// Random nonce for self-connection detection
 	pub my_nonce: u64,
@@ -485,10 +515,17 @@ pub struct NodeManager {
 	pub(crate) relay_key: u64,
 
 	/// Peer votes for our external IP address
-	external_ip_votes: DashMap<IpAddr, u32>,
+	pub external_ip_votes: DashMap<IpAddr, u32>,
+
+	/// The port we are listening on (from CLI or default)
+	pub listen_port: u16,
+
+	/// Whether our listen port has been confirmed reachable from the outside.
+	/// Set by probing our own `external_ip:listen_port` via TCP connect
+	port_reachable: AtomicBool,
 
 	/// Number of currently active incoming connections
-	incoming_count: Arc<AtomicUsize>,
+	pub incoming_count: Arc<AtomicUsize>,
 
 	/// Per-IP cooldown for incoming connections to prevent reconnect spam
 	incoming_cooldowns: DashMap<IpAddr, Instant>,
@@ -556,6 +593,8 @@ impl NodeManager {
 			my_nonce: rng.next_u64(),
 			relay_key: rng.next_u64(),
 			external_ip_votes: DashMap::new(),
+			listen_port: DEFAULT_PORT,
+			port_reachable: AtomicBool::new(false),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
 			header_store: Arc::new(parking_lot::RwLock::new(store)),
@@ -669,9 +708,19 @@ impl NodeManager {
 	pub fn insert_incoming(&self, address: IpAddr, port: u16) -> Option<IncomingGuard> {
 		if self.incoming_count.load(Ordering::Acquire) >= MAX_INCOMING_CONNECTIONS {
 			debug!(
-				"Incoming connection limit reached ({}), rejecting {}:{}",
-				MAX_INCOMING_CONNECTIONS, address, port
+				limit = MAX_INCOMING_CONNECTIONS,
+				peer = %address,
+				port,
+				"incoming connection limit reached, rejecting"
 			);
+			return None;
+		}
+
+		// Reject connections from our own external IP or loopback (e.g. reachability
+		// probes). These would create ghost entries in the node map and waste
+		// incoming slots
+		if address.is_loopback() || self.get_external_ip().is_some_and(|ip| ip == address) {
+			debug!(peer = %address, "rejecting incoming from own address");
 			return None;
 		}
 
@@ -679,7 +728,7 @@ impl NodeManager {
 		if let Some(last) = self.incoming_cooldowns.get(&address)
 			&& last.elapsed() < INCOMING_IP_COOLDOWN
 		{
-			debug!("Rejecting {}:{} (per-IP cooldown)", address, port);
+			debug!(peer = %address, port, "rejecting (per-IP cooldown)");
 			return None;
 		}
 
@@ -706,7 +755,7 @@ impl NodeManager {
 		reset_handshake: bool,
 	) -> bool {
 		if self.nodes.len() >= MAX_NODES {
-			debug!("Node limit reached ({}), not adding {}:{}", MAX_NODES, address, port);
+			debug!(limit = MAX_NODES, peer = %address, port, "node limit reached, not adding");
 			return false;
 		}
 
@@ -725,6 +774,7 @@ impl NodeManager {
 						node.sent_getaddr = false;
 						node.addr_tokens = ADDR_TOKEN_INITIAL;
 						node.last_token_refill = Instant::now();
+						node.pending_getheaders = None;
 					}
 
 					reset_handshake
@@ -761,6 +811,7 @@ impl NodeManager {
 			// Clear per-session state when the connection ends
 			if matches!(state, NodeState::Disconnected { .. } | NodeState::Dead) {
 				node.inv_known.clear();
+				node.pending_getheaders = None;
 			}
 			node.state = state;
 		}
@@ -785,20 +836,20 @@ impl NodeManager {
 			let writer = if let NodeState::Connected { ref writer } = node.state {
 				Arc::clone(writer)
 			} else {
-				debug!("Skipping ping to {}, not connected", address);
+				debug!(peer = %address, "skipping ping, not connected");
 				return;
 			};
 			node.last_ping_nonce = Some(nonce);
 			writer
 		} else {
-			debug!("Skipping ping to {}, node not found", address);
+			debug!(peer = %address, "skipping ping, node not found");
 			return;
 		};
 
-		debug!("Sending ping to {}", address);
+		debug!(peer = %address, "sending ping");
 
 		if let Err(e) = tcp_writer.send_message("ping", &nonce.to_le_bytes()).await {
-			warn!("Failed to send ping to {}: {}", address, e);
+			warn!(peer = %address, error = %e, "failed to send ping");
 		}
 	}
 
@@ -821,6 +872,116 @@ impl NodeManager {
 	/// Returns the number of nodes currently in Connected state
 	pub fn connected_count(&self) -> usize {
 		self.nodes.iter().filter(|e| e.value().state.is_connected()).count()
+	}
+
+	/// Increments a peer's timeout strike counter and returns the new value
+	///
+	/// Sets `strike_excluded` when the counter reaches `MAX_TIMEOUT_STRIKES`.
+	/// No-op for peers already at MAX (avoids resetting the decay clock).
+	/// Returns 0 if the peer is not found
+	pub fn increment_strike(&self, peer: &IpAddr) -> u8 {
+		let Some(mut node) = self.nodes.get_mut(peer) else {
+			return 0;
+		};
+		if node.timeout_strikes >= MAX_TIMEOUT_STRIKES {
+			return node.timeout_strikes;
+		}
+		node.timeout_strikes = node.timeout_strikes.saturating_add(1);
+		node.last_strike = Some(Instant::now());
+		if node.timeout_strikes >= MAX_TIMEOUT_STRIKES {
+			node.strike_excluded = true;
+		}
+		node.timeout_strikes
+	}
+
+	/// Performs one pass of strike decay across all peers
+	///
+	/// For each peer with strikes and an expired decay interval, decrements
+	/// by 1. When strikes reach 0, clears exclusion and `last_strike`
+	pub fn decay_strikes(&self) {
+		for mut entry in self.nodes.iter_mut() {
+			let node = entry.value_mut();
+			if node.timeout_strikes == 0 {
+				continue;
+			}
+			let Some(last) = node.last_strike else {
+				continue;
+			};
+			if last.elapsed() < STRIKE_DECAY_INTERVAL {
+				continue;
+			}
+			node.timeout_strikes = node.timeout_strikes.saturating_sub(1);
+			if node.timeout_strikes == 0 {
+				node.strike_excluded = false;
+				node.last_strike = None;
+			} else {
+				node.last_strike = Some(Instant::now());
+			}
+		}
+	}
+
+	/// Background loop that checks for strike decay every 60 seconds
+	///
+	/// Each peer decays by 1 strike per `STRIKE_DECAY_INTERVAL` (5 minutes).
+	/// A fully excluded peer (5 strikes) takes at least 25 minutes to recover
+	pub async fn run_strike_decay(self: Arc<Self>) {
+		loop {
+			tokio::time::sleep(Duration::from_secs(60)).await;
+			self.decay_strikes();
+		}
+	}
+
+	/// Performs one pass of the header timeout scanner
+	///
+	/// Checks all peers for expired `pending_getheaders` requests and
+	/// increments strikes for slow responders
+	pub fn scan_header_timeouts(&self) {
+		let mut timed_out_peers: Vec<IpAddr> = Vec::new();
+
+		for mut entry in self.nodes.iter_mut() {
+			let node = entry.value_mut();
+			// Skip peers already excluded -- no point striking them further
+			if node.strike_excluded {
+				node.pending_getheaders = None;
+				continue;
+			}
+			if let Some(sent_at) = node.pending_getheaders
+				&& sent_at.elapsed() > HEADER_REQUEST_TIMEOUT
+			{
+				node.pending_getheaders = None;
+				timed_out_peers.push(*entry.key());
+			}
+		}
+
+		for peer in &timed_out_peers {
+			let strikes = self.increment_strike(peer);
+			if strikes >= MAX_TIMEOUT_STRIKES {
+				warn!(
+					peer = %peer,
+					strikes,
+					"peer reached max timeout strikes from header timeouts, excluding from requests"
+				);
+			}
+		}
+
+		// Check if all connected peers are excluded
+		if !timed_out_peers.is_empty() {
+			let all_excluded = self.nodes.iter().all(|entry| {
+				let node = entry.value();
+				!node.state.is_connected() || node.strike_excluded
+			});
+			if all_excluded && self.connected_count() > 0 {
+				warn!("all connected peers are excluded from header requests");
+			}
+		}
+	}
+
+	/// Background loop that scans for header request timeouts every 3 seconds
+	pub async fn run_header_timeout_scanner(self: Arc<Self>) {
+		loop {
+			tokio::time::sleep(Duration::from_secs(3)).await;
+			self.scan_header_timeouts();
+		}
 	}
 
 	/// Returns the current chain tip height (lock-free, from atomic cache)
@@ -973,6 +1134,8 @@ impl NodeManager {
 					version: node.version,
 					user_agent: node.user_agent.clone(),
 					last_seen: node.last_seen,
+					timeout_strikes: node.timeout_strikes,
+					strike_excluded: node.strike_excluded,
 				}
 			})
 			.collect();
@@ -1036,7 +1199,7 @@ impl NodeManager {
 			}
 
 			if !ready_nodes.is_empty() {
-				info!("Reaper: {} nodes ready for retry", ready_nodes.len());
+				info!(count = ready_nodes.len(), "reaper: nodes ready for retry");
 			}
 
 			for (address, attempt) in ready_nodes {
@@ -1059,7 +1222,7 @@ impl NodeManager {
 			}
 
 			for address in stale_nodes {
-				warn!("Node {} stuck in stale state, scheduling retry", address);
+				warn!(peer = %address, "node stuck in stale state, scheduling retry");
 				if let Some(mut node) = self.nodes.get_mut(&address)
 					&& matches!(node.state, NodeState::Connecting { .. } | NodeState::Handshaking { .. })
 				{
@@ -1097,10 +1260,10 @@ impl NodeManager {
 				.retain(|_, instant| instant.elapsed() < INCOMING_IP_COOLDOWN.saturating_mul(2));
 
 			debug!(
-				"Reaper scan complete: {} total, {} connected, {} disconnected",
 				total,
 				connected,
-				total.saturating_sub(connected)
+				disconnected = total.saturating_sub(connected),
+				"reaper scan complete"
 			);
 		}
 	}
@@ -1222,6 +1385,54 @@ impl NodeManager {
 			.map(|entry| *entry.key())
 	}
 
+	/// Returns true if our listen port has been confirmed reachable from the outside
+	pub fn is_port_reachable(&self) -> bool {
+		self.port_reachable.load(Ordering::Acquire)
+	}
+
+	/// Probes our own external address to check if our listen port is reachable.
+	/// Attempts a TCP connect to `external_ip:listen_port` with a short timeout.
+	/// If the connection succeeds, we are publicly reachable and can safely
+	/// advertise our address without polluting peer tables with unreachable entries
+	pub async fn probe_reachability(&self) {
+		let Some(external_ip) = self.get_external_ip() else {
+			return;
+		};
+
+		let addr = std::net::SocketAddr::new(external_ip, self.listen_port);
+
+		match timeout(REACHABILITY_PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+			Ok(Ok(stream)) => {
+				// Connection succeeded, port is reachable
+				drop(stream);
+				if !self.port_reachable.swap(true, Ordering::Release) {
+					info!(
+						address = %external_ip,
+						port = self.listen_port,
+						"port reachability confirmed via self-probe"
+					);
+				}
+			}
+			Ok(Err(e)) => {
+				self.port_reachable.store(false, Ordering::Release);
+				debug!(
+					address = %external_ip,
+					port = self.listen_port,
+					error = %e,
+					"port reachability probe failed"
+				);
+			}
+			Err(_) => {
+				self.port_reachable.store(false, Ordering::Release);
+				debug!(
+					address = %external_ip,
+					port = self.listen_port,
+					"port reachability probe timed out"
+				);
+			}
+		}
+	}
+
 	/// Revives a Dead node if the given timestamp is newer than `last_seen`
 	///
 	/// Returns true if the node was revived, false otherwise
@@ -1248,33 +1459,28 @@ impl NodeManager {
 		false
 	}
 
-	/// Returns true if at least one incoming peer is in Connected state
-	pub fn has_incoming_connected(&self) -> bool {
-		self.nodes.iter().any(|entry| {
-			let node = entry.value();
-			node.connection_type == ConnectionType::Incoming && node.state.is_connected()
-		})
-	}
-
 	/// Periodically announces our own address to all connected peers
 	///
-	/// Only runs if we have incoming peers (proving our port is reachable)
-	/// and a consensus external IP from version messages
+	/// Re-probes reachability each cycle. Only announces if our port is
+	/// confirmed reachable to avoid polluting peer tables with NAT'd addresses
 	pub async fn run_self_announce(self: Arc<Self>) {
 		loop {
 			tokio::time::sleep(SELF_ANNOUNCE_INTERVAL).await;
-
-			if !self.has_incoming_connected() {
-				debug!("Self-announce skipped: no incoming peers connected");
-				continue;
-			}
 
 			let Some(external_ip) = self.get_external_ip() else {
 				debug!("Self-announce skipped: no consensus on external IP");
 				continue;
 			};
 
-			let addr = NetworkAddress::new(external_ip, DEFAULT_PORT);
+			// Re-probe each cycle in case network conditions changed
+			self.probe_reachability().await;
+
+			if !self.is_port_reachable() {
+				debug!("Self-announce skipped: port not reachable");
+				continue;
+			}
+
+			let addr = NetworkAddress::new(external_ip, self.listen_port);
 			let msg = MessageAddr::new(vec![addr]);
 			let payload = msg.to_bytes();
 
@@ -1296,15 +1502,15 @@ impl NodeManager {
 			}
 
 			info!(
-				"Announcing own address {}:{} to {} peers",
-				external_ip,
-				DEFAULT_PORT,
-				writers.len()
+				address = %external_ip,
+				port = self.listen_port,
+				peer_count = writers.len(),
+				"announcing own address to peers"
 			);
 
 			for (address, writer) in &writers {
 				if let Err(e) = writer.send_message("addr", &payload).await {
-					debug!("Failed to self-announce to {}: {}", address, e);
+					debug!(peer = %address, error = %e, "failed to self-announce");
 				}
 			}
 		}
@@ -1435,11 +1641,11 @@ fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
 
 	let next_attempt = attempt.saturating_add(1);
 	if next_attempt >= MAX_RETRY_ATTEMPTS {
-		info!("Node {} exhausted all retry attempts, marking dead", address);
+		info!(peer = %address, "node exhausted all retry attempts, marking dead");
 		node_manager.set_state(address, NodeState::Dead);
 	} else {
 		let backoff = calculate_backoff(next_attempt);
-		debug!("Node {} scheduling retry {} in {:?}", address, next_attempt, backoff);
+		debug!(peer = %address, attempt = next_attempt, delay = ?backoff, "scheduling retry");
 		// Instant::now() + bounded Duration cannot overflow in practice
 		#[allow(clippy::arithmetic_side_effects)]
 		let retry_at = Instant::now() + backoff;
@@ -1456,10 +1662,7 @@ fn schedule_retry(node_manager: &NodeManager, address: &IpAddr, attempt: u32) {
 /// Handles the connection to a node
 async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr, port: u16, attempt: u32) {
 	if !node_manager.should_attempt_connection(&address) {
-		trace!(
-			"Avoiding connection to node {}:{} as it is not a good candidate",
-			address, port
-		);
+		trace!(peer = %address, port, "avoiding connection, not a good candidate");
 		return;
 	}
 
@@ -1469,7 +1672,7 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	for tcp_attempt in 1..=TCP_MAX_ATTEMPTS {
 		let fail_reason = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
 			Ok(Ok(stream)) => {
-				info!("Connected to {}:{} on attempt {}", address, port, tcp_attempt);
+				info!(peer = %address, port, attempt = tcp_attempt, "TCP connected");
 				tcp_stream = Some(stream);
 				break;
 			}
@@ -1478,26 +1681,17 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 		};
 
 		if tcp_attempt < TCP_MAX_ATTEMPTS {
-			trace!(
-				"Failed to connect to {}:{} on attempt {}: {}",
-				address, port, tcp_attempt, fail_reason
-			);
+			trace!(peer = %address, port, attempt = tcp_attempt, reason = %fail_reason, "TCP connect failed, retrying");
 			sleep(TCP_RETRY_DELAY).await;
 		} else {
-			debug!(
-				"Failed to connect to {}:{} after {} attempts: {}",
-				address, port, TCP_MAX_ATTEMPTS, fail_reason
-			);
+			debug!(peer = %address, port, attempts = TCP_MAX_ATTEMPTS, reason = %fail_reason, "TCP connect failed after all attempts");
 			schedule_retry(&node_manager, &address, attempt);
 			return;
 		}
 	}
 
 	let Some(mut tcp_stream) = tcp_stream else {
-		error!(
-			"Failed to establish connection to {}:{} after {} attempts",
-			address, port, TCP_MAX_ATTEMPTS
-		);
+		error!(peer = %address, port, attempts = TCP_MAX_ATTEMPTS, "failed to establish connection");
 		return;
 	};
 
@@ -1512,18 +1706,19 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	// by sending a MessageVersion packet
 
 	let network_address = NetworkAddress::new(address, port);
-	let version = MessageVersion::new(network_address, node_manager.my_nonce);
+	let tip_height = node_manager.chainstate().map_or(0, |cs| cs.tip_height());
+	let version = MessageVersion::new(network_address, node_manager.my_nonce, tip_height);
 	let packet = match Message::new("version", &version.to_bytes()) {
 		Ok(p) => p,
 		Err(e) => {
-			error!("Failed to create version message for {}:{}: {}", address, port, e);
+			error!(peer = %address, port, error = %e, "failed to create version message");
 			schedule_retry(&node_manager, &address, attempt);
 			return;
 		}
 	};
 
 	if let Err(e) = tcp_stream.write_all(&packet.to_bytes()).await {
-		error!("Failed to send version to {}:{}: {}", address, port, e);
+		error!(peer = %address, port, error = %e, "failed to send version");
 		schedule_retry(&node_manager, &address, attempt);
 		return;
 	}
@@ -1535,14 +1730,14 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	if let Some(node) = node_manager.nodes.get(&address)
 		&& node.state.is_banned()
 	{
-		debug!("Node {} is banned, not scheduling retry", address);
+		debug!(peer = %address, "node is banned, not scheduling retry");
 		return;
 	}
 
 	// Connection loop ended -- schedule retry
 	schedule_retry(&node_manager, &address, attempt);
 
-	debug!("Exiting handle_node_connection for {}:{}", address, port);
+	debug!(peer = %address, port, "exiting handle_node_connection");
 }
 
 /// Main read loop for a node connection
@@ -1580,7 +1775,7 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 						// n is bounded by buf.len() since it comes from read()
 						#[allow(clippy::indexing_slicing)]
 						if let Err(e) = incoming_queue.process_incoming_data(&buf[..n]) {
-							warn!("Error processing data from {}: {}", address, e);
+							warn!(peer = %address, error = %e, "error processing incoming data");
 							break;
 						}
 					}
@@ -1588,7 +1783,7 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 						continue; // No data available, try again
 					}
 					Err(e) => {
-						warn!("Error in try_read(): {:?}", e);
+						warn!(error = ?e, "error in try_read()");
 						break;
 					}
 				}
@@ -1597,7 +1792,7 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 				node_manager.send_ping(&address).await;
 			}
 			() = tokio::time::sleep_until(idle_deadline) => {
-				warn!("Connection to {} idle for {:?}, disconnecting", address, IDLE_TIMEOUT);
+				warn!(peer = %address, timeout = ?IDLE_TIMEOUT, "connection idle, disconnecting");
 				break;
 			}
 		}
@@ -1607,11 +1802,11 @@ pub(crate) async fn node_connection_loop(node_manager: Arc<NodeManager>, address
 			node_manager.update_last_seen(&address);
 
 			if let Err(e) = parse_incoming_message(&node_manager, &address, &shared_writer, message).await {
-				warn!("Error parsing message: {:?}", e);
+				warn!(peer = %address, error = ?e, "error parsing message");
 
 				// Close the connection
 				if let Err(e) = shared_writer.lock().await.shutdown().await {
-					warn!("Error shutting down writer for {}: {}", address, e);
+					warn!(peer = %address, error = %e, "error shutting down writer");
 				}
 				break 'main;
 			}
@@ -1630,22 +1825,19 @@ async fn parse_incoming_message(
 		str.to_str()
 			.map_err(|e| anyhow!("command field is not valid UTF-8: {e}"))?
 	} else {
-		warn!("Malformed 'command' field in message from {}", address);
+		warn!(peer = %address, "malformed 'command' field in message");
 		return Err(anyhow!("Error parsing incoming message, 'command' field is malformed"));
 	};
 
 	let command = NetworkCommand::from_command_str(command);
 
-	debug!("Received message: {:?} from {}", command, address);
+	debug!(peer = %address, command = ?command, "received message");
 
 	// Only allow Version/Verack before the handshake completes
 	if !matches!(command, NetworkCommand::Version | NetworkCommand::Verack) {
 		let is_connected = node_manager.nodes.get(address).is_some_and(|n| n.state.is_connected());
 		if !is_connected {
-			warn!(
-				"Received {:?} from {} before handshake complete, ignoring",
-				command, address
-			);
+			warn!(peer = %address, command = ?command, "received message before handshake complete, ignoring");
 			return Ok(());
 		}
 	}
@@ -1662,7 +1854,7 @@ async fn parse_incoming_message(
 		}
 		NetworkCommand::Addr => handler_addr::handle_addr(node_manager, address, &message.payload).await,
 		NetworkCommand::Alert => {
-			debug!("Received alert from {}, ignoring", address);
+			debug!(peer = %address, "received alert, ignoring");
 			Ok(())
 		}
 		NetworkCommand::GetAddr => handler_addr::handle_getaddr(node_manager, address, tcp_writer).await,
@@ -1709,761 +1901,8 @@ async fn parse_incoming_message(
 		}
 		NetworkCommand::Mempool => handler_mempool::handle_mempool(node_manager, address, tcp_writer).await,
 		NetworkCommand::Unknown(cmd) => {
-			warn!("Unknown command from {}: {}", address, cmd);
+			warn!(peer = %address, command = %cmd, "unknown command");
 			Ok(())
 		}
-	}
-}
-
-#[cfg(test)]
-// Tests use unwrap/indexing for brevity since panics are the intended failure mode.
-// DashMap guard drop order doesn't matter in synchronous test functions
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::significant_drop_tightening)]
-mod tests {
-	use super::handler_addr::{compute_relay_score, refill_addr_tokens};
-	use super::handler_version::sanitize_user_agent;
-	use super::*;
-
-	/// Dummy genesis header for tests that don't care about header data
-	const fn test_genesis() -> BlockHeader {
-		BlockHeader {
-			version: 1,
-			prev_hash: Hash256::ZERO,
-			merkle_root: Hash256::ZERO,
-			timestamp: 0,
-			bits: 0,
-			nonce: 0,
-		}
-	}
-
-	#[test]
-	fn connectable_when_retry_time_passed() {
-		let state = NodeState::Disconnected {
-			retry_at: Instant::now() - Duration::from_secs(1),
-			attempt: 0,
-		};
-		assert!(state.is_connectable());
-	}
-
-	#[test]
-	fn not_connectable_when_retry_pending() {
-		let state = NodeState::Disconnected {
-			retry_at: Instant::now() + Duration::from_secs(3600),
-			attempt: 3,
-		};
-		assert!(!state.is_connectable());
-	}
-
-	#[test]
-	fn not_connectable_when_banned() {
-		let state = NodeState::Banned {
-			reason: BanReason::ProtocolViolation,
-			created: 1_000_000,
-			expires: 1_000_000 + 86_400,
-		};
-		assert!(!state.is_connectable());
-	}
-
-	#[test]
-	fn not_connectable_when_dead() {
-		assert!(!NodeState::Dead.is_connectable());
-	}
-
-	#[test]
-	fn connecting_is_not_connected() {
-		assert!(!NodeState::Connecting { since: Instant::now() }.is_connected());
-	}
-
-	#[test]
-	fn dead_is_not_connected() {
-		assert!(!NodeState::Dead.is_connected());
-	}
-
-	#[test]
-	fn backoff_increases_with_attempts() {
-		// Test multiple times to account for jitter
-		for _ in 0..10 {
-			let d0 = calculate_backoff(0);
-			let d5 = calculate_backoff(5);
-			// d0 should be around 30s +/-25% = 22.5-37.5s
-			assert!(d0 >= Duration::from_secs(22));
-			assert!(d0 <= Duration::from_secs(38));
-			// d5 should be capped or near cap
-			// BACKOFF_MAX_SECS + 25% jitter headroom + 1s tolerance
-			#[allow(clippy::arithmetic_side_effects)]
-			let max_with_jitter = Duration::from_secs(BACKOFF_MAX_SECS + BACKOFF_MAX_SECS / 4 + 1);
-			assert!(d5 <= max_with_jitter);
-		}
-	}
-
-	#[test]
-	fn backoff_caps_at_maximum() {
-		let d = calculate_backoff(20); // way past cap
-		// BACKOFF_MAX_SECS + 25% jitter headroom + 1s tolerance
-		#[allow(clippy::arithmetic_side_effects)]
-		let max_with_jitter = Duration::from_secs(BACKOFF_MAX_SECS + BACKOFF_MAX_SECS / 4 + 1);
-		assert!(d <= max_with_jitter);
-	}
-
-	#[test]
-	fn banned_is_banned() {
-		let now = unix_now();
-		let state = NodeState::Banned {
-			reason: BanReason::Misbehavior,
-			created: now,
-			expires: ban_expires_at(now),
-		};
-		assert!(state.is_banned());
-	}
-
-	#[test]
-	fn expired_ban_is_not_banned() {
-		let state = NodeState::Banned {
-			reason: BanReason::ProtocolViolation,
-			created: 0,
-			expires: 1, // expired long ago
-		};
-		assert!(!state.is_banned());
-	}
-
-	#[test]
-	fn connected_is_not_banned() {
-		assert!(!NodeState::Connecting { since: Instant::now() }.is_banned());
-	}
-
-	#[test]
-	fn ban_reason_display() {
-		assert_eq!(format!("{}", BanReason::ProtocolViolation), "protocol violation");
-		assert_eq!(format!("{}", BanReason::Misbehavior), "misbehavior");
-	}
-
-	#[test]
-	fn refill_addr_tokens_adds_correctly() {
-		let tokens = refill_addr_tokens(0.0, Duration::from_secs(50));
-		// 50 * 0.1 = 5.0
-		assert!((tokens - 5.0).abs() < f64::EPSILON);
-	}
-
-	#[test]
-	fn refill_addr_tokens_respects_capacity() {
-		let tokens = refill_addr_tokens(999.0, Duration::from_secs(100));
-		assert!((tokens - ADDR_TOKEN_CAPACITY).abs() < f64::EPSILON);
-	}
-
-	#[test]
-	fn refill_addr_tokens_zero_elapsed() {
-		let tokens = refill_addr_tokens(500.0, Duration::from_secs(0));
-		assert!((tokens - 500.0).abs() < f64::EPSILON);
-	}
-
-	#[test]
-	fn record_external_ip_vote_counts() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "8.8.8.8".parse().unwrap();
-		nm.record_external_ip_vote(ip);
-		nm.record_external_ip_vote(ip);
-		nm.record_external_ip_vote(ip);
-		assert_eq!(nm.get_external_ip(), Some(ip));
-	}
-
-	#[test]
-	fn get_external_ip_requires_three_votes() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "8.8.8.8".parse().unwrap();
-		nm.record_external_ip_vote(ip);
-		nm.record_external_ip_vote(ip);
-		assert_eq!(nm.get_external_ip(), None);
-	}
-
-	#[test]
-	fn get_external_ip_returns_majority() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip_a: IpAddr = "8.8.8.8".parse().unwrap();
-		let ip_b: IpAddr = "1.1.1.1".parse().unwrap();
-		nm.record_external_ip_vote(ip_a);
-		nm.record_external_ip_vote(ip_b);
-		nm.record_external_ip_vote(ip_a);
-		nm.record_external_ip_vote(ip_a);
-		nm.record_external_ip_vote(ip_b);
-		nm.record_external_ip_vote(ip_b);
-		nm.record_external_ip_vote(ip_a);
-		assert_eq!(nm.get_external_ip(), Some(ip_a));
-	}
-
-	#[test]
-	fn record_external_ip_vote_rejects_private() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let private_ip: IpAddr = "192.168.1.1".parse().unwrap();
-		nm.record_external_ip_vote(private_ip);
-		nm.record_external_ip_vote(private_ip);
-		nm.record_external_ip_vote(private_ip);
-		assert_eq!(nm.get_external_ip(), None);
-	}
-
-	#[test]
-	fn relay_score_is_deterministic() {
-		let score_a = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 42);
-		let score_b = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 42);
-		assert_eq!(score_a, score_b);
-	}
-
-	#[test]
-	fn relay_score_varies_by_peer() {
-		let score_a = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 1);
-		let score_b = compute_relay_score(12345, 0xDEAD_BEEF, 1000, 2);
-		assert_ne!(score_a, score_b);
-	}
-
-	#[test]
-	fn relay_score_rotates_daily() {
-		let score_day1 = compute_relay_score(12345, 0xDEAD_BEEF, 0, 42);
-		let score_day2 = compute_relay_score(12345, 0xDEAD_BEEF, 1, 42);
-		assert_ne!(score_day1, score_day2);
-	}
-
-	#[test]
-	fn has_incoming_connected_detects_incoming() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 12345, ConnectionType::Incoming);
-
-		// Node starts in Handshaking, not Connected -- should return false
-		assert!(!nm.has_incoming_connected());
-	}
-
-	#[test]
-	fn addr_known_dedup_prevents_duplicate_insert() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// First insert returns true (new)
-		let first = nm.nodes.get_mut(&ip).unwrap().addr_known.insert(ip);
-		assert!(first);
-
-		// Second insert returns false (already known)
-		let second = nm.nodes.get_mut(&ip).unwrap().addr_known.insert(ip);
-		assert!(!second);
-	}
-
-	#[test]
-	fn addr_known_clears_on_bucket_rotation() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Insert an addr and set a bucket
-		{
-			let mut node = nm.nodes.get_mut(&ip).unwrap();
-			node.addr_known.insert("1.2.3.4".parse::<IpAddr>().unwrap());
-			node.addr_known_bucket = 100;
-		}
-
-		// Simulate bucket rotation by checking a different bucket
-		{
-			let mut node = nm.nodes.get_mut(&ip).unwrap();
-			let new_bucket = 101;
-			if node.addr_known_bucket != new_bucket {
-				node.addr_known.clear();
-				node.addr_known_bucket = new_bucket;
-			}
-			assert!(node.addr_known.is_empty());
-		}
-	}
-
-	#[test]
-	fn sent_getaddr_defaults_to_false() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert!(!node.sent_getaddr);
-	}
-
-	#[test]
-	fn sent_getaddr_can_be_set() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		{
-			let mut node = nm.nodes.get_mut(&ip).unwrap();
-			node.sent_getaddr = true;
-		}
-		let node = nm.nodes.get(&ip).unwrap();
-		assert!(node.sent_getaddr);
-	}
-
-	#[test]
-	fn new_node_starts_with_initial_token_bucket() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert!((node.addr_tokens - ADDR_TOKEN_INITIAL).abs() < f64::EPSILON);
-	}
-
-	#[test]
-	fn relay_score_same_key_different_addresses_differ() {
-		let key = 42;
-		let bucket = 100;
-		let peer = 1;
-		let score_a = compute_relay_score(key, 111, bucket, peer);
-		let score_b = compute_relay_score(key, 222, bucket, peer);
-		assert_ne!(score_a, score_b);
-	}
-
-	#[test]
-	fn same_ip_different_port_deduplicates() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-		assert!(nm.insert(ip, 9933, ConnectionType::Outgoing));
-		assert!(!nm.insert(ip, 8888, ConnectionType::Outgoing));
-		assert_eq!(nm.nodes.len(), 1);
-	}
-
-	#[test]
-	fn insert_updates_port_when_disconnected() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Disconnected {
-				retry_at: Instant::now(),
-				attempt: 0,
-			};
-		}
-
-		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
-		assert!(!result, "should return false for existing node");
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 8888);
-	}
-
-	#[test]
-	fn insert_updates_port_when_dead() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Dead;
-		}
-
-		let result = nm.insert(ip, 7777, ConnectionType::Outgoing);
-		assert!(!result);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 7777);
-	}
-
-	#[test]
-	fn insert_ignores_when_connecting() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Node starts in Connecting state
-		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
-		assert!(!result);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 9933, "port should not change when connecting");
-	}
-
-	#[test]
-	fn insert_incoming_new_node() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_some());
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 54321);
-		assert_eq!(node.connection_type, ConnectionType::Incoming);
-		assert!(matches!(node.state, NodeState::Handshaking { .. }));
-	}
-
-	#[test]
-	fn insert_incoming_replaces_disconnected() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Disconnected {
-				retry_at: Instant::now(),
-				attempt: 0,
-			};
-		}
-
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_some());
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 54321);
-		assert_eq!(node.connection_type, ConnectionType::Incoming);
-		assert!(matches!(node.state, NodeState::Handshaking { .. }));
-	}
-
-	#[test]
-	fn insert_incoming_replaces_dead() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Dead;
-		}
-
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_some());
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 54321);
-		assert_eq!(node.connection_type, ConnectionType::Incoming);
-		assert!(matches!(node.state, NodeState::Handshaking { .. }));
-	}
-
-	#[test]
-	fn insert_incoming_rejects_when_connecting() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Node starts in Connecting -- should reject incoming
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_none());
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 9933);
-	}
-
-	#[test]
-	fn insert_ignores_when_banned() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: 1_000_000,
-				expires: 1_000_000 + 86_400,
-			};
-		}
-
-		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
-		assert!(!result);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 9933, "port should not change when banned");
-	}
-
-	#[test]
-	fn insert_incoming_rejects_when_banned() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: 1_000_000,
-				expires: 1_000_000 + 86_400,
-			};
-		}
-
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_none(), "should reject incoming for banned node");
-	}
-
-	#[tokio::test]
-	async fn insert_ignores_when_connected() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Create a real TCP pair to get an OwnedWriteHalf
-		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
-		let stream = TcpStream::connect(addr).await.unwrap();
-		let (_, write_half) = stream.into_split();
-		let writer: SharedTcpWriter = Arc::new(Mutex::new(write_half));
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Connected { writer };
-		}
-
-		let result = nm.insert(ip, 8888, ConnectionType::Outgoing);
-		assert!(!result);
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 9933, "port should not change when connected");
-	}
-
-	#[tokio::test]
-	async fn insert_incoming_rejects_when_connected() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
-		let stream = TcpStream::connect(addr).await.unwrap();
-		let (_, write_half) = stream.into_split();
-		let writer: SharedTcpWriter = Arc::new(Mutex::new(write_half));
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Connected { writer };
-		}
-
-		let result = nm.insert_incoming(ip, 54321);
-		assert!(result.is_none(), "should reject incoming when node is connected");
-
-		let node = nm.nodes.get(&ip).unwrap();
-		assert_eq!(node.port, 9933, "port should not change");
-	}
-
-	#[test]
-	fn collect_peers_includes_connected_peer() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Simulate a peer that completed handshake: set version and last_seen
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.version = 70003;
-			node.last_seen = 1_700_000_000;
-			node.user_agent = "/Test:1.0/".to_string();
-			node.height = 100;
-			node.services = ServiceMask::NODE_NETWORK_LIMITED;
-		}
-
-		let db = nm.collect_peers_for_save();
-		assert_eq!(db.peers.len(), 1);
-		assert_eq!(db.peers[0].port, 9933);
-		assert_eq!(db.peers[0].height, 100);
-	}
-
-	#[test]
-	fn collect_peers_excludes_unconnected_loaded_peer() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Simulate a peer loaded from disk: has last_seen but version stays 0
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.last_seen = 1_700_000_000;
-		}
-
-		let db = nm.collect_peers_for_save();
-		assert!(db.peers.is_empty(), "peer with version=0 should not be saved");
-	}
-
-	#[test]
-	fn collect_peers_excludes_incoming() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Incoming);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.version = 70003;
-			node.last_seen = 1_700_000_000;
-		}
-
-		let db = nm.collect_peers_for_save();
-		assert!(db.peers.is_empty(), "incoming peers should not be saved");
-	}
-
-	#[test]
-	fn collect_peers_includes_disconnected_peer_with_version() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Peer connected once (version set), now disconnected and retrying.
-		// version_received may be false but version field persists
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.version = 70003;
-			node.last_seen = 1_700_000_000;
-			node.version_received = false;
-			node.state = NodeState::Disconnected {
-				retry_at: Instant::now(),
-				attempt: 1,
-			};
-		}
-
-		let db = nm.collect_peers_for_save();
-		assert_eq!(db.peers.len(), 1, "disconnected peer with version>0 should be saved");
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn reaper_clears_expired_bans() {
-		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		// Set an already-expired ban
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Banned {
-				reason: BanReason::ProtocolViolation,
-				created: 0,
-				expires: 1, // expired long ago
-			};
-		}
-
-		// Verify the ban shows as expired
-		let node = nm.nodes.get(&ip).unwrap();
-		assert!(!node.state.is_banned(), "ban should be expired");
-		drop(node);
-
-		// Run one reaper cycle -- with paused time, sleep auto-advances
-		// past the 30s reaper interval, letting the scan execute
-		let nm_clone = Arc::clone(&nm);
-		let reaper = tokio::spawn(async move { nm_clone.run_reaper().await });
-		tokio::time::sleep(REAPER_SCAN_INTERVAL + Duration::from_secs(1)).await;
-		reaper.abort();
-
-		// The expired ban should have been cleared to Dead
-		let node = nm.nodes.get(&ip).unwrap();
-		assert!(
-			matches!(node.state, NodeState::Dead),
-			"expired ban should become Dead, got {}",
-			node.state
-		);
-	}
-
-	#[test]
-	fn collect_bans_excludes_expired() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "1.2.3.4".parse().unwrap();
-		nm.insert(ip, 9933, ConnectionType::Outgoing);
-
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Banned {
-				reason: BanReason::Misbehavior,
-				created: 0,
-				expires: 1, // expired
-			};
-		}
-
-		let db = nm.collect_bans_for_save();
-		assert!(db.bans.is_empty(), "expired bans should not be saved");
-	}
-
-	#[test]
-	fn sanitize_user_agent_strips_control_chars() {
-		assert_eq!(sanitize_user_agent("/Satoshi:0.1/"), "/Satoshi:0.1/");
-	}
-
-	#[test]
-	fn sanitize_user_agent_strips_non_ascii() {
-		assert_eq!(sanitize_user_agent("/Test\x1b[31m:evil/"), "/Test[31m:evil/");
-	}
-
-	#[test]
-	fn sanitize_user_agent_trims_whitespace() {
-		assert_eq!(sanitize_user_agent("  /Satoshi:0.1/  "), "/Satoshi:0.1/");
-	}
-
-	#[test]
-	fn sanitize_user_agent_all_spaces_becomes_empty() {
-		assert_eq!(sanitize_user_agent("       "), "");
-	}
-
-	#[test]
-	fn sanitize_user_agent_truncates_long_input() {
-		let long = "A".repeat(300);
-		let result = sanitize_user_agent(&long);
-		assert_eq!(result.len(), MAX_USER_AGENT_DISPLAY);
-	}
-
-	#[test]
-	fn load_saved_peers_skips_unknown_version() {
-		let nm = Arc::new(NodeManager::new(test_genesis(), ConsensusParams::mainnet()));
-		let db = crate::storage::peers::PeerDb {
-			version: 999,
-			peers: vec![crate::storage::peers::SavedPeer {
-				ip: "1.2.3.4".parse().unwrap(),
-				port: 9933,
-				services: 0,
-				last_seen: 0,
-				user_agent: String::new(),
-				height: 0,
-			}],
-		};
-		nm.load_saved_peers(&db);
-		assert!(nm.nodes.is_empty(), "should skip peers with unknown version");
-	}
-
-	#[test]
-	fn load_saved_bans_skips_unknown_version() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let db = crate::storage::bans::BanDb {
-			version: 999,
-			bans: vec![crate::storage::bans::SavedBan {
-				ip: "1.2.3.4".parse().unwrap(),
-				reason: "test".to_string(),
-				created: 0,
-				expires: u64::MAX,
-			}],
-		};
-		nm.load_saved_bans(&db);
-		assert!(nm.nodes.is_empty(), "should skip bans with unknown version");
-	}
-
-	#[test]
-	fn incoming_cooldown_rejects_rapid_reconnect() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-		// First connection should succeed
-		let guard = nm.insert_incoming(ip, 54321);
-		assert!(guard.is_some());
-		drop(guard);
-
-		// Make the node Dead so it's eligible again
-		if let Some(mut node) = nm.nodes.get_mut(&ip) {
-			node.state = NodeState::Dead;
-		}
-
-		// Second connection within cooldown should be rejected
-		let guard2 = nm.insert_incoming(ip, 54322);
-		assert!(guard2.is_none(), "should reject per-IP cooldown");
-	}
-
-	#[test]
-	fn incoming_guard_decrements_on_drop() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-		let guard = nm.insert_incoming(ip, 54321);
-		assert!(guard.is_some());
-		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 1);
-
-		drop(guard);
-		assert_eq!(nm.incoming_count.load(Ordering::Acquire), 0);
-	}
-
-	#[test]
-	fn block_store_none_by_default() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		assert!(nm.block_store().is_none());
-	}
-
-	#[test]
-	fn block_store_set_and_get() {
-		let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-		let dir = tempfile::tempdir().unwrap();
-		let store = Arc::new(crate::storage::block_store::BlockStore::open(dir.path()).unwrap());
-		nm.set_block_store(Arc::clone(&store));
-		assert!(nm.block_store().is_some());
 	}
 }

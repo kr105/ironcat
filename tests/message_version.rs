@@ -56,7 +56,7 @@ fn from_bytes_with_unknown_service_bits_does_not_panic() {
 #[test]
 fn from_bytes_roundtrip() {
 	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
-	let original = MessageVersion::new(addr, 123_456);
+	let original = MessageVersion::new(addr, 123_456, 424_791);
 
 	let bytes = original.to_bytes();
 	let decoded = MessageVersion::from_bytes(&bytes).expect("roundtrip decode should succeed");
@@ -70,11 +70,11 @@ fn from_bytes_roundtrip() {
 }
 
 #[test]
-fn from_bytes_without_relay_fails() {
+fn from_bytes_without_relay_defaults_to_true() {
 	let mut payload = build_version_payload(ServiceMask::NODE_NETWORK.bits());
 	payload.pop(); // Remove the relay byte
-	let result = MessageVersion::from_bytes(&payload);
-	assert!(result.is_err(), "missing relay field should fail parsing");
+	let msg = MessageVersion::from_bytes(&payload).unwrap();
+	assert!(msg.relay, "missing relay should default to true per BIP 37");
 }
 
 #[test]
@@ -88,16 +88,23 @@ fn from_bytes_with_relay_false() {
 }
 
 #[test]
-fn new_reports_zero_start_height() {
+fn new_reports_provided_start_height() {
 	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
-	let msg = MessageVersion::new(addr, 42);
-	assert_eq!(msg.start_height, 0, "should report honest 0 height");
+	let msg = MessageVersion::new(addr, 42, 424_791);
+	assert_eq!(msg.start_height, 424_791, "should report the provided chain height");
+}
+
+#[test]
+fn new_reports_zero_when_no_chainstate() {
+	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
+	let msg = MessageVersion::new(addr, 42, 0);
+	assert_eq!(msg.start_height, 0, "should report 0 when chainstate unavailable");
 }
 
 #[test]
 fn new_uses_cargo_version_in_user_agent() {
 	let addr = NetworkAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9933);
-	let msg = MessageVersion::new(addr, 42);
+	let msg = MessageVersion::new(addr, 42, 0);
 	let expected = format!("/Ironcat:{}/", env!("CARGO_PKG_VERSION"));
 	assert_eq!(msg.user_agent, expected);
 }

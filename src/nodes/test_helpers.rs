@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Test utilities: unwrap/panic are intentional here since panics are the correct failure mode.
+// missing_panics_doc is suppressed because these are test helpers -- callers expect panics on failure
+#![allow(clippy::unwrap_used, clippy::panic, clippy::missing_panics_doc)]
+
 //! Shared test utilities for handler tests
 //!
 //! Provides a loopback TCP pair, message reader, and dummy genesis header

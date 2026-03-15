@@ -186,6 +186,8 @@ fn draw(frame: &mut Frame, node_manager: &NodeManager, log_buffer: &VecDeque<Tui
 			let data = tab_overview::OverviewData {
 				stats: &stats,
 				nodes: &nodes,
+				listen_port: node_manager.listen_port,
+				port_reachable: node_manager.is_port_reachable(),
 				chain_height,
 				tip_bits,
 				block_height,

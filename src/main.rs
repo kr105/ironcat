@@ -120,7 +120,9 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		.with_context(|| format!("failed to create data directory {}", args.datadir.display()))?;
 
 	// Create NodeManager without backend first so the TUI can start immediately
-	let node_manager = Arc::new(NodeManager::new(GENESIS_HEADER, ConsensusParams::mainnet()));
+	let mut nm = NodeManager::new(GENESIS_HEADER, ConsensusParams::mainnet());
+	nm.listen_port = args.port;
+	let node_manager = Arc::new(nm);
 
 	// Create mempool early so the TUI can display it from the start
 	let mempool = Arc::new(tokio::sync::RwLock::new(Mempool::new()));
@@ -269,6 +271,14 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 	let nm = Arc::clone(&node_manager);
 	let announce_handle = tokio::spawn(nm.run_self_announce());
 
+	// Spawn header timeout scanner
+	let nm = Arc::clone(&node_manager);
+	let header_timeout_handle = tokio::spawn(nm.run_header_timeout_scanner());
+
+	// Spawn strike decay loop
+	let nm = Arc::clone(&node_manager);
+	let strike_decay_handle = tokio::spawn(nm.run_strike_decay());
+
 	// Spawn periodic persistence task
 	let nm = Arc::clone(&node_manager);
 	let datadir = args.datadir.clone();
@@ -400,6 +410,12 @@ async fn run_core(tui_rx: Option<mpsc::Receiver<TuiLogEntry>>, args: &Args) -> R
 		}
 		_ = relay_handle => {
 			info!("Tx relay task ended, shutting down");
+		}
+		_ = header_timeout_handle => {
+			info!("Header timeout scanner ended, shutting down");
+		}
+		_ = strike_decay_handle => {
+			info!("Strike decay task ended, shutting down");
 		}
 		() = async {
 			match ui_handle {

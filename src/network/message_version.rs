@@ -8,9 +8,6 @@ use std::io::{Cursor, Read};
 
 const PROTOCOL_VERSION: u32 = 70012;
 
-/// Reports 0 until actual chain state is available (honest: we don't have blocks)
-const DEFAULT_START_HEIGHT: i32 = 0;
-
 /// Represents a version message in the Catcoin protocol
 #[derive(Debug)]
 pub struct MessageVersion {
@@ -35,14 +32,18 @@ pub struct MessageVersion {
 }
 
 impl MessageVersion {
-	/// Creates a new version message for the given receiving address and nonce
-	pub fn new(addr_recv: NetworkAddress, nonce: u64) -> Self {
+	/// Creates a new version message for the given receiving address, nonce, and chain height
+	pub fn new(addr_recv: NetworkAddress, nonce: u64, start_height: u32) -> Self {
 		let mut services = ServiceMask::empty();
 		services.set(ServiceMask::NODE_NETWORK, true);
 
 		// Protocol uses i64 for timestamp; u64 seconds won't wrap for ~584 billion years
 		#[allow(clippy::cast_possible_wrap)]
 		let timestamp = unix_now() as i64;
+
+		// start_height is i32 on the wire; u32 tip won't exceed i32::MAX in practice
+		#[allow(clippy::cast_possible_wrap)]
+		let start_height = start_height as i32;
 
 		Self {
 			version: PROTOCOL_VERSION,
@@ -51,7 +52,7 @@ impl MessageVersion {
 			addr_recv,
 			nonce,
 			user_agent: format!("/Ironcat:{}/", env!("CARGO_PKG_VERSION")),
-			start_height: DEFAULT_START_HEIGHT,
+			start_height,
 			relay: true,
 		}
 	}
@@ -78,8 +79,9 @@ impl MessageVersion {
 	/// Decodes a version message from wire bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		// Minimum: version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26) +
-		//          nonce(8) + user_agent_varint(1) + start_height(4) + relay(1) = 86
-		if bytes.len() < 86 {
+		//          nonce(8) + user_agent_varint(1) + start_height(4) = 85
+		// relay(1) is optional per BIP 37, defaults to true when absent
+		if bytes.len() < 85 {
 			return Err(anyhow!("Insufficient bytes for MessageVersion"));
 		}
 
@@ -114,7 +116,8 @@ impl MessageVersion {
 			.read_i32::<LittleEndian>()
 			.context("failed to read start_height")?;
 
-		let relay = cursor.read_u8().context("failed to read relay field")? != 0;
+		// relay is optional per BIP 37; defaults to true when absent (same as reference client)
+		let relay = cursor.read_u8().map_or(true, |b| b != 0);
 
 		Ok(Self {
 			version,

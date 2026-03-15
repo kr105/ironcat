@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	difficulty::compact::work_from_bits,
@@ -634,7 +634,7 @@ impl HeaderStore {
 		for header in headers {
 			let hash = header.block_hash();
 			if self.by_hash.contains_key(&hash) {
-				debug!(block_hash = %hash, "skipping duplicate header in batch");
+				trace!(block_hash = %hash, "skipping duplicate header in batch");
 				continue;
 			}
 

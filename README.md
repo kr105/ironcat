@@ -104,6 +104,11 @@ All logs are also written to `debug.log` in the data directory (append mode, per
 
 DNS seeds are resolved on startup unless `--no-dns-seed` is passed.
 
+## Known limitations
+
+- **Single-core machines**: On systems with only 1 CPU core, block and header download timeouts may fire prematurely. The async runtime shares the core with block validation and processing, so under load the timeout timers can expire even though peers responded in time. Minimum 2 cores recommended
+- **Slow peer handling**: Peers that consistently time out are automatically excluded from block and header requests (5 strikes = exclusion), but remain connected for other protocol traffic. Recovery is automatic via 5-minute strike decay. On single-core machines, this may exclude peers that are responding in time but losing the race against block processing for CPU time
+
 ## Notable dependencies
 
 - **redb** -- Pure Rust embedded key-value database for persistent header, block index, and chainstate storage. ACID transactions, zero C/C++ linkage
