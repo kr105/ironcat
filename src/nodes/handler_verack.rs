@@ -7,7 +7,10 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
 use super::{BanReason, NodeManager, NodeState, SENDHEADERS_VERSION, ban_expires_at};
-use crate::network::{SharedTcpWriter, SharedTcpWriterExt, message_getheaders::MessageGetHeaders};
+use crate::network::{
+	NetworkAddress, SharedTcpWriter, SharedTcpWriterExt, message_addr::MessageAddr,
+	message_getheaders::MessageGetHeaders,
+};
 use crate::types::hash::Hash256;
 use crate::utils::unix_now;
 
@@ -54,7 +57,34 @@ pub(super) async fn handle_verack(
 
 	// Record external IP vote only after handshake completes
 	if let Some(ip) = pending_ip {
+		let had_consensus = node_manager.get_external_ip().is_some();
 		node_manager.record_external_ip_vote(ip);
+
+		// If we just reached IP consensus, probe our own reachability inline
+		// so the advertisement check below can see the result immediately
+		if !had_consensus && node_manager.get_external_ip().is_some() {
+			node_manager.probe_reachability().await;
+		}
+	}
+
+	// Advertise our address if we have confirmed that our port is reachable.
+	// This avoids polluting peer tables with unreachable addresses (e.g. behind NAT)
+	if node_manager.is_port_reachable()
+		&& let Some(external_ip) = node_manager.get_external_ip()
+	{
+		let addr = NetworkAddress::new(external_ip, node_manager.listen_port);
+		let msg = MessageAddr::new(vec![addr]);
+		tcp_writer
+			.send_message("addr", &msg.to_bytes())
+			.await
+			.context("failed to send self-advertisement")?;
+
+		debug!(
+			peer = %address,
+			external_ip = %external_ip,
+			port = node_manager.listen_port,
+			"advertised own address during handshake"
+		);
 	}
 
 	tcp_writer

@@ -220,13 +220,89 @@ fn relay_score_rotates_daily() {
 }
 
 #[test]
-fn has_incoming_connected_detects_incoming() {
+fn port_reachable_defaults_to_false() {
 	let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
-	let ip: IpAddr = "1.2.3.4".parse().unwrap();
-	nm.insert(ip, 12345, ConnectionType::Incoming);
+	assert!(!nm.is_port_reachable());
+}
 
-	// Node starts in Handshaking, not Connected -- should return false
-	assert!(!nm.has_incoming_connected());
+#[tokio::test]
+async fn probe_reachability_succeeds_against_local_listener() {
+	let mut nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+
+	// Bind a local listener on an OS-assigned port
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let bound_port = listener.local_addr().unwrap().port();
+
+	// Inject votes directly since record_external_ip_vote rejects non-routable IPs
+	let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+	nm.external_ip_votes.insert(loopback, 3);
+	nm.listen_port = bound_port;
+
+	nm.probe_reachability().await;
+	assert!(nm.is_port_reachable());
+}
+
+#[tokio::test]
+async fn probe_reachability_fails_when_nothing_listening() {
+	let mut nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+
+	// Bind and immediately drop to get a port that nobody is listening on
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let dead_port = listener.local_addr().unwrap().port();
+	drop(listener);
+
+	let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+	nm.external_ip_votes.insert(loopback, 3);
+	nm.listen_port = dead_port;
+
+	nm.probe_reachability().await;
+	assert!(!nm.is_port_reachable());
+}
+
+#[tokio::test]
+async fn probe_reachability_resets_after_failure() {
+	let mut nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+
+	let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+	nm.external_ip_votes.insert(loopback, 3);
+	nm.listen_port = port;
+
+	// First probe succeeds
+	nm.probe_reachability().await;
+	assert!(nm.is_port_reachable());
+
+	// Drop the listener, second probe should reset to false
+	drop(listener);
+	nm.probe_reachability().await;
+	assert!(!nm.is_port_reachable());
+}
+
+#[test]
+fn insert_incoming_rejects_loopback() {
+	let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+	let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+	let result = nm.insert_incoming(loopback, 9933);
+	assert!(result.is_none(), "should reject loopback incoming");
+	assert!(nm.nodes.is_empty());
+}
+
+#[test]
+fn insert_incoming_rejects_own_external_ip() {
+	let nm = NodeManager::new(test_genesis(), ConsensusParams::mainnet());
+	let external: IpAddr = "8.8.8.8".parse().unwrap();
+
+	// Build consensus on external IP
+	nm.record_external_ip_vote(external);
+	nm.record_external_ip_vote(external);
+	nm.record_external_ip_vote(external);
+
+	let result = nm.insert_incoming(external, 9933);
+	assert!(result.is_none(), "should reject own external IP");
+	assert!(nm.nodes.is_empty());
 }
 
 #[test]

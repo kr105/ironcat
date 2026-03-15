@@ -23,7 +23,7 @@ use std::{
 	net::IpAddr,
 	sync::{
 		Arc,
-		atomic::{AtomicU32, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 	},
 	time::Duration,
 };
@@ -100,13 +100,16 @@ pub const ADDR_TOKEN_CAPACITY: f64 = 1000.0;
 pub const ADDR_TOKEN_INITIAL: f64 = 10.0;
 
 /// How often to announce our own address to peers
-const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const SELF_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Maximum length of user agent string after sanitization
 pub const MAX_USER_AGENT_DISPLAY: usize = 256;
 
 /// Maximum number of entries in the external IP votes map
 const MAX_EXTERNAL_IP_VOTES: usize = 100;
+
+/// Timeout for the self-connectivity probe
+const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum entries in a peer's `addr_known` set within a 24h bucket
 const MAX_ADDR_KNOWN: usize = 5000;
@@ -512,7 +515,14 @@ pub struct NodeManager {
 	pub(crate) relay_key: u64,
 
 	/// Peer votes for our external IP address
-	external_ip_votes: DashMap<IpAddr, u32>,
+	pub external_ip_votes: DashMap<IpAddr, u32>,
+
+	/// The port we are listening on (from CLI or default)
+	pub listen_port: u16,
+
+	/// Whether our listen port has been confirmed reachable from the outside.
+	/// Set by probing our own `external_ip:listen_port` via TCP connect
+	port_reachable: AtomicBool,
 
 	/// Number of currently active incoming connections
 	pub incoming_count: Arc<AtomicUsize>,
@@ -583,6 +593,8 @@ impl NodeManager {
 			my_nonce: rng.next_u64(),
 			relay_key: rng.next_u64(),
 			external_ip_votes: DashMap::new(),
+			listen_port: DEFAULT_PORT,
+			port_reachable: AtomicBool::new(false),
 			incoming_count: Arc::new(AtomicUsize::new(0)),
 			incoming_cooldowns: DashMap::new(),
 			header_store: Arc::new(parking_lot::RwLock::new(store)),
@@ -701,6 +713,14 @@ impl NodeManager {
 				port,
 				"incoming connection limit reached, rejecting"
 			);
+			return None;
+		}
+
+		// Reject connections from our own external IP or loopback (e.g. reachability
+		// probes). These would create ghost entries in the node map and waste
+		// incoming slots
+		if address.is_loopback() || self.get_external_ip().is_some_and(|ip| ip == address) {
+			debug!(peer = %address, "rejecting incoming from own address");
 			return None;
 		}
 
@@ -1365,6 +1385,54 @@ impl NodeManager {
 			.map(|entry| *entry.key())
 	}
 
+	/// Returns true if our listen port has been confirmed reachable from the outside
+	pub fn is_port_reachable(&self) -> bool {
+		self.port_reachable.load(Ordering::Acquire)
+	}
+
+	/// Probes our own external address to check if our listen port is reachable.
+	/// Attempts a TCP connect to `external_ip:listen_port` with a short timeout.
+	/// If the connection succeeds, we are publicly reachable and can safely
+	/// advertise our address without polluting peer tables with unreachable entries
+	pub async fn probe_reachability(&self) {
+		let Some(external_ip) = self.get_external_ip() else {
+			return;
+		};
+
+		let addr = std::net::SocketAddr::new(external_ip, self.listen_port);
+
+		match timeout(REACHABILITY_PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+			Ok(Ok(stream)) => {
+				// Connection succeeded, port is reachable
+				drop(stream);
+				if !self.port_reachable.swap(true, Ordering::Release) {
+					info!(
+						address = %external_ip,
+						port = self.listen_port,
+						"port reachability confirmed via self-probe"
+					);
+				}
+			}
+			Ok(Err(e)) => {
+				self.port_reachable.store(false, Ordering::Release);
+				debug!(
+					address = %external_ip,
+					port = self.listen_port,
+					error = %e,
+					"port reachability probe failed"
+				);
+			}
+			Err(_) => {
+				self.port_reachable.store(false, Ordering::Release);
+				debug!(
+					address = %external_ip,
+					port = self.listen_port,
+					"port reachability probe timed out"
+				);
+			}
+		}
+	}
+
 	/// Revives a Dead node if the given timestamp is newer than `last_seen`
 	///
 	/// Returns true if the node was revived, false otherwise
@@ -1391,33 +1459,28 @@ impl NodeManager {
 		false
 	}
 
-	/// Returns true if at least one incoming peer is in Connected state
-	pub fn has_incoming_connected(&self) -> bool {
-		self.nodes.iter().any(|entry| {
-			let node = entry.value();
-			node.connection_type == ConnectionType::Incoming && node.state.is_connected()
-		})
-	}
-
 	/// Periodically announces our own address to all connected peers
 	///
-	/// Only runs if we have incoming peers (proving our port is reachable)
-	/// and a consensus external IP from version messages
+	/// Re-probes reachability each cycle. Only announces if our port is
+	/// confirmed reachable to avoid polluting peer tables with NAT'd addresses
 	pub async fn run_self_announce(self: Arc<Self>) {
 		loop {
 			tokio::time::sleep(SELF_ANNOUNCE_INTERVAL).await;
-
-			if !self.has_incoming_connected() {
-				debug!("Self-announce skipped: no incoming peers connected");
-				continue;
-			}
 
 			let Some(external_ip) = self.get_external_ip() else {
 				debug!("Self-announce skipped: no consensus on external IP");
 				continue;
 			};
 
-			let addr = NetworkAddress::new(external_ip, DEFAULT_PORT);
+			// Re-probe each cycle in case network conditions changed
+			self.probe_reachability().await;
+
+			if !self.is_port_reachable() {
+				debug!("Self-announce skipped: port not reachable");
+				continue;
+			}
+
+			let addr = NetworkAddress::new(external_ip, self.listen_port);
 			let msg = MessageAddr::new(vec![addr]);
 			let payload = msg.to_bytes();
 
@@ -1440,7 +1503,7 @@ impl NodeManager {
 
 			info!(
 				address = %external_ip,
-				port = DEFAULT_PORT,
+				port = self.listen_port,
 				peer_count = writers.len(),
 				"announcing own address to peers"
 			);

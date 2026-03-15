@@ -22,6 +22,10 @@ pub struct OverviewData<'a> {
 	pub stats: &'a NodeStats,
 	/// Snapshot of all peer nodes
 	pub nodes: &'a [NodeSnapshot],
+	/// Local listening port
+	pub listen_port: u16,
+	/// Whether our listen port is reachable from outside
+	pub port_reachable: bool,
 	/// Current header chain height
 	pub chain_height: u32,
 	/// Compact difficulty bits at chain tip
@@ -41,7 +45,7 @@ pub fn render(frame: &mut Frame, area: Rect, data: &OverviewData) {
 	let main_layout = Layout::default()
 		.direction(Direction::Vertical)
 		.constraints([
-			Constraint::Length(7), // top row
+			Constraint::Length(9), // top row
 			Constraint::Length(7), // bottom row
 			Constraint::Min(0),    // absorb remaining space
 		])
@@ -94,6 +98,21 @@ fn render_network(frame: &mut Frame, area: Rect, data: &OverviewData) {
 		Line::from(vec![
 			Span::styled("Banned: ", Style::default().fg(Color::Gray)),
 			Span::styled(format!("{}", data.stats.banned), Style::default().fg(Color::Red)),
+		]),
+		Line::from(vec![
+			Span::styled("Listen: ", Style::default().fg(Color::Gray)),
+			Span::styled(
+				format!(":{}", data.listen_port),
+				Style::default().fg(Color::White),
+			),
+		]),
+		Line::from(vec![
+			Span::styled("Port: ", Style::default().fg(Color::Gray)),
+			if data.port_reachable {
+				Span::styled("Open", Style::default().fg(Color::Green))
+			} else {
+				Span::styled("Closed", Style::default().fg(Color::Red))
+			},
 		]),
 	];
 
