@@ -31,7 +31,18 @@ pub fn render(frame: &mut Frame, area: Rect, nodes: &[NodeSnapshot]) {
 		.map(|d| d.as_secs())
 		.unwrap_or(0);
 
-	let rows: Vec<Row> = nodes
+	// Sort: connected/handshaking/connecting first, then dead/disconnected/banned at the bottom
+	let mut sorted_nodes: Vec<&NodeSnapshot> = nodes.iter().collect();
+	sorted_nodes.sort_by_key(|n| match n.state_label {
+		NodeStateLabel::Connected => 0,
+		NodeStateLabel::Handshaking => 1,
+		NodeStateLabel::Connecting => 2,
+		NodeStateLabel::Disconnected(_) => 3,
+		NodeStateLabel::Dead => 4,
+		NodeStateLabel::Banned => 5,
+	});
+
+	let rows: Vec<Row> = sorted_nodes
 		.iter()
 		.map(|node| {
 			let state_color = match node.state_label {
