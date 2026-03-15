@@ -110,7 +110,9 @@ pub(super) async fn handle_headers(
 		};
 
 		// Build locator while we still hold the lock (avoids a second acquire)
-		let locator = if count == MAX_HEADERS_PER_MSG {
+		// Only request more if we actually added new headers -- otherwise we loop
+		// forever requesting batches of duplicates we already have
+		let locator = if count == MAX_HEADERS_PER_MSG && !batch.is_empty() {
 			Some(store.build_locator())
 		} else {
 			None
