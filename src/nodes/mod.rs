@@ -1706,7 +1706,8 @@ async fn handle_node_connection(node_manager: Arc<NodeManager>, address: IpAddr,
 	// by sending a MessageVersion packet
 
 	let network_address = NetworkAddress::new(address, port);
-	let version = MessageVersion::new(network_address, node_manager.my_nonce);
+	let tip_height = node_manager.chainstate().map_or(0, |cs| cs.tip_height());
+	let version = MessageVersion::new(network_address, node_manager.my_nonce, tip_height);
 	let packet = match Message::new("version", &version.to_bytes()) {
 		Ok(p) => p,
 		Err(e) => {

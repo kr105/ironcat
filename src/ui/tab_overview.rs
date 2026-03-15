@@ -101,10 +101,7 @@ fn render_network(frame: &mut Frame, area: Rect, data: &OverviewData) {
 		]),
 		Line::from(vec![
 			Span::styled("Listen: ", Style::default().fg(Color::Gray)),
-			Span::styled(
-				format!(":{}", data.listen_port),
-				Style::default().fg(Color::White),
-			),
+			Span::styled(format!(":{}", data.listen_port), Style::default().fg(Color::White)),
 		]),
 		Line::from(vec![
 			Span::styled("Port: ", Style::default().fg(Color::Gray)),

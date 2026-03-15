@@ -56,7 +56,8 @@ pub(super) async fn handle_version(
 	// Phase 2: Async sends without holding any lock
 	if is_incoming {
 		let network_address = NetworkAddress::new(*address, port);
-		let version_message = MessageVersion::new(network_address, node_manager.my_nonce);
+		let tip_height = node_manager.chainstate().map_or(0, |cs| cs.tip_height());
+		let version_message = MessageVersion::new(network_address, node_manager.my_nonce, tip_height);
 		tcp_writer
 			.send_message("version", &version_message.to_bytes())
 			.await
