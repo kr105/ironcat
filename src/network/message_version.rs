@@ -79,8 +79,9 @@ impl MessageVersion {
 	/// Decodes a version message from wire bytes
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		// Minimum: version(4) + services(8) + timestamp(8) + addr_recv(26) + addr_from(26) +
-		//          nonce(8) + user_agent_varint(1) + start_height(4) + relay(1) = 86
-		if bytes.len() < 86 {
+		//          nonce(8) + user_agent_varint(1) + start_height(4) = 85
+		// relay(1) is optional per BIP 37, defaults to true when absent
+		if bytes.len() < 85 {
 			return Err(anyhow!("Insufficient bytes for MessageVersion"));
 		}
 
@@ -115,7 +116,8 @@ impl MessageVersion {
 			.read_i32::<LittleEndian>()
 			.context("failed to read start_height")?;
 
-		let relay = cursor.read_u8().context("failed to read relay field")? != 0;
+		// relay is optional per BIP 37; defaults to true when absent (same as reference client)
+		let relay = cursor.read_u8().map_or(true, |b| b != 0);
 
 		Ok(Self {
 			version,

@@ -70,11 +70,11 @@ fn from_bytes_roundtrip() {
 }
 
 #[test]
-fn from_bytes_without_relay_fails() {
+fn from_bytes_without_relay_defaults_to_true() {
 	let mut payload = build_version_payload(ServiceMask::NODE_NETWORK.bits());
 	payload.pop(); // Remove the relay byte
-	let result = MessageVersion::from_bytes(&payload);
-	assert!(result.is_err(), "missing relay field should fail parsing");
+	let msg = MessageVersion::from_bytes(&payload).unwrap();
+	assert!(msg.relay, "missing relay should default to true per BIP 37");
 }
 
 #[test]
